@@ -29,12 +29,12 @@ belongs to a different package:
 
 | Port | Implementation | Tests |
 | --- | ---: | ---: |
-| Rust (`isongraph-vector-rs/`) | 2,368 | 47 |
-| C++ (`isongraph-vector-cpp/`, header-only) | 1,806 | 67 |
-| Python (`isongraph_vector-py/`) | 1,745 | 68 |
-| TypeScript (`isongraph-vector-ts/`) | 1,390 | 66 |
+| Rust (`isongraph-vector-rs/`) | 2,368 | 48 |
+| C++ (`isongraph-vector-cpp/`, header-only) | 1,806 | 69 |
+| Python (`isongraph_vector-py/`) | 1,745 | 70 |
+| TypeScript (`isongraph-vector-ts/`) | 1,390 | 67 |
 | C# (`isongraph-vector-csharp/`) | 1,386 | 59 |
-| JavaScript (`isongraph-vector-js/`) | 1,132 | 64 |
+| JavaScript (`isongraph-vector-js/`) | 1,132 | 65 |
 
 Line counts are implementation only, excluding tests. Rust leads because
 its store, its SQLite backend and its tests all live in the crate; C++ is
@@ -55,7 +55,7 @@ two tables, so a database file written by one opens in another.
 
 ## Maturity
 
-Real, working, tested — 371 tests across six languages, all passing,
+Real, working, tested — 378 tests across six languages, all passing,
 all six verified by actually building and running them rather than by
 reading the code and assuming it worked.
 

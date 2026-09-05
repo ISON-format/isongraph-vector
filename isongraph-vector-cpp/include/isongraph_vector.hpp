@@ -28,6 +28,7 @@
 #include <map>
 #include <unordered_map>
 #include <memory>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <algorithm>
@@ -728,9 +729,15 @@ public:
             case ison::ValueType::Bool:   return value.as_bool() ? "true" : "false";
             case ison::ValueType::Int:    return std::to_string(value.as_int());
             case ison::ValueType::Float: {
-                std::ostringstream out;
-                out << value.as_float();
-                return out.str();
+                // Shortest round-trip, matching what Python, JavaScript, Rust
+                // and C# produce. The default ostringstream format is six
+                // significant figures, which rendered 1/3 as "0.333333" and
+                // put this port out of step with the other five.
+                char buffer[32];
+                auto [end, ec] = std::to_chars(buffer, buffer + sizeof(buffer),
+                                               value.as_float());
+                if (ec != std::errc()) return "";
+                return std::string(buffer, end);
             }
             default: return "";
         }

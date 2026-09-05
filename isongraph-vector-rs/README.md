@@ -191,7 +191,7 @@ store.from_json(&json, false)?;
 ## Tests
 
 ```bash
-cargo test                      # 32 unit tests + 1 doctest
+cargo test                      # 33 unit tests + 1 doctest
 cargo test --features sqlite    # + 14 SQLite tests
 ```
 

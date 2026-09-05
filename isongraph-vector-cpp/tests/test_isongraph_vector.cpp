@@ -792,6 +792,26 @@ TEST(embed_text_is_identical_across_ports) {
     ASSERT_EQ(record->text, "Report 1.5 true");
 }
 
+TEST(vendored_headers_are_the_versions_we_documented) {
+    // The vendored copies have no version resolution behind them, so this is
+    // the only thing that notices when they drift from vendor/VENDORED.md.
+    // Update both together when re-copying from upstream.
+    ASSERT_EQ(std::string(ison_graph::VERSION), "1.1.0");
+    ASSERT_EQ(std::string(ison::VERSION), "1.2.0");
+}
+
+TEST(floats_render_the_same_way_in_every_port) {
+    // The same values are asserted in all six suites. This port used the
+    // default six significant figures and rendered 1/3 as "0.333333", which
+    // meant a different embedding text - and so a different vector - from
+    // every other port for the same graph.
+    ASSERT_EQ(SemanticGraph::propertyText(ison::Value(1.0)), "1");
+    ASSERT_EQ(SemanticGraph::propertyText(ison::Value(100.0)), "100");
+    ASSERT_EQ(SemanticGraph::propertyText(ison::Value(1.5)), "1.5");
+    ASSERT_EQ(SemanticGraph::propertyText(ison::Value(0.1)), "0.1");
+    ASSERT_EQ(SemanticGraph::propertyText(ison::Value(1.0 / 3.0)), "0.3333333333333333");
+}
+
 TEST(null_contributes_nothing_to_embed_text) {
     SemanticGraph graph("props", std::make_shared<MockEncoder>(8));
     Properties props{{"name", ison::Value()}, {"description", ison::Value("kept")}};

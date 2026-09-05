@@ -185,14 +185,15 @@ store.import_embeddings(payload)
 - **Auto-embed renders typed properties.** Since ISONGraph 1.4.0 a property can
   be a number, a bool or `None`. Nulls are skipped and booleans render as ISON
   spells them (`true`/`false`, not Python's `True`), so the same graph produces
-  the same text in every port. Whole-number floats are the exception — Python
-  renders `1.0` as `"1.0"` where the other ports render `"1"`. Pass
-  `_embed_text` explicitly when the exact wording matters.
+  the same text in every port. Floats render in the shortest round-trip form,
+  so an integral float is `"1"` and not Python's usual `"1.0"` — the other five
+  ports would otherwise disagree with this one, and a different text means a
+  different vector.
 
 ## Tests
 
 ```bash
-pytest tests/                     # 68 tests, MockEncoder, no downloads
+pytest tests/                     # 70 tests, MockEncoder, no downloads
 USE_REAL_ENCODER=1 pytest tests/  # against real sentence-transformers
 ```
 

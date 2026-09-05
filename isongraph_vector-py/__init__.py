@@ -1198,6 +1198,11 @@ class SemanticGraph(ISONGraph):
             return ""
         if isinstance(value, bool):
             return "true" if value else "false"
+        if isinstance(value, float) and value.is_integer() and abs(value) < 1e16:
+            # Python is alone in writing an integral float as "1.0"; every
+            # other port renders "1". Matching them keeps one property bag
+            # mapped to one embedding text, and so to one vector.
+            return str(int(value))
         return str(value)
 
     def embed_text_for(self, properties: Dict[str, Any]) -> str:
@@ -1679,17 +1684,27 @@ class SemanticGraph(ISONGraph):
             sqlite_vec=sqlite_vec
         )
 
-        # Copy nodes
+        # Copy the loaded state across through the public API.
+        #
+        # This used to reach into ISONGraph's private attributes (_nodes,
+        # _edges, _out_edges, _in_edges, _edge_set) to skip re-validation.
+        # That worked, but it silently depended on the base library's internal
+        # representation - the kind of coupling that breaks without a
+        # compilation error to warn you. add_node and add_edge rebuild the
+        # same indexes, and a graph small enough to load is small enough to
+        # rebuild.
+        #
+        # super().add_node is used rather than graph.add_node so that loading
+        # never triggers auto-embedding: the embeddings come from the sidecar
+        # below, already computed, and re-deriving them here would need an
+        # encoder and would silently overwrite what was saved.
         for node in base.nodes():
-            graph._nodes[node.type][node.id] = node
+            ISONGraph.add_node(graph, node.type, node.id, **node.properties)
 
-        # Copy edges
         for rel_type in base.edge_types():
             for edge in base.edges(rel_type):
-                graph._edges[rel_type].append(edge)
-                graph._out_edges[edge.source].append(edge)
-                graph._in_edges[edge.target].append(edge)
-                graph._edge_set.add(edge.key)
+                graph.add_edge(edge.rel_type, edge.source, edge.target,
+                               **edge.properties)
 
         if embeddings:
             sidecar = cls.embeddings_path_for(path)

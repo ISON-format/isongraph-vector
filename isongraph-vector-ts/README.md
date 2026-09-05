@@ -171,7 +171,7 @@ store.importEmbeddings(payload);
 ## Tests
 
 ```bash
-npm test           # 66 tests
+npm test           # 67 tests
 npm run typecheck  # tsc --noEmit, tests included
 npm run build      # emits dist/, library only
 ```

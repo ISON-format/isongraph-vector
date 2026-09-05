@@ -22,10 +22,13 @@ add_subdirectory(isongraph-vector-cpp)
 target_link_libraries(your_target PRIVATE isongraph_vector)
 ```
 
-`ison_graph.hpp` (ISONGraph 1.4.0) and `ison_parser.hpp` (ison-cpp 1.2.0) are
-vendored under `vendor/ison-graph-cpp/`. There is no package registry for C++,
-so unlike the other ports these are copies rather than a dependency
-declaration; they are taken from the canonical checkouts.
+`ison_graph.hpp` (ISONGraph 1.4.0, though the header constant itself still
+reads 1.1.0) and `ison_parser.hpp` (ison-cpp 1.2.0) are vendored under
+`vendor/ison-graph-cpp/`. There is no package registry for C++, so unlike the
+other ports these are copies rather than a dependency declaration.
+[`VENDORED.md`](vendor/ison-graph-cpp/VENDORED.md) records where they came
+from, and a test asserts their versions so a stale copy fails the suite instead
+of passing quietly.
 
 ## The idea, in one example
 
@@ -163,8 +166,11 @@ row written by Python byte for byte.
 - **`MockEncoder` has no semantic structure.** Use it to test plumbing, never
   to judge relevance quality. This port ships no real encoder — subclass
   `EmbeddingEncoder` over the model of your choice.
-- **The base library is vendored, not versioned.** Nothing tells you when
-  ISONGraph moves on; re-copy the headers when it does.
+- **The base library is vendored, not versioned.** There is no upgrade
+  notification, so re-copy the headers when ISONGraph moves on. A test asserts
+  the vendored versions against
+  [`VENDORED.md`](vendor/ison-graph-cpp/VENDORED.md), so at least a *stale*
+  copy fails loudly rather than passing quietly.
 - **Auto-embed renders typed properties.** Nulls and references contribute
   nothing and booleans render as `true`/`false`, so the same graph produces the
   same text in every port.
@@ -173,7 +179,7 @@ row written by Python byte for byte.
 
 ```bash
 cmake -S . -B build && cmake --build build
-./build/test_isongraph_vector                 # 51 tests
+./build/test_isongraph_vector                 # 53 tests
 
 cmake -S . -B build -DISONGRAPH_VECTOR_SQLITE=ON && cmake --build build
 ./build/test_isongraph_vector_sqlite          # + 16 SQLite tests

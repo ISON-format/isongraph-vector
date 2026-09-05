@@ -36,12 +36,12 @@ README. The behaviour is the same in all six; the idioms are native to each.
 
 | Port | Directory | Package | Base library | Tests |
 | --- | --- | --- | --- | ---: |
-| Python | [`isongraph_vector-py/`](isongraph_vector-py/) | `isongraph-vector` | `ison-graph` 1.4.0 | 68 |
-| C++ | [`isongraph-vector-cpp/`](isongraph-vector-cpp/) | headers | vendored `ison-graph-cpp` 1.4.0 | 67 |
-| TypeScript | [`isongraph-vector-ts/`](isongraph-vector-ts/) | `isongraph-vector-ts` | `ison-graph-ts` 1.4.0 | 66 |
-| JavaScript | [`isongraph-vector-js/`](isongraph-vector-js/) | `isongraph-vector-js` | `ison-graph-js` 1.4.0 | 64 |
+| Python | [`isongraph_vector-py/`](isongraph_vector-py/) | `isongraph-vector` | `ison-graph` 1.4.0 | 70 |
+| C++ | [`isongraph-vector-cpp/`](isongraph-vector-cpp/) | headers | vendored `ison-graph-cpp` 1.4.0 | 69 |
+| TypeScript | [`isongraph-vector-ts/`](isongraph-vector-ts/) | `isongraph-vector-ts` | `ison-graph-ts` 1.4.0 | 67 |
+| JavaScript | [`isongraph-vector-js/`](isongraph-vector-js/) | `isongraph-vector-js` | `ison-graph-js` 1.4.0 | 65 |
 | C# | [`isongraph-vector-csharp/`](isongraph-vector-csharp/) | `IsonGraph.Vector` | `IsonGraph` 1.4.0 | 59 |
-| Rust | [`isongraph-vector-rs/`](isongraph-vector-rs/) | `isongraph-vector-rs` | `ison-graph` 1.4 | 47 |
+| Rust | [`isongraph-vector-rs/`](isongraph-vector-rs/) | `isongraph-vector-rs` | `ison-graph` 1.4 | 48 |
 
 Parity is deliberate but not total:
 
@@ -287,9 +287,11 @@ not Python's `True` or .NET's `True`. A golden test in all six asserts that the
 same property bag yields the same string, because different text means a
 different vector and would quietly break the cross-port guarantee.
 
-One loose end: whole-number floats. Python renders `1.0` as `"1.0"` where the
-other five render `"1"`. Pass an explicit embed text when the exact wording
-matters.
+Floats agree too, which took fixing in two places: Python alone wrote an
+integral float as `"1.0"` where the others write `"1"`, and C++ used the default
+six significant figures, rendering `1/3` as `"0.333333"`. All six now produce
+the shortest round-trip form — `1`, `1.5`, `0.1`, `0.3333333333333333` — and
+every suite asserts that set.
 
 ## Honest limits
 
@@ -355,18 +357,18 @@ silently wrong scores.
 ## Testing
 
 ```bash
-pytest tests/                                            # Python, 68
+pytest tests/                                            # Python, 70
 cd isongraph-vector-csharp && dotnet test                # C#, 59
-cd isongraph-vector-ts && npm test                       # TypeScript, 66
-cd isongraph-vector-js && npm test                       # JavaScript, 64
-cd isongraph-vector-rs && cargo test --features sqlite   # Rust, 47
+cd isongraph-vector-ts && npm test                       # TypeScript, 67
+cd isongraph-vector-js && npm test                       # JavaScript, 65
+cd isongraph-vector-rs && cargo test --features sqlite   # Rust, 48
 
 cd isongraph-vector-cpp
 cmake -S . -B build -DISONGRAPH_VECTOR_SQLITE=ON && cmake --build build
-./build/test_isongraph_vector && ./build/test_isongraph_vector_sqlite   # C++, 67
+./build/test_isongraph_vector && ./build/test_isongraph_vector_sqlite   # C++, 69
 ```
 
-371 tests in total. `pytest` works straight from a checkout:
+378 tests in total. `pytest` works straight from a checkout:
 [`conftest.py`](conftest.py) binds the import name `isongraph_vector` to the
 `isongraph_vector-py/` directory, which is named to line up with the other
 ports and so cannot be imported directly. An installed copy takes precedence.

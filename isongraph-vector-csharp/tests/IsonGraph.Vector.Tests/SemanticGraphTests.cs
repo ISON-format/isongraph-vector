@@ -544,10 +544,18 @@ public class PropertyRenderingTests
     }
 
     [Fact]
-    public void FloatsUseTheInvariantCulture()
+    public void FloatsRenderTheSameWayInEveryPort()
     {
-        // "1.5" on every machine, never "1,5".
+        // Invariant culture, so "1.5" on every machine and never "1,5"; and
+        // the same shortest round-trip form the other five ports produce.
+        // Python used to write an integral float as "1.0" and C++ used six
+        // significant figures - either one means a different vector for the
+        // same graph.
+        Assert.Equal("1", SemanticGraph.PropertyText(1.0));
+        Assert.Equal("100", SemanticGraph.PropertyText(100.0));
         Assert.Equal("1.5", SemanticGraph.PropertyText(1.5));
+        Assert.Equal("0.1", SemanticGraph.PropertyText(0.1));
+        Assert.Equal("0.3333333333333333", SemanticGraph.PropertyText(1.0 / 3.0));
     }
 }
 

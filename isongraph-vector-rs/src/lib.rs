@@ -1582,6 +1582,26 @@ mod tests {
     }
 
     #[test]
+    fn test_floats_render_the_same_way_in_every_port() {
+        // The same values are asserted in all six suites. Python used to
+        // write an integral float as "1.0" where the others write "1", and
+        // C++ used six significant figures, rendering 1/3 as "0.333333".
+        // Either one means a different embedding text, and so a different
+        // vector, for the same graph.
+        let graph = SemanticGraph::new("floats", Box::new(MockEncoder::new(8)));
+        let render = |v: f64| {
+            let mut props = HashMap::new();
+            props.insert("name".to_string(), Value::Float(v));
+            graph.embed_text_for(&props)
+        };
+        assert_eq!(render(1.0), "1");
+        assert_eq!(render(100.0), "100");
+        assert_eq!(render(1.5), "1.5");
+        assert_eq!(render(0.1), "0.1");
+        assert_eq!(render(1.0 / 3.0), "0.3333333333333333");
+    }
+
+    #[test]
     fn test_null_contributes_nothing_to_embed_text() {
         let graph = SemanticGraph::new("props", Box::new(MockEncoder::new(8)));
         let mut props = HashMap::new();

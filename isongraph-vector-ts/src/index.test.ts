@@ -597,4 +597,16 @@ describe('typed property rendering', () => {
     expect(SemanticGraph.propertyText(true)).toBe('true');
     expect(SemanticGraph.propertyText(false)).toBe('false');
   });
+
+  it('renders floats the same way as every other port', () => {
+    // Two ports used to disagree here: Python wrote an integral float as
+    // "1.0" where the others write "1", and C++ used six significant
+    // figures, rendering 1/3 as "0.333333".
+    expect(SemanticGraph.propertyText(1.0)).toBe('1');
+    expect(SemanticGraph.propertyText(100.0)).toBe('100');
+    expect(SemanticGraph.propertyText(1.5)).toBe('1.5');
+    expect(SemanticGraph.propertyText(0.1)).toBe('0.1');
+    expect(SemanticGraph.propertyText(1 / 3)).toBe('0.3333333333333333');
+  });
+
 });

@@ -55,7 +55,7 @@ JavaScript, Rust and C++.
   `vec0` metadata column, so it narrows the search rather than filtering its
   results.
 - Typed errors: `EmbeddingError`, `DimensionMismatchError`, `NoEncoderError`.
-- 371 tests across the six ports, including cross-port checks that import an
+- 378 tests across the six ports, including cross-port checks that import an
   embedding payload produced by the Python port, checks in every port that the
   sqlite-vec backend returns exactly what the scan returns, and a golden
   embedding-text assertion shared by all six.
@@ -68,8 +68,10 @@ JavaScript, Rust and C++.
   auto-embedding renders them: nulls are skipped and booleans use the ISON
   spelling (`true`/`false`) in every port, keeping one property bag mapped to
   one embedding text - and so one vector - across all six. A golden test in
-  each suite asserts it. Whole-number floats still differ (`"1.0"` from
-  Python, `"1"` elsewhere); pass an explicit embed text when that matters.
+  each suite asserts it, floats included: all six render the shortest
+  round-trip form, so an integral float is `"1"` rather than Python's usual
+  `"1.0"`, and `1/3` keeps full precision rather than C++'s default six
+  significant figures.
 - Rust `add_node` takes `Vec<(&str, PropertyValue)>`; `add_node_with_embed`
   keeps its string-valued signature and lifts values for you. The C# port
   takes `IDictionary<string, object?>`.

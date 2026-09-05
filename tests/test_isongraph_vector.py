@@ -684,6 +684,44 @@ class TestEmbeddingPersistence:
             Path(graph_path).unlink(missing_ok=True)
             sidecar.unlink(missing_ok=True)
 
+    def test_round_trip_preserves_properties_and_edges(self, encoder):
+        """load() rebuilds through the public API, so nothing may be lost.
+
+        It used to copy ISONGraph's private attributes across wholesale.
+        Going through add_node/add_edge instead means the round trip has to
+        actually carry node properties, edge properties and their types.
+        """
+        graph = SemanticGraph(name='rt', embedding_db=':memory:',
+                              encoder=encoder, auto_embed=False)
+        graph.add_node('person', 1, name='Alice', age=30, active=True)
+        graph.add_node('person', 2, name='Bob')
+        graph.add_edge('KNOWS', ('person', 1), ('person', 2),
+                       since=2020, strength=0.75)
+        graph.embed_node(('person', 1), 'alice text')
+
+        with tempfile.NamedTemporaryFile(suffix='.isong', delete=False) as f:
+            graph_path = f.name
+        sidecar = SemanticGraph.embeddings_path_for(graph_path)
+        try:
+            graph.save(graph_path)
+            loaded = SemanticGraph.load(graph_path, encoder=encoder)
+
+            assert loaded.node_count() == 2
+            assert loaded.edge_count() == 1
+
+            node = loaded.get_node_by_ref(('person', 1))
+            assert node.properties == {'name': 'Alice', 'age': 30, 'active': True}
+
+            edge = next(iter(loaded.edges('KNOWS')))
+            assert edge.properties == {'since': 2020, 'strength': 0.75}
+
+            # the rebuilt indexes actually work
+            assert loaded.neighbors(('person', 1), 'KNOWS') == [('person', 2)]
+            assert loaded.get_embedding(('person', 1)).text == 'alice text'
+        finally:
+            Path(graph_path).unlink(missing_ok=True)
+            sidecar.unlink(missing_ok=True)
+
     def test_save_can_skip_embeddings(self, populated_graph):
         with tempfile.NamedTemporaryFile(suffix='.isong', delete=False) as f:
             graph_path = f.name
@@ -818,6 +856,22 @@ class TestPropertyRendering:
         graph = SemanticGraph(name='props', embedding_db=':memory:', encoder=encoder)
         assert graph.property_text(True) == 'true'
         assert graph.property_text(False) == 'false'
+
+    def test_floats_render_the_same_way_in_every_port(self):
+        """The same values are asserted in all six suites.
+
+        Two ports used to disagree here. Python alone wrote an integral
+        float as "1.0" where the others write "1", and C++ used the
+        default six significant figures, rendering 1/3 as "0.333333".
+        Either one means a different embedding text, and so a different
+        vector, for the same graph.
+        """
+        text = SemanticGraph.property_text
+        assert text(1.0) == '1'
+        assert text(100.0) == '100'
+        assert text(1.5) == '1.5'
+        assert text(0.1) == '0.1'
+        assert text(1 / 3) == '0.3333333333333333'
 
 
 class TestMockEncoderQuality:

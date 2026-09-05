@@ -171,7 +171,7 @@ store.importEmbeddings(payload);
 ## Tests
 
 ```bash
-npm test           # 64 tests
+npm test           # 65 tests
 ```
 
 ## Links
