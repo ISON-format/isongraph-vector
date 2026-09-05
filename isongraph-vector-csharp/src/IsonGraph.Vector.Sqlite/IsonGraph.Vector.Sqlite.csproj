@@ -1,0 +1,44 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <RootNamespace>IsonGraph.Vector.Sqlite</RootNamespace>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\IsonGraph.Vector\IsonGraph.Vector.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.10" />
+    <!-- Ships the native vec0 binaries per RID. Only a prerelease exists on
+         NuGet; the extension itself is the same C code the other ports use. -->
+    <PackageReference Include="sqlite-vec" Version="0.1.7-alpha.2.1" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <PackageId>IsonGraph.Vector.Sqlite</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>Mahesh Vaikri</Authors>
+    <Copyright>Copyright (c) 2026 ISON - Mahesh Vaikri</Copyright>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/ISON-format/isongraph-vector</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageProjectUrl>https://graph.ison.dev/docs/isongraph-vector</PackageProjectUrl>
+    <PackageTags>ison;graph;embeddings;semantic;vector;sqlite;sqlite-vec</PackageTags>
+    <Description>SQLite-backed storage for IsonGraph.Vector, with sqlite-vec answering top-k searches. The schema matches every other isongraph-vector language port, so a database written by one can be opened by another.</Description>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+    <None Include="..\..\LICENSE" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+</Project>

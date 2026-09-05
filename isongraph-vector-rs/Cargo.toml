@@ -1,0 +1,44 @@
+[package]
+name = "isongraph-vector-rs"
+version = "1.0.0"
+edition = "2021"
+authors = ["Mahesh Vaikri"]
+description = "ISONGraph Vector - Semantic Graph Extension for Rust"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/ISON-format/isongraph-vector"
+homepage = "https://github.com/ISON-format/isongraph-vector"
+documentation = "https://graph.ison.dev/docs/isongraph-vector"
+categories = ["database-implementations", "data-structures"]
+keywords = ["ison", "graph", "embeddings", "semantic", "vector"]
+
+[dependencies]
+# Published on crates.io as "ison-graph" (not "ison-graph-rs" - that was
+# only ever a local directory name in the multi-language monorepo this
+# was extracted from). Aliased back to ison_graph_rs so the existing
+# `use ison_graph_rs::...` imports below don't need to change. The
+# original dependency was `path = "../ison-graph-rs"`, a local path that
+# never resolved to anything in this package's own directory tree even
+# before it moved here - this package hadn't been built in a long time.
+ison-graph-rs = { package = "ison-graph", version = "1.4" }
+thiserror = "1.0"
+# The portable embedding payload every language port reads and writes, so a
+# store built by one can be searched by another.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Optional: the SQLite-backed store. Off by default so the crate stays
+# dependency-light; rusqlite is bundled so enabling it needs no system SQLite.
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+sqlite-vec = { version = "0.1.9", optional = true }
+md-5 = { version = "0.10", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = []
+# Persistent storage in SQLite, with sqlite-vec answering top-k searches.
+# The schema matches the other language ports byte for byte, so a database
+# written by one can be opened by another.
+sqlite = ["dep:rusqlite", "dep:sqlite-vec", "dep:md-5"]

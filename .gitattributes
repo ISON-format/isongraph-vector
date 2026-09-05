@@ -1,0 +1,25 @@
+# Normalise line endings: stored as LF in the repository, checked out native.
+# Six languages across Windows, Linux and macOS otherwise means diffs that are
+# nothing but line endings.
+* text=auto
+
+# Explicit for the source and config we ship
+*.py    text
+*.pyi   text
+*.ts    text
+*.js    text
+*.rs    text
+*.cs    text
+*.cpp   text
+*.hpp   text
+*.json  text
+*.toml  text
+*.md    text
+*.txt   text
+*.sln   text eol=crlf
+*.csproj text
+
+# Never touched
+*.db    binary
+*.png   binary
+*.ison  text

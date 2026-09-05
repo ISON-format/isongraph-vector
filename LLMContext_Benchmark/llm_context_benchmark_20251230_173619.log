@@ -1,0 +1,88 @@
+================================================================================
+ISONGRAPH LLM CONTEXT WINDOW BENCHMARK
+================================================================================
+
+CONFIGURATION
+----------------------------------------
+Date: 2025-12-30 17:36:19
+Node Count: 1,000
+Edge Count: 4,981
+Tokenizer: o200k_base (GPT-4o/GPT-5)
+
+STORES TESTED
+----------------------------------------
+  - ISONGraph
+  - NetworkX
+  - igraph
+  - SQLite
+  - DictGraph
+
+================================================================================
+TOKEN EFFICIENCY RANKING
+================================================================================
+
+Rank   Store           Tokens       Nodes/1K Tok   Relative
+------------------------------------------------------------
+1      ISONGraph       66,787       15.0           1.0x
+2      SQLite          142,575      7.0            2.1x
+3      NetworkX        178,457      5.6            2.7x
+4      igraph          287,392      3.5            4.3x
+5      DictGraph       352,800      2.8            5.3x
+
+================================================================================
+SERIALIZATION SIZE RANKING
+================================================================================
+
+Rank   Store           Size (bytes)   Size (KB)    Relative
+------------------------------------------------------------
+1      ISONGraph       167,203        163.3        1.00x
+2      SQLite          423,542        413.6        2.53x
+3      NetworkX        490,124        478.6        2.93x
+4      igraph          839,913        820.2        5.02x
+5      DictGraph       1,168,687      1141.3       6.99x
+
+================================================================================
+CONTEXT WINDOW CAPACITY (Nodes that fit)
+================================================================================
+
+Store           |         4K |         8K |        32K |       128K |       200K |         1M
+---------------------------------------------------------------------------------------------
+ISONGraph       |         61 |        122 |        490 |      1,962 |      3,066 |     15,700
+SQLite          |         28 |         57 |        229 |        919 |      1,436 |      7,354
+NetworkX        |         22 |         45 |        183 |        734 |      1,147 |      5,875
+igraph          |         14 |         28 |        114 |        456 |        712 |      3,648
+DictGraph       |         11 |         23 |         92 |        371 |        580 |      2,972
+
+================================================================================
+TOKEN SAVINGS vs. ISONGraph
+================================================================================
+
+  ISONGraph uses 53.2% fewer tokens than SQLite
+  ISONGraph uses 62.6% fewer tokens than NetworkX
+  ISONGraph uses 76.8% fewer tokens than igraph
+  ISONGraph uses 81.1% fewer tokens than DictGraph
+
+================================================================================
+PRACTICAL CAPACITY EXAMPLES
+================================================================================
+
+GPT-4o (128K context):
+  ISONGraph: 1,962 nodes, 9,810 edges
+  SQLite: 919 nodes, 4,595 edges
+  NetworkX: 734 nodes, 3,670 edges
+  igraph: 456 nodes, 2,280 edges
+  DictGraph: 371 nodes, 1,855 edges
+
+Claude 3.5 (200K context):
+  ISONGraph: 3,066 nodes, 15,330 edges
+  SQLite: 1,436 nodes, 7,180 edges
+  NetworkX: 1,147 nodes, 5,735 edges
+  igraph: 712 nodes, 3,560 edges
+  DictGraph: 580 nodes, 2,900 edges
+
+Gemini 1.5 Pro (1M context):
+  ISONGraph: 15,700 nodes, 78,500 edges
+  SQLite: 7,354 nodes, 36,770 edges
+  NetworkX: 5,875 nodes, 29,375 edges
+  igraph: 3,648 nodes, 18,240 edges
+  DictGraph: 2,972 nodes, 14,860 edges

@@ -1,0 +1,204 @@
+================================================================================
+ISONGRAPH STORE BENCHMARK - DETAILED LOG
+================================================================================
+
+CONFIGURATION
+----------------------------------------
+Date: 2025-12-30 15:32:37
+Node Count: 1,000
+Edge Count: 5,000
+Warmup Iterations: 10
+Benchmark Iterations: 100
+Traversal Iterations: 50
+Path Iterations: 20
+
+STORES TESTED
+----------------------------------------
+  - ISONGraph
+  - NetworkX
+  - igraph
+  - SQLite
+  - DictGraph
+
+================================================================================
+STORE: ISONGraph
+================================================================================
+
+Total Time: 542.26 ms
+Peak Memory: 0.31 MB
+Memory After Load: 2.73 MB
+Serialized Size: 172,347 bytes
+Token Count: 68,975
+Nodes per 1K Tokens: 14.5
+Context Usage (4K): 1684.0%
+Context Usage (32K): 210.5%
+
+OPERATION DETAILS
+------------------------------------------------------------
+Operation            Avg (us)     Min (us)     Max (us)     Ops/sec        
+------------------------------------------------------------
+add_node             0.73         0.60         1.70         1,377,410      
+get_node             0.37         0.30         0.70         2,724,796      
+update_node          0.75         0.60         1.60         1,340,483      
+add_edge             2.08         1.60         6.60         481,696        
+get_edge             0.28         0.20         0.50         3,610,108      
+neighbors_1hop       1.24         0.80         2.30         806,452        
+multi_hop_2          8.52         2.70         24.70        117,371        
+multi_hop_3          32.36        5.70         69.60        30,904         
+shortest_path        186.53       1.10         370.50       5,361          
+has_path             240.94       41.50        639.60       4,150          
+has_cycle            13.73        13.20        15.00        72,833         
+save                 3726.31      3503.20      4048.80      268            
+load                 49365.11     46369.50     54969.20     20             
+
+================================================================================
+STORE: NetworkX
+================================================================================
+
+Total Time: 2017.99 ms
+Peak Memory: 0.46 MB
+Memory After Load: 2.10 MB
+Serialized Size: 509,409 bytes
+Token Count: 185,578
+Nodes per 1K Tokens: 5.4
+Context Usage (4K): 4530.7%
+Context Usage (32K): 566.3%
+
+OPERATION DETAILS
+------------------------------------------------------------
+Operation            Avg (us)     Min (us)     Max (us)     Ops/sec        
+------------------------------------------------------------
+add_node             1.21         1.00         3.70         827,815        
+get_node             0.61         0.40         1.00         1,636,661      
+update_node          0.76         0.60         1.20         1,317,523      
+add_edge             2.42         2.00         3.80         412,882        
+get_edge             0.53         0.40         0.90         1,883,239      
+neighbors_1hop       0.93         0.70         2.20         1,070,664      
+multi_hop_2          4.86         2.60         8.20         205,677        
+multi_hop_3          18.98        4.50         41.10        52,676         
+shortest_path        15.14        8.90         25.20        66,050         
+has_path             13.72        6.20         24.70        72,886         
+has_cycle            44.74        42.50        56.40        22,349         
+save                 25143.31     23995.10     27949.00     40             
+load                 176329.14    171127.40    191367.00    6              
+
+================================================================================
+STORE: igraph
+================================================================================
+
+Total Time: 250.26 ms
+Peak Memory: 0.21 MB
+Memory After Load: 0.22 MB
+Serialized Size: 876,335 bytes
+Token Count: 299,987
+Nodes per 1K Tokens: 3.3
+Context Usage (4K): 7323.9%
+Context Usage (32K): 915.5%
+
+OPERATION DETAILS
+------------------------------------------------------------
+Operation            Avg (us)     Min (us)     Max (us)     Ops/sec        
+------------------------------------------------------------
+add_node             3.22         2.50         8.30         310,559        
+get_node             0.85         0.70         1.10         1,176,471      
+update_node          0.85         0.70         1.00         1,183,432      
+add_edge             109.82       91.50        198.70       9,106          
+get_edge             0.77         0.70         1.00         1,293,661      
+neighbors_1hop       1.65         1.00         3.20         607,533        
+multi_hop_2          7.94         2.70         20.90        125,945        
+multi_hop_3          38.18        14.30        93.70        26,189         
+shortest_path        11.55        2.60         21.10        86,543         
+has_path             11.41        1.70         26.90        87,604         
+has_cycle            0.15         0.10         0.30         6,896,552      
+save                 11475.13     11105.30     12310.90     87             
+load                 12111.12     11348.10     12691.50     83             
+
+================================================================================
+STORE: SQLite
+================================================================================
+
+Total Time: 115.50 ms
+Peak Memory: 0.03 MB
+Memory After Load: 0.03 MB
+Serialized Size: 638,976 bytes
+Token Count: 363,583
+Nodes per 1K Tokens: 2.8
+Context Usage (4K): 8876.5%
+Context Usage (32K): 1109.6%
+
+OPERATION DETAILS
+------------------------------------------------------------
+Operation            Avg (us)     Min (us)     Max (us)     Ops/sec        
+------------------------------------------------------------
+add_node             1.55         1.30         7.60         644,330        
+get_node             2.28         2.00         5.00         437,828        
+update_node          1.95         1.80         2.20         513,347        
+add_edge             4.73         3.70         9.30         211,506        
+get_edge             1.94         1.80         4.60         515,730        
+neighbors_1hop       5.35         3.10         11.70        186,916        
+multi_hop_2          35.35        16.50        66.30        28,289         
+multi_hop_3          183.01       44.50        427.70       5,464          
+shortest_path        2560.04      5.60         5122.50      391            
+has_path             1773.51      15.10        4478.60      564            
+has_cycle            638.35       609.50       862.60       1,567          
+save                 321.49       312.20       336.20       3,111          
+load                 41.53        40.60        45.50        24,079         
+
+================================================================================
+STORE: DictGraph
+================================================================================
+
+Total Time: 563.61 ms
+Peak Memory: 0.26 MB
+Memory After Load: 1.86 MB
+Serialized Size: 709,994 bytes
+Token Count: 273,977
+Nodes per 1K Tokens: 3.6
+Context Usage (4K): 6688.9%
+Context Usage (32K): 836.1%
+
+OPERATION DETAILS
+------------------------------------------------------------
+Operation            Avg (us)     Min (us)     Max (us)     Ops/sec        
+------------------------------------------------------------
+add_node             0.39         0.30         1.20         2,538,071      
+get_node             0.41         0.30         0.70         2,433,090      
+update_node          0.59         0.40         2.00         1,694,915      
+add_edge             0.87         0.70         1.70         1,154,734      
+get_edge             0.18         0.10         0.30         5,714,286      
+neighbors_1hop       0.40         0.30         0.60         2,487,562      
+multi_hop_2          4.97         1.70         8.90         201,126        
+multi_hop_3          19.81        5.80         42.20        50,469         
+shortest_path        269.45       3.00         713.90       3,711          
+has_path             251.72       3.80         401.80       3,973          
+has_cycle            3.92         3.60         4.90         255,428        
+save                 49977.16     44596.40     70614.40     20             
+load                 5183.51      4607.80      6629.90      193            
+
+================================================================================
+COMPARISON SUMMARY
+================================================================================
+
+Operation            |       ISONGraph |        NetworkX |          igraph |          SQLite |       DictGraph | Winner
+-----------------------------------------------------------------------------------------------------------------------
+add_node             |         0.73 us |         1.21 us |         3.22 us |         1.55 us |         0.39 us | DictGraph
+get_node             |         0.37 us |         0.61 us |         0.85 us |         2.28 us |         0.41 us | ISONGraph
+update_node          |         0.75 us |         0.76 us |         0.85 us |         1.95 us |         0.59 us | DictGraph
+add_edge             |         2.08 us |         2.42 us |       109.82 us |         4.73 us |         0.87 us | DictGraph
+get_edge             |         0.28 us |         0.53 us |         0.77 us |         1.94 us |         0.18 us | DictGraph
+neighbors_1hop       |         1.24 us |         0.93 us |         1.65 us |         5.35 us |         0.40 us | DictGraph
+multi_hop_2          |         8.52 us |         4.86 us |         7.94 us |        35.35 us |         4.97 us | NetworkX
+multi_hop_3          |        32.36 us |        18.98 us |        38.18 us |       183.01 us |        19.81 us | NetworkX
+shortest_path        |       186.53 us |        15.14 us |        11.55 us |      2560.04 us |       269.45 us | igraph
+has_path             |       240.94 us |        13.72 us |        11.41 us |      1773.51 us |       251.72 us | igraph
+has_cycle            |        13.73 us |        44.74 us |         0.15 us |       638.35 us |         3.92 us | igraph
+save                 |      3726.31 us |     25143.31 us |     11475.13 us |       321.49 us |     49977.16 us | SQLite
+load                 |     49365.11 us |    176329.14 us |     12111.12 us |        41.53 us |      5183.51 us | SQLite
+
+WINNER SUMMARY
+----------------------------------------
+  DictGraph       5/13 operations (38.5%)
+  igraph          3/13 operations (23.1%)
+  NetworkX        2/13 operations (15.4%)
+  SQLite          2/13 operations (15.4%)
+  ISONGraph       1/13 operations (7.7%)

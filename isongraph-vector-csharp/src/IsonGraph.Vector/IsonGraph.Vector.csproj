@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <RootNamespace>IsonGraph.Vector</RootNamespace>
+    <!-- Ship XML docs so consumers get IntelliSense. CS1591 (missing doc on a
+         public member) stays a warning rather than an error under
+         TreatWarningsAsErrors: the types and methods carry real summaries,
+         and record positional properties do not need boilerplate. -->
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="IsonGraph" Version="1.4.0" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <PackageId>IsonGraph.Vector</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>Mahesh Vaikri</Authors>
+    <Copyright>Copyright (c) 2026 ISON - Mahesh Vaikri</Copyright>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/ISON-format/isongraph-vector</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageProjectUrl>https://graph.ison.dev/docs/isongraph-vector</PackageProjectUrl>
+    <PackageTags>ison;graph;embeddings;semantic;vector;knowledge-graph</PackageTags>
+    <Description>ISONGraph Vector - semantic graph search for .NET: embedding similarity combined with graph traversal, semantic multi-hop, and on-topic subgraph extraction</Description>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+    <None Include="..\..\LICENSE" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+</Project>

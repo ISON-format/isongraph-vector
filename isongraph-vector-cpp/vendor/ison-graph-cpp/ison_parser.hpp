@@ -1,0 +1,2005 @@
+/**
+ * @file ison_parser.hpp
+ * @brief ISON v1.0 Reference Parser for C++ (C++11 compatible)
+ *
+ * Interchange Simple Object Notation (ISON)
+ * A minimal, LLM-friendly data serialization format optimized for
+ * graph databases, multi-agent systems, and RAG pipelines.
+ *
+ * Compatibility: C++11 and later (auto-detects C++17 for std::optional)
+ *
+ * @author Mahesh Vaikri
+ * @version 1.2.0
+ */
+
+#ifndef ISON_PARSER_HPP
+#define ISON_PARSER_HPP
+
+#include <string>
+#include <vector>
+#include <map>
+#include <memory>
+#include <stdexcept>
+#include <sstream>
+#include <fstream>
+#include <algorithm>
+#include <cctype>
+#include <cstdint>
+#include <cmath>
+
+// C++17 detection
+#if __cplusplus >= 201703L
+    #define ISON_HAS_CPP17 1
+    #include <optional>
+#else
+    #define ISON_HAS_CPP17 0
+#endif
+
+namespace ison {
+
+// Version info
+static const char* VERSION = "1.2.0";
+
+} // namespace ison
+
+// Numeric version, usable in preprocessor conditionals. VERSION above is a
+// const char* and cannot be compared at compile time, so a consumer had no
+// way to require a minimum parser version - a stale header produced a subtle
+// behavioural mismatch instead of a build failure. ison-graph-cpp gates on
+// these.
+#define ISON_VERSION_MAJOR 1
+#define ISON_VERSION_MINOR 2
+#define ISON_VERSION_PATCH 0
+
+namespace ison {
+
+// =============================================================================
+// Optional implementation for C++11/14
+// =============================================================================
+
+#if ISON_HAS_CPP17
+    template<typename T>
+    using Optional = std::optional<T>;
+    static const std::nullopt_t None = std::nullopt;
+#else
+    // Simple optional implementation for C++11
+    template<typename T>
+    class Optional {
+    public:
+        Optional() : has_value_(false) {}
+        Optional(const T& value) : has_value_(true), value_(value) {}
+        Optional(T&& value) : has_value_(true), value_(std::move(value)) {}
+
+        bool has_value() const { return has_value_; }
+        explicit operator bool() const { return has_value_; }
+
+        T& value() {
+            if (!has_value_) throw std::runtime_error("Optional has no value");
+            return value_;
+        }
+        const T& value() const {
+            if (!has_value_) throw std::runtime_error("Optional has no value");
+            return value_;
+        }
+
+        T value_or(const T& default_val) const {
+            return has_value_ ? value_ : default_val;
+        }
+
+        void reset() { has_value_ = false; }
+
+    private:
+        bool has_value_;
+        T value_;
+    };
+
+    struct NoneType {};
+    static const NoneType None = NoneType();
+#endif
+
+// =============================================================================
+// Value Type (tagged union for C++11 compatibility)
+// =============================================================================
+
+// Forward declarations
+class Reference;
+class Value;
+
+/**
+ * @brief Value type enumeration
+ */
+enum class ValueType {
+    Null,
+    Bool,
+    Int,
+    Float,
+    String,
+    Reference
+};
+
+/**
+ * @brief Represents any ISON value using tagged union
+ */
+class Value {
+public:
+    Value() : type_(ValueType::Null) {}
+
+    // Constructors for each type
+    Value(std::nullptr_t) : type_(ValueType::Null) {}
+
+    Value(bool b) : type_(ValueType::Bool) { data_.bool_val = b; }
+
+    Value(int i) : type_(ValueType::Int) { data_.int_val = static_cast<int64_t>(i); }
+    Value(long i) : type_(ValueType::Int) { data_.int_val = static_cast<int64_t>(i); }
+    Value(long long i) : type_(ValueType::Int) { data_.int_val = static_cast<int64_t>(i); }
+
+    Value(float f) : type_(ValueType::Float) { data_.float_val = static_cast<double>(f); }
+    Value(double f) : type_(ValueType::Float) { data_.float_val = f; }
+
+    Value(const char* s) : type_(ValueType::String), str_val_(s) {}
+    Value(const std::string& s) : type_(ValueType::String), str_val_(s) {}
+    Value(std::string&& s) : type_(ValueType::String), str_val_(std::move(s)) {}
+
+    Value(const std::shared_ptr<Reference>& r) : type_(ValueType::Reference), ref_val_(r) {}
+    Value(std::shared_ptr<Reference>&& r) : type_(ValueType::Reference), ref_val_(std::move(r)) {}
+
+    // Copy and move
+    Value(const Value& other) : type_(other.type_), data_(other.data_),
+                                 str_val_(other.str_val_), ref_val_(other.ref_val_) {}
+
+    Value(Value&& other) : type_(other.type_), data_(other.data_),
+                           str_val_(std::move(other.str_val_)),
+                           ref_val_(std::move(other.ref_val_)) {}
+
+    Value& operator=(const Value& other) {
+        if (this != &other) {
+            type_ = other.type_;
+            data_ = other.data_;
+            str_val_ = other.str_val_;
+            ref_val_ = other.ref_val_;
+        }
+        return *this;
+    }
+
+    Value& operator=(Value&& other) {
+        if (this != &other) {
+            type_ = other.type_;
+            data_ = other.data_;
+            str_val_ = std::move(other.str_val_);
+            ref_val_ = std::move(other.ref_val_);
+        }
+        return *this;
+    }
+
+    // Type checking
+    ValueType type() const { return type_; }
+    bool is_null() const { return type_ == ValueType::Null; }
+    bool is_bool() const { return type_ == ValueType::Bool; }
+    bool is_int() const { return type_ == ValueType::Int; }
+    bool is_float() const { return type_ == ValueType::Float; }
+    bool is_string() const { return type_ == ValueType::String; }
+    bool is_reference() const { return type_ == ValueType::Reference; }
+
+    // Value access (throws if wrong type)
+    bool as_bool() const {
+        if (type_ != ValueType::Bool) throw std::runtime_error("Value is not a bool");
+        return data_.bool_val;
+    }
+
+    int64_t as_int() const {
+        if (type_ != ValueType::Int) throw std::runtime_error("Value is not an int");
+        return data_.int_val;
+    }
+
+    double as_float() const {
+        if (type_ != ValueType::Float) throw std::runtime_error("Value is not a float");
+        return data_.float_val;
+    }
+
+    const std::string& as_string() const {
+        if (type_ != ValueType::String) throw std::runtime_error("Value is not a string");
+        return str_val_;
+    }
+
+    const std::shared_ptr<Reference>& as_reference_ptr() const {
+        if (type_ != ValueType::Reference) throw std::runtime_error("Value is not a reference");
+        return ref_val_;
+    }
+
+private:
+    ValueType type_;
+    union Data {
+        bool bool_val;
+        int64_t int_val;
+        double float_val;
+        Data() : int_val(0) {}
+    } data_;
+    std::string str_val_;
+    std::shared_ptr<Reference> ref_val_;
+};
+
+// =============================================================================
+// Exceptions
+// =============================================================================
+
+class ISONError : public std::runtime_error {
+public:
+    explicit ISONError(const std::string& message) : std::runtime_error(message) {}
+};
+
+class ISONSyntaxError : public ISONError {
+public:
+    int line;
+    int col;
+
+    ISONSyntaxError(const std::string& message, int line = 0, int col = 0)
+        : ISONError("Line " + std::to_string(line) + ", Col " + std::to_string(col) + ": " + message),
+          line(line), col(col) {}
+};
+
+class ISONTypeError : public ISONError {
+public:
+    explicit ISONTypeError(const std::string& message) : ISONError(message) {}
+};
+
+// A block or field name has no unambiguous ISON encoding.
+//
+// Thrown at serialization, not construction: a Document may hold any name in
+// memory, but writing one that cannot be read back would produce a file that
+// silently parses as different data.
+class ISONNameError : public ISONError {
+public:
+    explicit ISONNameError(const std::string& message) : ISONError(message) {}
+};
+
+// =============================================================================
+// Name validation
+// =============================================================================
+//
+// Names from loads() are safe by construction - the parser could not have
+// produced them otherwise. These rules exist for the other path: a Document
+// built in code whose names never had to survive a parse.
+//
+// Each forbidden character is one the reader gives a meaning to:
+//
+//   space, tab   the field header is whitespace-separated, so "first name"
+//                reads back as two fields
+//   newline, CR  ends the header line
+//   ':'          separates a field name from its type ("id:int")
+//   '|'          the ISONL field delimiter
+//   '#'          a comment, but only line-initial - "a#b" is unambiguous and
+//                stays legal, so that is a prefix rule rather than a character
+//                listed here
+//
+// '.' is deliberately absent for field names: dotted keys address nested
+// values and flat keys containing dots round-trip correctly.
+namespace detail {
+
+// Render a double in ISON's canonical numeric form.
+//
+// ISON has one integer-valued number: a double that happens to be integral
+// renders as an integer, which the default ostringstream formatting already
+// does. The format defines it that way because JavaScript cannot do otherwise --
+// there 1.0 and 1 are the same value.
+//
+// Negative zero is the exception, and the only one. It is integral but has no
+// integer form, and the default formatting renders it "-0", which reads back as
+// the integer 0 and loses the sign. "-0.0" keeps it.
+//
+// Used for the canonical row sort key as well as for emission: if the two used
+// different renderings, two ports could order the same rows differently while
+// each emitted correct bytes.
+inline std::string format_double(double d) {
+    if (d == 0.0 && std::signbit(d)) {
+        return "-0.0";
+    }
+    std::ostringstream oss;
+    oss << d;
+    std::string s = oss.str();
+    // A double renders as a float. The default formatting drops the ".0" from
+    // an integral value, so 1.0 came out as "1" and was read back as the
+    // integer 1 -- corrupting the value in transport, silently, between two
+    // systems that both believed they were speaking ISON.
+    if (s.find('.') == std::string::npos &&
+        s.find('e') == std::string::npos &&
+        s.find('E') == std::string::npos &&
+        s.find("inf") == std::string::npos &&
+        s.find("nan") == std::string::npos) {
+        s += ".0";
+    }
+    return s;
+}
+
+inline bool name_char_forbidden(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+inline bool field_char_forbidden(char c) {
+    return name_char_forbidden(c) || c == ':' || c == '|';
+}
+
+inline std::string describe_char(char c) {
+    switch (c) {
+        case ' ':  return "a space";
+        case '\t': return "a tab";
+        case '\n': return "a newline";
+        case '\r': return "a carriage return";
+        default:   return std::string("'") + c + "'";
+    }
+}
+
+// Reject a field name that cannot be written and read back unchanged.
+inline void validate_field_name(const std::string& name) {
+    for (size_t i = 0; i < name.size(); ++i) {
+        if (field_char_forbidden(name[i])) {
+            throw ISONNameError(
+                "field name '" + name + "' contains " + describe_char(name[i]) +
+                ", which has no unambiguous ISON encoding");
+        }
+    }
+    if (!name.empty() && name[0] == '#') {
+        throw ISONNameError(
+            "field name '" + name + "' starts with '#', which begins a comment; "
+            "'#' elsewhere in a name is fine");
+    }
+    if (name.empty()) {
+        throw ISONNameError("field name is empty");
+    }
+}
+
+// Reject a block header that cannot be written and read back unchanged.
+inline void validate_block_name(const std::string& kind, const std::string& name) {
+    const char* labels[2] = {"kind", "name"};
+    const std::string* values[2] = {&kind, &name};
+    for (int p = 0; p < 2; ++p) {
+        const std::string& value = *values[p];
+        for (size_t i = 0; i < value.size(); ++i) {
+            if (name_char_forbidden(value[i])) {
+                throw ISONNameError(
+                    std::string("block ") + labels[p] + " '" + value + "' contains " +
+                    describe_char(value[i]) + ", which has no unambiguous ISON encoding");
+            }
+        }
+        if (value.empty()) {
+            throw ISONNameError(std::string("block ") + labels[p] + " is empty");
+        }
+    }
+    // The header splits on the first '.', so a dot in the kind would move the
+    // boundary and rename the block. A dot in the name survives.
+    if (kind.find('.') != std::string::npos) {
+        throw ISONNameError(
+            "block kind '" + kind + "' contains '.', which separates kind from name");
+    }
+}
+
+}  // namespace detail
+
+// =============================================================================
+// Reference Class
+// =============================================================================
+
+/**
+ * @brief Represents a reference to another record
+ *
+ * Syntax variants:
+ *   :10              - Simple reference (id only)
+ *   :user:101        - Namespaced reference (type:id)
+ *   :MEMBER_OF:10    - Relationship-typed reference
+ */
+class Reference {
+public:
+    std::string id;
+    Optional<std::string> type;
+
+    Reference() {}
+    explicit Reference(const std::string& id) : id(id) {}
+    Reference(const std::string& id, const std::string& type) : id(id), type(type) {}
+
+    std::string to_ison() const {
+        if (type.has_value()) {
+            return ":" + type.value() + ":" + id;
+        }
+        return ":" + id;
+    }
+
+    bool is_relationship() const {
+        if (!type.has_value()) return false;
+        const std::string& t = type.value();
+        for (size_t i = 0; i < t.size(); ++i) {
+            if (!std::isupper(static_cast<unsigned char>(t[i])) && t[i] != '_') {
+                return false;
+            }
+        }
+        return !t.empty();
+    }
+
+    Optional<std::string> relationship_type() const {
+        if (is_relationship()) return type;
+        return Optional<std::string>();
+    }
+
+    Optional<std::string> get_namespace() const {
+        if (type.has_value() && !is_relationship()) return type;
+        return Optional<std::string>();
+    }
+};
+
+// Reference accessor for Value
+inline const Reference& as_reference(const Value& v) {
+    auto ptr = v.as_reference_ptr();
+    if (!ptr) throw ISONTypeError("Reference is null");
+    return *ptr;
+}
+
+// =============================================================================
+// FieldInfo Class
+// =============================================================================
+
+class FieldInfo {
+public:
+    std::string name;
+    Optional<std::string> type;
+    bool is_computed;
+
+    FieldInfo() : is_computed(false) {}
+    explicit FieldInfo(const std::string& name) : name(name), is_computed(false) {}
+    FieldInfo(const std::string& name, const std::string& type)
+        : name(name), type(type), is_computed(type == "computed") {}
+
+    static FieldInfo parse(const std::string& field_str) {
+        size_t colon_pos = field_str.find(':');
+        if (colon_pos != std::string::npos) {
+            std::string name = field_str.substr(0, colon_pos);
+            std::string type_hint = field_str.substr(colon_pos + 1);
+            // Convert to lowercase
+            for (size_t i = 0; i < type_hint.size(); ++i) {
+                type_hint[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(type_hint[i])));
+            }
+            return FieldInfo(name, type_hint);
+        }
+        return FieldInfo(field_str);
+    }
+};
+
+// =============================================================================
+// Row Type
+// =============================================================================
+
+typedef std::map<std::string, Value> Row;
+
+// =============================================================================
+// Block Class
+// =============================================================================
+
+class Block {
+public:
+    std::string kind;
+    std::string name;
+    std::vector<std::string> fields;
+    std::vector<Row> rows;
+    std::vector<FieldInfo> field_info;
+    Optional<std::string> summary;
+
+    Block() {}
+    Block(const std::string& kind, const std::string& name) : kind(kind), name(name) {}
+
+    Optional<std::string> get_field_type(const std::string& field_name) const {
+        for (size_t i = 0; i < field_info.size(); ++i) {
+            if (field_info[i].name == field_name) {
+                return field_info[i].type;
+            }
+        }
+        return Optional<std::string>();
+    }
+
+    std::vector<std::string> get_computed_fields() const {
+        std::vector<std::string> result;
+        for (size_t i = 0; i < field_info.size(); ++i) {
+            if (field_info[i].is_computed) {
+                result.push_back(field_info[i].name);
+            }
+        }
+        return result;
+    }
+
+    size_t size() const { return rows.size(); }
+    Row& operator[](size_t index) { return rows[index]; }
+    const Row& operator[](size_t index) const { return rows[index]; }
+};
+
+// =============================================================================
+// Document Class
+// =============================================================================
+
+namespace detail {
+
+// Validate every name a block will emit. Defined here rather than beside the
+// other validators because it needs Block to be complete.
+inline void validate_block_names(const Block& block) {
+    validate_block_name(block.kind, block.name);
+    for (size_t i = 0; i < block.fields.size(); ++i) {
+        validate_field_name(block.fields[i]);
+    }
+}
+
+// A reference emits as ":type:id" with no quoting. Every other value type
+// passes through the quoting rules, so a string holding a space is quoted and
+// survives; a reference has no such escape and the raw characters land in the
+// row. Whitespace therefore splits the row into extra columns, and a newline
+// ends it early - which truncates the reference silently.
+//
+// Each form rejects exactly what it cannot parse, and nothing more. That is
+// what keeps the invariant that anything obtained by parsing can be written
+// back. '|' is absent from the ISON set on purpose: ":p:a|b" parses there and
+// reads back correctly, so refusing to write it would make a valid file
+// readable but not writable. ISONL cannot parse one, so it rejects it.
+inline bool reference_char_forbidden(char c, bool isonl) {
+    if (c == ' ' || c == '\t' || c == '\n' || c == '\r') return true;
+    return isonl && c == '|';
+}
+
+// Reject a reference that cannot be written and read back unchanged.
+inline void validate_reference_part(const std::string& label,
+                                    const std::string& value, bool isonl) {
+    for (size_t i = 0; i < value.size(); ++i) {
+        if (reference_char_forbidden(value[i], isonl)) {
+            throw ISONNameError(
+                "reference " + label + " '" + value + "' contains " +
+                describe_char(value[i]) + "; a reference is written as ':type:id' with "
+                "no quoting, so it has no unambiguous ISON encoding");
+        }
+    }
+}
+
+inline void validate_reference(const Reference& ref, bool isonl) {
+    validate_reference_part("id", ref.id, isonl);
+    if (ref.type.has_value()) {
+        validate_reference_part("type", ref.type.value(), isonl);
+    }
+    if (ref.id.empty()) {
+        throw ISONNameError("reference id is empty");
+    }
+}
+
+// Check every reference a block will emit.
+inline void validate_row_references(const Block& block, bool isonl) {
+    for (size_t r = 0; r < block.rows.size(); ++r) {
+        for (Row::const_iterator it = block.rows[r].begin(); it != block.rows[r].end(); ++it) {
+            if (it->second.type() == ValueType::Reference) {
+                const std::shared_ptr<Reference>& ref = it->second.as_reference_ptr();
+                if (ref) validate_reference(*ref, isonl);
+            }
+        }
+    }
+}
+
+}  // namespace detail
+
+class Document {
+public:
+    std::vector<Block> blocks;
+
+    Document() {}
+
+    Block* get(const std::string& name) {
+        for (size_t i = 0; i < blocks.size(); ++i) {
+            if (blocks[i].name == name) return &blocks[i];
+        }
+        return NULL;
+    }
+
+    const Block* get(const std::string& name) const {
+        for (size_t i = 0; i < blocks.size(); ++i) {
+            if (blocks[i].name == name) return &blocks[i];
+        }
+        return NULL;
+    }
+
+    Block& operator[](const std::string& name) {
+        Block* b = get(name);
+        if (!b) throw ISONError("Block not found: " + name);
+        return *b;
+    }
+
+    const Block& operator[](const std::string& name) const {
+        const Block* b = get(name);
+        if (!b) throw ISONError("Block not found: " + name);
+        return *b;
+    }
+
+    bool has(const std::string& name) const { return get(name) != NULL; }
+    size_t size() const { return blocks.size(); }
+
+    std::string to_json(int indent = 2) const;
+};
+
+// =============================================================================
+// Tokenizer
+// =============================================================================
+
+class Tokenizer {
+public:
+    Tokenizer(const std::string& line, int line_num = 0)
+        : line_(line), line_num_(line_num), pos_(0) {}
+
+    std::vector<std::string> tokenize() {
+        std::vector<std::string> tokens;
+        pos_ = 0;
+
+        while (pos_ < line_.size()) {
+            skip_whitespace();
+            if (pos_ >= line_.size()) break;
+
+            if (line_[pos_] == '"') {
+                tokens.push_back(read_quoted_string());
+            } else {
+                tokens.push_back(read_unquoted_token());
+            }
+        }
+        return tokens;
+    }
+
+private:
+    std::string line_;
+    int line_num_;
+    size_t pos_;
+
+    void skip_whitespace() {
+        while (pos_ < line_.size() && (line_[pos_] == ' ' || line_[pos_] == '\t')) {
+            ++pos_;
+        }
+    }
+
+    std::string read_quoted_string() {
+        size_t start_pos = pos_;
+        ++pos_;
+        std::string result;
+
+        while (pos_ < line_.size()) {
+            char c = line_[pos_];
+
+            if (c == '"') {
+                ++pos_;
+                return result;
+            }
+
+            if (c == '\\') {
+                ++pos_;
+                if (pos_ >= line_.size()) {
+                    throw ISONSyntaxError("Unexpected end of line after backslash", line_num_, static_cast<int>(pos_));
+                }
+                char escape_char = line_[pos_];
+                switch (escape_char) {
+                    case '"': result += '"'; break;
+                    case '\\': result += '\\'; break;
+                    case 'n': result += '\n'; break;
+                    case 't': result += '\t'; break;
+                    case 'r': result += '\r'; break;
+                    case '|': result += '|'; break;  // ISONL section delimiter
+                    default: result += escape_char; break;
+                }
+            } else {
+                result += c;
+            }
+            ++pos_;
+        }
+        throw ISONSyntaxError("Unterminated quoted string", line_num_, static_cast<int>(start_pos));
+    }
+
+    std::string read_unquoted_token() {
+        size_t start = pos_;
+        while (pos_ < line_.size() && line_[pos_] != ' ' && line_[pos_] != '\t') {
+            ++pos_;
+        }
+        return line_.substr(start, pos_ - start);
+    }
+};
+
+// =============================================================================
+// Type Inferrer
+// =============================================================================
+
+class TypeInferrer {
+public:
+    static Value infer(const std::string& token, bool was_quoted = false) {
+        if (was_quoted) {
+            return Value(token);
+        }
+
+        if (token == "true") return Value(true);
+        if (token == "false") return Value(false);
+        if (token == "null" || token == "~") return Value(nullptr);
+
+        if (is_integer(token)) {
+            return Value(static_cast<int64_t>(std::stoll(token)));
+        }
+
+        if (is_float(token)) {
+            return Value(std::stod(token));
+        }
+
+        if (token.size() > 1 && token[0] == ':') {
+            std::string ref_value = token.substr(1);
+            size_t colon_pos = ref_value.find(':');
+            if (colon_pos != std::string::npos) {
+                std::string type = ref_value.substr(0, colon_pos);
+                std::string id = ref_value.substr(colon_pos + 1);
+                return Value(std::make_shared<Reference>(id, type));
+            }
+            return Value(std::make_shared<Reference>(ref_value));
+        }
+
+        return Value(token);
+    }
+
+private:
+    static bool is_integer(const std::string& s) {
+        if (s.empty()) return false;
+        size_t start = (s[0] == '-') ? 1 : 0;
+        if (start == s.size()) return false;
+        for (size_t i = start; i < s.size(); ++i) {
+            if (!std::isdigit(static_cast<unsigned char>(s[i]))) return false;
+        }
+        return true;
+    }
+
+    static bool is_float(const std::string& s) {
+        if (s.empty()) return false;
+        size_t start = (s[0] == '-') ? 1 : 0;
+        bool has_dot = false;
+        bool has_digit = false;
+        for (size_t i = start; i < s.size(); ++i) {
+            if (s[i] == '.') {
+                if (has_dot) return false;
+                has_dot = true;
+            } else if (std::isdigit(static_cast<unsigned char>(s[i]))) {
+                has_digit = true;
+            } else {
+                return false;
+            }
+        }
+        return has_dot && has_digit;
+    }
+};
+
+// =============================================================================
+// Parser
+// =============================================================================
+
+class Parser {
+public:
+    explicit Parser(const std::string& text) : line_num_(0) {
+        std::istringstream stream(text);
+        std::string line;
+        while (std::getline(stream, line)) {
+            lines_.push_back(line);
+        }
+    }
+
+    Document parse() {
+        Document doc;
+        while (line_num_ < lines_.size()) {
+            skip_empty_and_comments();
+            if (line_num_ >= lines_.size()) break;
+
+            Block block = parse_block();
+            doc.blocks.push_back(block);
+        }
+        return doc;
+    }
+
+    /**
+     * Return the number of leading tokens that are data: an unquoted token
+     * starting with '#' begins an inline comment, ignoring it and everything
+     * after it. Quoted tokens are always data. (Shared with ISONLParser.)
+     */
+    static size_t strip_inline_comment(const std::vector<std::string>& raw_tokens,
+                                       const std::vector<bool>& quoted_flags) {
+        for (size_t i = 0; i < raw_tokens.size(); ++i) {
+            if (!quoted_flags[i] && !raw_tokens[i].empty() && raw_tokens[i][0] == '#') {
+                return i;
+            }
+        }
+        return raw_tokens.size();
+    }
+
+    /**
+     * Reject rows with more values than fields instead of silently
+     * truncating them. (Shared with ISONLParser.)
+     */
+    static void check_extra_tokens(const std::vector<std::string>& raw_tokens,
+                                   size_t field_count, int line_num) {
+        if (raw_tokens.size() <= field_count) return;
+        throw ISONSyntaxError(
+            "Row has " + std::to_string(raw_tokens.size()) + " values but only " +
+            std::to_string(field_count) + " fields (extra value: '" +
+            raw_tokens[field_count] + "')",
+            line_num, 0);
+    }
+
+    /**
+     * Check whether a bare line scans as a 'kind.name' block header.
+     * (Also used by Serializer to quote strings that would be misread
+     * as a header when they land alone on a row line.)
+     */
+    static bool looks_like_header(const std::string& line) {
+        size_t dot_pos = line.find('.');
+        if (dot_pos == std::string::npos) return false;
+        if (line.find(' ') != std::string::npos) return false;
+
+        std::string kind = line.substr(0, dot_pos);
+        std::string name = line.substr(dot_pos + 1);
+        return is_valid_id(kind) && is_valid_id(name);
+    }
+
+private:
+    std::vector<std::string> lines_;
+    size_t line_num_;
+
+    std::string current_line() const {
+        return (line_num_ < lines_.size()) ? lines_[line_num_] : "";
+    }
+
+    static std::string trim(const std::string& s) {
+        size_t start = s.find_first_not_of(" \t\r\n");
+        if (start == std::string::npos) return "";
+        size_t end = s.find_last_not_of(" \t\r\n");
+        return s.substr(start, end - start + 1);
+    }
+
+    void skip_empty_and_comments() {
+        while (line_num_ < lines_.size()) {
+            std::string line = trim(current_line());
+            if (line.empty() || line[0] == '#') {
+                ++line_num_;
+            } else {
+                break;
+            }
+        }
+    }
+
+    Block parse_block() {
+        std::string header_line = trim(current_line());
+        size_t dot_pos = header_line.find('.');
+        if (dot_pos == std::string::npos) {
+            throw ISONSyntaxError("Invalid block header: '" + header_line + "'", static_cast<int>(line_num_ + 1), 0);
+        }
+
+        std::string kind = header_line.substr(0, dot_pos);
+        std::string name = header_line.substr(dot_pos + 1);
+        ++line_num_;
+
+        skip_empty_and_comments();
+        if (line_num_ >= lines_.size()) {
+            throw ISONSyntaxError("Block '" + kind + "." + name + "' missing field definitions", static_cast<int>(line_num_ + 1), 0);
+        }
+
+        std::string fields_line = current_line();
+        Tokenizer tokenizer(fields_line, static_cast<int>(line_num_ + 1));
+        std::vector<std::string> raw_fields = tokenizer.tokenize();
+        ++line_num_;
+
+        Block block(kind, name);
+        for (size_t i = 0; i < raw_fields.size(); ++i) {
+            FieldInfo fi = FieldInfo::parse(raw_fields[i]);
+            block.field_info.push_back(fi);
+            block.fields.push_back(fi.name);
+        }
+
+        while (line_num_ < lines_.size()) {
+            std::string line = current_line();
+            std::string stripped = trim(line);
+
+            if (stripped.empty()) break;
+            if (stripped[0] == '#') { ++line_num_; continue; }
+
+            if (stripped.size() >= 3 && stripped.substr(0, 3) == "---") {
+                ++line_num_;
+                while (line_num_ < lines_.size()) {
+                    std::string summary_line = trim(current_line());
+                    if (!summary_line.empty() && summary_line[0] != '#') {
+                        block.summary = summary_line;
+                        ++line_num_;
+                        break;
+                    } else if (summary_line.empty()) {
+                        break;
+                    }
+                    ++line_num_;
+                }
+                continue;
+            }
+
+            if (looks_like_header(stripped)) break;
+
+            Row row = parse_data_row(block.fields, line);
+            block.rows.push_back(row);
+            ++line_num_;
+        }
+
+        return block;
+    }
+
+    static bool is_valid_id(const std::string& s) {
+        if (s.empty()) return false;
+        if (!std::isalpha(static_cast<unsigned char>(s[0])) && s[0] != '_') return false;
+        for (size_t i = 0; i < s.size(); ++i) {
+            char c = s[i];
+            if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '-') return false;
+        }
+        return true;
+    }
+
+    Row parse_data_row(const std::vector<std::string>& fields, const std::string& line) {
+        Tokenizer tokenizer(line, static_cast<int>(line_num_ + 1));
+        std::vector<std::string> raw_tokens = tokenizer.tokenize();
+
+        std::vector<Value> values;
+        std::vector<bool> quoted_flags;
+        size_t pos = 0;
+
+        for (size_t i = 0; i < raw_tokens.size(); ++i) {
+            while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) {
+                ++pos;
+            }
+            bool was_quoted = pos < line.size() && line[pos] == '"';
+            values.push_back(TypeInferrer::infer(raw_tokens[i], was_quoted));
+            quoted_flags.push_back(was_quoted);
+
+            if (was_quoted) {
+                ++pos;
+                while (pos < line.size() && line[pos] != '"') {
+                    if (line[pos] == '\\') ++pos;
+                    ++pos;
+                }
+                if (pos < line.size()) ++pos;
+            } else {
+                pos += raw_tokens[i].size();
+            }
+        }
+
+        size_t keep = strip_inline_comment(raw_tokens, quoted_flags);
+        raw_tokens.resize(keep);
+        values.resize(keep);
+        check_extra_tokens(raw_tokens, fields.size(), static_cast<int>(line_num_ + 1));
+
+        Row row;
+        for (size_t i = 0; i < fields.size(); ++i) {
+            if (i < values.size()) {
+                row[fields[i]] = values[i];
+            } else {
+                row[fields[i]] = Value(nullptr);
+            }
+        }
+        return row;
+    }
+};
+
+// =============================================================================
+// Serializer
+// =============================================================================
+
+class Serializer {
+public:
+    static std::string dumps(const Document& doc, bool align_columns = true) {
+        std::string result;
+        for (size_t i = 0; i < doc.blocks.size(); ++i) {
+            if (i > 0) result += "\n\n";
+            result += serialize_block(doc.blocks[i], align_columns);
+        }
+        return result;
+    }
+
+    /**
+     * Serialize a Document to canonical ISON string.
+     *
+     * Canonical form sorts blocks and rows ordinal-string on their keys,
+     * sorts fields (id first, then UTF-8 byte order), uses single-space
+     * delimiter and no alignment, producing byte-identical output across
+     * implementations for the same logical data.
+     *
+     * The key for each row is the first column's value (conventionally 'id').
+     * Rows with null in the key column sort after rows with values.
+     */
+    static std::string dumps_canonical(const Document& doc) {
+        std::vector<const Block*> sorted_blocks;
+        for (size_t i = 0; i < doc.blocks.size(); ++i) {
+            sorted_blocks.push_back(&doc.blocks[i]);
+        }
+
+        // Sort blocks ordinal-string by key (kind.name)
+        std::sort(sorted_blocks.begin(), sorted_blocks.end(),
+                  [](const Block* a, const Block* b) {
+                      std::string a_key = a->kind + "." + a->name;
+                      std::string b_key = b->kind + "." + b->name;
+                      return a_key < b_key;
+                  });
+
+        std::string result;
+        for (size_t i = 0; i < sorted_blocks.size(); ++i) {
+            if (i > 0) result += "\n\n";
+            result += serialize_block_canonical(*sorted_blocks[i]);
+        }
+        return result;
+    }
+
+private:
+    /**
+     * Sort fields in canonical order: 'id' first (if present),
+     * then all other fields sorted by UTF-8 byte comparison.
+     *
+     * CRITICAL: Uses UNSIGNED char comparison to avoid x86 signed char trap.
+     * Bytes >= 0x80 must sort by their unsigned values, not as negative signed values.
+     * Example: Ａfield (U+FF21: 0xEF...) must sort before 😀field (U+1F600: 0xF0...)
+     */
+    static std::vector<std::string> sort_fields_canonical(const std::vector<std::string>& fields) {
+        std::vector<std::string> id_fields;
+        std::vector<std::string> other_fields;
+
+        // Partition: separate 'id' field from others
+        for (size_t i = 0; i < fields.size(); ++i) {
+            if (fields[i] == "id") {
+                id_fields.push_back(fields[i]);
+            } else {
+                other_fields.push_back(fields[i]);
+            }
+        }
+
+        // Sort other fields by UTF-8 bytes (using UNSIGNED char comparison)
+        std::sort(other_fields.begin(), other_fields.end(),
+            [](const std::string& a, const std::string& b) {
+                // Cast to unsigned char* to avoid signed char trap on x86
+                const auto* a_bytes = reinterpret_cast<const unsigned char*>(a.data());
+                const auto* b_bytes = reinterpret_cast<const unsigned char*>(b.data());
+                size_t min_len = std::min(a.size(), b.size());
+
+                // Compare byte-by-byte as unsigned values
+                for (size_t i = 0; i < min_len; ++i) {
+                    if (a_bytes[i] != b_bytes[i]) {
+                        return a_bytes[i] < b_bytes[i];
+                    }
+                }
+                // If all common bytes match, shorter one comes first
+                return a.size() < b.size();
+            });
+
+        // Return: id first (if present), then sorted others
+        std::vector<std::string> result = id_fields;
+        result.insert(result.end(), other_fields.begin(), other_fields.end());
+        return result;
+    }
+
+    /**
+     * Serialize a single block in canonical form (sorted fields, sorted rows, no alignment).
+     *
+     * Fields are sorted in canonical order: 'id' first (if present), then
+     * other fields by UTF-8 byte comparison.
+     */
+public:
+    // Order two rows on the FULL canonical field tuple.
+    //
+    // Keying on the first column alone left ties resolved by input order, so
+    // the same logical data serialized to different bytes depending on how the
+    // rows were built -- which defeats content addressing and prefix stability.
+    //
+    // Values compare as UTF-8 bytes with an unsigned char cast, matching the
+    // field sort. On x86 `char` is signed, so a plain std::string comparison
+    // orders bytes >= 0x80 as negative and reverses non-ASCII values.
+    // Nulls sort last at every position, not only the key column.
+    static bool row_less_canonical(const Row* a, const Row* b,
+                                   const std::vector<std::string>& sorted_fields) {
+        for (size_t f = 0; f < sorted_fields.size(); ++f) {
+            const std::string& field = sorted_fields[f];
+            Row::const_iterator it_a = a->find(field);
+            Row::const_iterator it_b = b->find(field);
+
+            Value val_a = (it_a != a->end()) ? it_a->second : Value(nullptr);
+            Value val_b = (it_b != b->end()) ? it_b->second : Value(nullptr);
+
+            bool a_null = val_a.is_null();
+            bool b_null = val_b.is_null();
+            if (a_null && b_null) continue;
+            if (a_null) return false;
+            if (b_null) return true;
+
+            const std::string sa = value_to_sort_string(val_a);
+            const std::string sb = value_to_sort_string(val_b);
+
+            const size_t n = (sa.size() < sb.size()) ? sa.size() : sb.size();
+            for (size_t i = 0; i < n; ++i) {
+                unsigned char ca = static_cast<unsigned char>(sa[i]);
+                unsigned char cb = static_cast<unsigned char>(sb[i]);
+                if (ca != cb) return ca < cb;
+            }
+            if (sa.size() != sb.size()) return sa.size() < sb.size();
+        }
+        return false;
+    }
+
+private:
+    static std::string serialize_block_canonical(const Block& block) {
+        detail::validate_block_names(block);
+        detail::validate_row_references(block, false);
+
+        std::vector<std::string> lines;
+        lines.push_back(block.kind + "." + block.name);
+
+        // Sort fields in canonical order: 'id' first, then by UTF-8 bytes
+        std::vector<std::string> sorted_fields = sort_fields_canonical(block.fields);
+
+        // Build fields line with type annotations if present
+        std::string fields_line;
+        for (size_t i = 0; i < sorted_fields.size(); ++i) {
+            if (i > 0) fields_line += " ";
+            const std::string& field_name = sorted_fields[i];
+
+            // Find field_info for this field to get type annotation if present
+            Optional<std::string> field_type;
+            for (size_t j = 0; j < block.field_info.size(); ++j) {
+                if (block.field_info[j].name == field_name) {
+                    field_type = block.field_info[j].type;
+                    break;
+                }
+            }
+
+            if (field_type.has_value()) {
+                fields_line += field_name + ":" + field_type.value();
+            } else {
+                fields_line += field_name;
+            }
+        }
+        lines.push_back(fields_line);
+
+        // Sort rows ordinal-string by first column value (key)
+        std::vector<const Row*> sorted_rows;
+        for (size_t i = 0; i < block.rows.size(); ++i) {
+            sorted_rows.push_back(&block.rows[i]);
+        }
+
+        if (!sorted_fields.empty()) {
+            std::stable_sort(sorted_rows.begin(), sorted_rows.end(),
+                             [&sorted_fields](const Row* a, const Row* b) {
+                                 return row_less_canonical(a, b, sorted_fields);
+                             });
+        }
+
+        // Data rows (no alignment, single-space delimiter)
+        for (size_t i = 0; i < sorted_rows.size(); ++i) {
+            const Row& row = *sorted_rows[i];
+            std::string row_line;
+            for (size_t j = 0; j < sorted_fields.size(); ++j) {
+                if (j > 0) row_line += " ";
+                std::string str_value = "null";
+                Row::const_iterator it = row.find(sorted_fields[j]);
+                if (it != row.end()) {
+                    str_value = value_to_ison(it->second);
+                }
+                row_line += str_value;
+            }
+            // Trim trailing whitespace
+            while (!row_line.empty() && (row_line[row_line.size()-1] == ' ' || row_line[row_line.size()-1] == '\t')) {
+                row_line.erase(row_line.size()-1);
+            }
+            lines.push_back(row_line);
+        }
+
+        // Summary row (if present)
+        if (block.summary.has_value()) {
+            lines.push_back("---");
+            lines.push_back(block.summary.value());
+        }
+
+        std::string result;
+        for (size_t i = 0; i < lines.size(); ++i) {
+            if (i > 0) result += "\n";
+            result += lines[i];
+        }
+        return result;
+    }
+
+    /**
+     * Convert a value to a string for ordinal-string sorting.
+     * Preserves the value as-is for comparison purposes.
+     */
+    static std::string value_to_sort_string(const Value& v) {
+        switch (v.type()) {
+            case ValueType::Null: return "";  // null values sort to end
+            case ValueType::Bool: return v.as_bool() ? "true" : "false";
+            case ValueType::Int: return std::to_string(v.as_int());
+            case ValueType::Float: return detail::format_double(v.as_float());
+            case ValueType::String: return v.as_string();
+            case ValueType::Reference: {
+                std::shared_ptr<Reference> r = v.as_reference_ptr();
+                return r ? r->to_ison() : "";
+            }
+        }
+        return "";
+    }
+
+private:
+    static std::string serialize_block(const Block& block, bool align_columns) {
+        detail::validate_block_names(block);
+        detail::validate_row_references(block, false);
+
+        std::vector<std::string> lines;
+        lines.push_back(block.kind + "." + block.name);
+
+        std::string fields_line;
+        for (size_t i = 0; i < block.field_info.size(); ++i) {
+            if (i > 0) fields_line += " ";
+            const FieldInfo& fi = block.field_info[i];
+            if (fi.type.has_value()) {
+                fields_line += fi.name + ":" + fi.type.value();
+            } else {
+                fields_line += fi.name;
+            }
+        }
+        if (fields_line.empty() && !block.fields.empty()) {
+            for (size_t i = 0; i < block.fields.size(); ++i) {
+                if (i > 0) fields_line += " ";
+                fields_line += block.fields[i];
+            }
+        }
+        lines.push_back(fields_line);
+
+        std::vector<size_t> col_widths;
+        if (align_columns && !block.rows.empty()) {
+            col_widths = calculate_column_widths(block);
+        }
+
+        for (size_t ri = 0; ri < block.rows.size(); ++ri) {
+            const Row& row = block.rows[ri];
+            std::string row_line;
+            for (size_t i = 0; i < block.fields.size(); ++i) {
+                if (i > 0) row_line += " ";
+
+                std::string str_value = "null";
+                Row::const_iterator it = row.find(block.fields[i]);
+                if (it != row.end()) {
+                    str_value = value_to_ison(it->second);
+                }
+
+                if (!col_widths.empty() && i < col_widths.size()) {
+                    while (str_value.size() < col_widths[i]) {
+                        str_value += " ";
+                    }
+                }
+                row_line += str_value;
+            }
+            // Trim trailing whitespace
+            while (!row_line.empty() && (row_line[row_line.size()-1] == ' ' || row_line[row_line.size()-1] == '\t')) {
+                row_line.erase(row_line.size()-1);
+            }
+            lines.push_back(row_line);
+        }
+
+        if (block.summary.has_value()) {
+            lines.push_back("---");
+            lines.push_back(block.summary.value());
+        }
+
+        std::string result;
+        for (size_t i = 0; i < lines.size(); ++i) {
+            if (i > 0) result += "\n";
+            result += lines[i];
+        }
+        return result;
+    }
+
+    static std::vector<size_t> calculate_column_widths(const Block& block) {
+        std::vector<size_t> widths(block.fields.size());
+        for (size_t i = 0; i < block.fields.size(); ++i) {
+            widths[i] = block.fields[i].size();
+        }
+
+        for (size_t ri = 0; ri < block.rows.size(); ++ri) {
+            const Row& row = block.rows[ri];
+            for (size_t i = 0; i < block.fields.size(); ++i) {
+                Row::const_iterator it = row.find(block.fields[i]);
+                if (it != row.end()) {
+                    std::string str_value = value_to_ison(it->second);
+                    if (str_value.size() > widths[i]) {
+                        widths[i] = str_value.size();
+                    }
+                }
+            }
+        }
+        return widths;
+    }
+
+    static std::string value_to_ison(const Value& v) {
+        switch (v.type()) {
+            case ValueType::Null: return "null";
+            case ValueType::Bool: return v.as_bool() ? "true" : "false";
+            case ValueType::Int: return std::to_string(v.as_int());
+            case ValueType::Float: return detail::format_double(v.as_float());
+            case ValueType::String: return quote_if_needed(v.as_string());
+            case ValueType::Reference: {
+                std::shared_ptr<Reference> r = v.as_reference_ptr();
+                return r ? r->to_ison() : "null";
+            }
+        }
+        return "null";
+    }
+
+    static std::string quote_if_needed(const std::string& s) {
+        if (s.empty()) return "\"\"";
+
+        // '\r' and '\\' would be emitted raw and corrupt on re-parse; a
+        // leading '#' would turn the line into a comment (or an inline
+        // comment) and silently lose data.
+        bool needs_quote = (s == "true" || s == "false" || s == "null" || s == "~" ||
+                            s[0] == ':' || s[0] == '#');
+
+        if (!needs_quote) {
+            for (size_t i = 0; i < s.size(); ++i) {
+                char c = s[i];
+                if (c == ' ' || c == '\t' || c == '"' || c == '\n' ||
+                    c == '\r' || c == '\\') {
+                    needs_quote = true;
+                    break;
+                }
+            }
+        }
+
+        if (!needs_quote && looks_like_number(s)) {
+            needs_quote = true;
+        }
+
+        // A bare 'kind.name'-shaped value alone on a row line would be
+        // misread as the next block header on re-parse
+        if (!needs_quote && Parser::looks_like_header(s)) {
+            needs_quote = true;
+        }
+
+        if (needs_quote) {
+            std::string escaped;
+            for (size_t i = 0; i < s.size(); ++i) {
+                char c = s[i];
+                switch (c) {
+                    case '\\': escaped += "\\\\"; break;
+                    case '"':  escaped += "\\\""; break;
+                    case '\n': escaped += "\\n"; break;
+                    case '\t': escaped += "\\t"; break;
+                    case '\r': escaped += "\\r"; break;
+                    default:   escaped += c; break;
+                }
+            }
+            return "\"" + escaped + "\"";
+        }
+        return s;
+    }
+
+    static bool looks_like_number(const std::string& s) {
+        if (s.empty()) return false;
+        size_t start = (s[0] == '-') ? 1 : 0;
+        if (start == s.size()) return false;
+        for (size_t i = start; i < s.size(); ++i) {
+            if (s[i] != '.' && !std::isdigit(static_cast<unsigned char>(s[i]))) {
+                return false;
+            }
+        }
+        return true;
+    }
+};
+
+// =============================================================================
+// JSON Output
+// =============================================================================
+
+inline std::string Document::to_json(int indent) const {
+    std::string ind(static_cast<size_t>(indent), ' ');
+    std::ostringstream oss;
+
+    oss << "{\n";
+    for (size_t bi = 0; bi < blocks.size(); ++bi) {
+        const Block& block = blocks[bi];
+        oss << ind << "\"" << block.name << "\": [\n";
+
+        for (size_t ri = 0; ri < block.rows.size(); ++ri) {
+            const Row& row = block.rows[ri];
+            oss << ind << ind << "{\n";
+
+            size_t fi = 0;
+            for (Row::const_iterator it = row.begin(); it != row.end(); ++it, ++fi) {
+                oss << ind << ind << ind << "\"" << it->first << "\": ";
+
+                const Value& v = it->second;
+                switch (v.type()) {
+                    case ValueType::Null: oss << "null"; break;
+                    case ValueType::Bool: oss << (v.as_bool() ? "true" : "false"); break;
+                    case ValueType::Int: oss << v.as_int(); break;
+                    case ValueType::Float: oss << v.as_float(); break;
+                    case ValueType::String: oss << "\"" << v.as_string() << "\""; break;
+                    case ValueType::Reference: {
+                        std::shared_ptr<Reference> r = v.as_reference_ptr();
+                        oss << "\"" << (r ? r->to_ison() : "null") << "\"";
+                        break;
+                    }
+                }
+
+                if (fi < row.size() - 1) oss << ",";
+                oss << "\n";
+            }
+
+            oss << ind << ind << "}";
+            if (ri < block.rows.size() - 1) oss << ",";
+            oss << "\n";
+        }
+
+        oss << ind << "]";
+        if (bi < blocks.size() - 1) oss << ",";
+        oss << "\n";
+    }
+    oss << "}";
+
+    return oss.str();
+}
+
+// =============================================================================
+// ISONL Support
+// =============================================================================
+
+struct ISONLRecord {
+    std::string kind;
+    std::string name;
+    std::vector<std::string> fields;
+    std::vector<FieldInfo> field_info;
+    Row values;
+
+    std::string to_block_key() const { return kind + "." + name; }
+};
+
+class ISONLParser {
+public:
+    Optional<ISONLRecord> parse_line(const std::string& line, int line_num = 0) {
+        std::string trimmed = line;
+        size_t start = trimmed.find_first_not_of(" \t\r\n");
+        if (start == std::string::npos) return Optional<ISONLRecord>();
+        size_t end = trimmed.find_last_not_of(" \t\r\n");
+        trimmed = trimmed.substr(start, end - start + 1);
+
+        if (trimmed.empty() || trimmed[0] == '#') return Optional<ISONLRecord>();
+
+        std::vector<std::string> sections = split_by_pipe(trimmed);
+        if (sections.size() != 3) {
+            throw ISONSyntaxError("ISONL line must have 3 pipe-separated sections", line_num, 0);
+        }
+
+        size_t dot_pos = sections[0].find('.');
+        if (dot_pos == std::string::npos) {
+            throw ISONSyntaxError("Invalid ISONL header", line_num, 0);
+        }
+
+        ISONLRecord record;
+        record.kind = sections[0].substr(0, dot_pos);
+        record.name = sections[0].substr(dot_pos + 1);
+
+        // Parse fields, including any type annotations. Without this an
+        // annotated envelope written by another implementation would be read
+        // as fields literally named "id:int", corrupting the row keys.
+        Tokenizer field_tokenizer(sections[1], line_num);
+        std::vector<std::string> raw_fields = field_tokenizer.tokenize();
+        for (size_t i = 0; i < raw_fields.size(); ++i) {
+            FieldInfo fi = FieldInfo::parse(raw_fields[i]);
+            record.field_info.push_back(fi);
+            record.fields.push_back(fi.name);
+        }
+
+        Tokenizer value_tokenizer(sections[2], line_num);
+        std::vector<std::string> raw_values = value_tokenizer.tokenize();
+
+        std::vector<Value> typed_values;
+        std::vector<bool> quoted_flags;
+        size_t pos = 0;
+        for (size_t i = 0; i < raw_values.size(); ++i) {
+            while (pos < sections[2].size() && (sections[2][pos] == ' ' || sections[2][pos] == '\t')) {
+                ++pos;
+            }
+            bool was_quoted = pos < sections[2].size() && sections[2][pos] == '"';
+            typed_values.push_back(TypeInferrer::infer(raw_values[i], was_quoted));
+            quoted_flags.push_back(was_quoted);
+
+            if (was_quoted) {
+                ++pos;
+                while (pos < sections[2].size() && sections[2][pos] != '"') {
+                    if (sections[2][pos] == '\\') ++pos;
+                    ++pos;
+                }
+                if (pos < sections[2].size()) ++pos;
+            } else {
+                pos += raw_values[i].size();
+            }
+        }
+
+        size_t keep = Parser::strip_inline_comment(raw_values, quoted_flags);
+        raw_values.resize(keep);
+        typed_values.resize(keep);
+        Parser::check_extra_tokens(raw_values, record.fields.size(), line_num);
+
+        for (size_t i = 0; i < record.fields.size(); ++i) {
+            record.values[record.fields[i]] = (i < typed_values.size())
+                ? typed_values[i]
+                : Value(nullptr);
+        }
+
+        return record;
+    }
+
+    Document parse_to_document(const std::string& text) {
+        std::vector<ISONLRecord> records;
+        std::istringstream stream(text);
+        std::string line;
+        int line_num = 0;
+
+        while (std::getline(stream, line)) {
+            ++line_num;
+            Optional<ISONLRecord> record = parse_line(line, line_num);
+            if (record.has_value()) {
+                records.push_back(record.value());
+            }
+        }
+
+        return records_to_document(records);
+    }
+
+private:
+    std::vector<std::string> split_by_pipe(const std::string& line) {
+        std::vector<std::string> sections;
+        std::string current;
+        bool in_quotes = false;
+
+        size_t i = 0;
+        while (i < line.size()) {
+            char c = line[i];
+
+            if (in_quotes && c == '\\' && i + 1 < line.size()) {
+                // Consume the escape pair so an escaped backslash before a
+                // closing quote ("foo\\") can't desync the quote tracking
+                current += c;
+                current += line[i + 1];
+                i += 2;
+                continue;
+            }
+
+            if (c == '"') {
+                in_quotes = !in_quotes;
+                current += c;
+            } else if (c == '|' && !in_quotes) {
+                size_t s = current.find_first_not_of(" \t");
+                size_t e = current.find_last_not_of(" \t");
+                sections.push_back(s != std::string::npos ? current.substr(s, e - s + 1) : "");
+                current.clear();
+            } else {
+                current += c;
+            }
+
+            ++i;
+        }
+
+        size_t s = current.find_first_not_of(" \t");
+        size_t e = current.find_last_not_of(" \t");
+        sections.push_back(s != std::string::npos ? current.substr(s, e - s + 1) : "");
+
+        return sections;
+    }
+
+    Document records_to_document(const std::vector<ISONLRecord>& records) {
+        std::map<std::string, std::vector<const ISONLRecord*> > blocks_map;
+        std::vector<std::string> block_order;
+
+        for (size_t i = 0; i < records.size(); ++i) {
+            std::string key = records[i].to_block_key();
+            if (blocks_map.find(key) == blocks_map.end()) {
+                block_order.push_back(key);
+            }
+            blocks_map[key].push_back(&records[i]);
+        }
+
+        Document doc;
+        for (size_t i = 0; i < block_order.size(); ++i) {
+            const std::string& key = block_order[i];
+            const std::vector<const ISONLRecord*>& recs = blocks_map[key];
+            size_t dot_pos = key.find('.');
+
+            Block block;
+            block.kind = key.substr(0, dot_pos);
+            block.name = key.substr(dot_pos + 1);
+            block.fields = recs[0]->fields;
+            block.field_info = recs[0]->field_info;
+
+            for (size_t j = 0; j < recs.size(); ++j) {
+                block.rows.push_back(recs[j]->values);
+            }
+
+            doc.blocks.push_back(block);
+        }
+
+        return doc;
+    }
+};
+
+class ISONLSerializer {
+public:
+    // Build the ISONL field section, preserving type annotations. Dropping
+    // them makes an ISON -> ISONL -> ISON round trip lossy and diverges from
+    // the rest of the family.
+    static std::string fields_header(const Block& block,
+                                     const std::vector<std::string>& field_names) {
+        std::string out;
+        for (size_t i = 0; i < field_names.size(); ++i) {
+            if (i > 0) out += " ";
+            out += field_names[i];
+
+            for (size_t j = 0; j < block.field_info.size(); ++j) {
+                if (block.field_info[j].name == field_names[i]) {
+                    if (block.field_info[j].type.has_value()) {
+                        out += ":" + block.field_info[j].type.value();
+                    }
+                    break;
+                }
+            }
+        }
+        return out;
+    }
+
+    static std::string dumps(const Document& doc) {
+        std::ostringstream oss;
+        bool first = true;
+
+        for (size_t bi = 0; bi < doc.blocks.size(); ++bi) {
+            const Block& block = doc.blocks[bi];
+            validate_envelope(block);
+            std::string header = block.kind + "." + block.name;
+
+            std::string fields_str = fields_header(block, block.fields);
+
+            for (size_t ri = 0; ri < block.rows.size(); ++ri) {
+                if (!first) oss << "\n";
+                first = false;
+
+                const Row& row = block.rows[ri];
+                std::string values_str;
+                for (size_t i = 0; i < block.fields.size(); ++i) {
+                    if (i > 0) values_str += " ";
+                    Row::const_iterator it = row.find(block.fields[i]);
+                    if (it != row.end()) {
+                        values_str += value_to_isonl(it->second);
+                    } else {
+                        values_str += "null";
+                    }
+                }
+
+                oss << header << "|" << fields_str << "|" << values_str;
+            }
+        }
+
+        return oss.str();
+    }
+
+    /**
+     * Serialize a Document to canonical ISONL string.
+     *
+     * Blocks are sorted ordinal-string by key (kind.name), fields within
+     * each block are sorted (id first, then by UTF-8 bytes), rows within
+     * each block are sorted ordinal-string by first column value, producing
+     * byte-identical output across implementations for the same logical data.
+     */
+    static std::string dumps_canonical(const Document& doc) {
+        std::vector<const Block*> sorted_blocks;
+        for (size_t i = 0; i < doc.blocks.size(); ++i) {
+            sorted_blocks.push_back(&doc.blocks[i]);
+        }
+
+        // Sort blocks ordinal-string by key (kind.name)
+        std::sort(sorted_blocks.begin(), sorted_blocks.end(),
+                  [](const Block* a, const Block* b) {
+                      std::string a_key = a->kind + "." + a->name;
+                      std::string b_key = b->kind + "." + b->name;
+                      return a_key < b_key;
+                  });
+
+        std::ostringstream oss;
+        bool first = true;
+
+        for (size_t bi = 0; bi < sorted_blocks.size(); ++bi) {
+            const Block& block = *sorted_blocks[bi];
+            validate_envelope(block);
+            std::string header = block.kind + "." + block.name;
+
+            // Sort fields in canonical order (id first, then by UTF-8 bytes)
+            std::vector<std::string> sorted_fields = sort_fields_canonical_isonl(block.fields);
+
+            std::string fields_str = fields_header(block, sorted_fields);
+
+            // Sort rows by first column value (key)
+            std::vector<const Row*> sorted_rows;
+            for (size_t i = 0; i < block.rows.size(); ++i) {
+                sorted_rows.push_back(&block.rows[i]);
+            }
+
+            // Share the ISON comparator rather than carrying a second copy --
+            // the duplicate is how a first-column-only sort survives here after
+            // canonical ISON is fixed.
+            if (!sorted_fields.empty()) {
+                std::stable_sort(sorted_rows.begin(), sorted_rows.end(),
+                                 [&sorted_fields](const Row* a, const Row* b) {
+                                     return Serializer::row_less_canonical(a, b, sorted_fields);
+                                 });
+            }
+
+            for (size_t ri = 0; ri < sorted_rows.size(); ++ri) {
+                if (!first) oss << "\n";
+                first = false;
+
+                const Row& row = *sorted_rows[ri];
+                std::string values_str;
+                for (size_t i = 0; i < sorted_fields.size(); ++i) {
+                    if (i > 0) values_str += " ";
+                    Row::const_iterator it = row.find(sorted_fields[i]);
+                    if (it != row.end()) {
+                        values_str += value_to_isonl(it->second);
+                    } else {
+                        values_str += "null";
+                    }
+                }
+
+                oss << header << "|" << fields_str << "|" << values_str;
+            }
+        }
+
+        return oss.str();
+    }
+
+private:
+    /**
+     * Sort fields in canonical order: 'id' first (if present),
+     * then all other fields sorted by UTF-8 byte comparison.
+     * (Private helper for ISONLSerializer)
+     */
+    static std::vector<std::string> sort_fields_canonical_isonl(const std::vector<std::string>& fields) {
+        std::vector<std::string> id_fields;
+        std::vector<std::string> other_fields;
+
+        // Partition: separate 'id' field from others
+        for (size_t i = 0; i < fields.size(); ++i) {
+            if (fields[i] == "id") {
+                id_fields.push_back(fields[i]);
+            } else {
+                other_fields.push_back(fields[i]);
+            }
+        }
+
+        // Sort other fields by UTF-8 bytes (using UNSIGNED char comparison)
+        std::sort(other_fields.begin(), other_fields.end(),
+            [](const std::string& a, const std::string& b) {
+                // Cast to unsigned char* to avoid signed char trap on x86
+                const auto* a_bytes = reinterpret_cast<const unsigned char*>(a.data());
+                const auto* b_bytes = reinterpret_cast<const unsigned char*>(b.data());
+                size_t min_len = std::min(a.size(), b.size());
+
+                // Compare byte-by-byte as unsigned values
+                for (size_t i = 0; i < min_len; ++i) {
+                    if (a_bytes[i] != b_bytes[i]) {
+                        return a_bytes[i] < b_bytes[i];
+                    }
+                }
+                // If all common bytes match, shorter one comes first
+                return a.size() < b.size();
+            });
+
+        // Return: id first (if present), then sorted others
+        std::vector<std::string> result = id_fields;
+        result.insert(result.end(), other_fields.begin(), other_fields.end());
+        return result;
+    }
+
+    /**
+     * Convert a value to a string for ordinal-string sorting.
+     */
+    static std::string value_to_sort_string(const Value& v) {
+        switch (v.type()) {
+            case ValueType::Null: return "";  // null values sort to end
+            case ValueType::Bool: return v.as_bool() ? "true" : "false";
+            case ValueType::Int: return std::to_string(v.as_int());
+            case ValueType::Float: return detail::format_double(v.as_float());
+            case ValueType::String: return v.as_string();
+            case ValueType::Reference: {
+                std::shared_ptr<Reference> r = v.as_reference_ptr();
+                return r ? r->to_ison() : "";
+            }
+        }
+        return "";
+    }
+    // Characters that would corrupt the line structure if they appeared
+    // raw in the envelope (kind, name, or field names)
+    static bool envelope_char_forbidden(char c) {
+        return c == '|' || c == '"' || c == '\\' ||
+               c == ' ' || c == '\t' || c == '\n' || c == '\r';
+    }
+
+    static void validate_envelope_part(const std::string& label, const std::string& value) {
+        if (value.empty()) {
+            throw ISONError("ISONL block " + label + " must be non-empty");
+        }
+        for (size_t i = 0; i < value.size(); ++i) {
+            if (envelope_char_forbidden(value[i])) {
+                throw ISONError(
+                    "ISONL block " + label + " '" + value + "' contains characters that "
+                    "cannot be serialized (pipe, quote, backslash, or whitespace)");
+            }
+        }
+    }
+
+    // Reject kind/name/fields that cannot survive an ISONL round-trip
+    static void validate_envelope(const Block& block) {
+        // The shared ISON name rules apply here too - a name unwritable in ISON
+        // is unwritable in ISONL. ISONL then adds two of its own, for different
+        // reasons: the quote, which it genuinely cannot parse in an envelope, and
+        // the backslash, which it CAN parse but which is kept out of the raw
+        // envelope as a deliberate guard - it is the escape character inside
+        // values. See ISONCS.md, 'Where ISONL is stricter'.
+        detail::validate_block_names(block);
+        detail::validate_row_references(block, true);
+
+        validate_envelope_part("kind", block.kind);
+        validate_envelope_part("name", block.name);
+        if (block.kind.find('.') != std::string::npos) {
+            throw ISONError("ISONL block kind '" + block.kind + "' must not contain '.'");
+        }
+        if (block.kind[0] == '#') {
+            throw ISONError("ISONL block kind '" + block.kind + "' must not start with '#'");
+        }
+        for (size_t i = 0; i < block.fields.size(); ++i) {
+            validate_envelope_part("field name", block.fields[i]);
+        }
+    }
+
+    static std::string value_to_isonl(const Value& v) {
+        switch (v.type()) {
+            case ValueType::Null: return "null";
+            case ValueType::Bool: return v.as_bool() ? "true" : "false";
+            case ValueType::Int: return std::to_string(v.as_int());
+            case ValueType::Float: return detail::format_double(v.as_float());
+            case ValueType::String: return quote_if_needed(v.as_string());
+            case ValueType::Reference: {
+                std::shared_ptr<Reference> r = v.as_reference_ptr();
+                return r ? r->to_ison() : "null";
+            }
+        }
+        return "null";
+    }
+
+    static std::string quote_if_needed(const std::string& s) {
+        if (s.empty()) return "\"\"";
+
+        // A leading '#' would start an inline comment in the values section
+        // and silently drop the rest of the row on re-parse
+        bool needs_quote = (s == "true" || s == "false" || s == "null" || s == "~" ||
+                           s[0] == ':' || s[0] == '#' ||
+                           s.find(' ') != std::string::npos ||
+                           s.find('\t') != std::string::npos ||
+                           s.find('"') != std::string::npos ||
+                           s.find('\n') != std::string::npos ||
+                           s.find('\r') != std::string::npos ||
+                           s.find('\\') != std::string::npos ||
+                           s.find('|') != std::string::npos);
+
+        if (!needs_quote && looks_like_number(s)) {
+            needs_quote = true;
+        }
+
+        if (needs_quote) {
+            std::string escaped;
+            for (size_t i = 0; i < s.size(); ++i) {
+                char c = s[i];
+                switch (c) {
+                    case '\\': escaped += "\\\\"; break;
+                    case '"':  escaped += "\\\""; break;
+                    case '\n': escaped += "\\n"; break;
+                    case '\t': escaped += "\\t"; break;
+                    case '\r': escaped += "\\r"; break;
+                    case '|':  escaped += "\\|"; break;
+                    default:   escaped += c; break;
+                }
+            }
+            return "\"" + escaped + "\"";
+        }
+        return s;
+    }
+
+    // Mirrors Serializer::looks_like_number (private there): bare numeric
+    // strings must be quoted or they would be re-parsed as numbers
+    static bool looks_like_number(const std::string& s) {
+        if (s.empty()) return false;
+        size_t start = (s[0] == '-') ? 1 : 0;
+        if (start == s.size()) return false;
+        for (size_t i = start; i < s.size(); ++i) {
+            if (s[i] != '.' && !std::isdigit(static_cast<unsigned char>(s[i]))) {
+                return false;
+            }
+        }
+        return true;
+    }
+};
+
+// =============================================================================
+// Public API Functions
+// =============================================================================
+
+inline Document parse(const std::string& text) {
+    Parser parser(text);
+    return parser.parse();
+}
+
+inline Document loads(const std::string& text) {
+    return parse(text);
+}
+
+inline Document load(const std::string& path) {
+    std::ifstream file(path.c_str());
+    if (!file.is_open()) {
+        throw ISONError("Could not open file: " + path);
+    }
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    return parse(buffer.str());
+}
+
+inline std::string dumps(const Document& doc, bool align_columns = false, const std::string& delimiter = " ") {
+    return Serializer::dumps(doc, align_columns);
+}
+
+inline std::string dumps_canonical(const Document& doc) {
+    return Serializer::dumps_canonical(doc);
+}
+
+inline void dump(const Document& doc, const std::string& path, bool align_columns = true) {
+    std::ofstream file(path.c_str());
+    if (!file.is_open()) {
+        throw ISONError("Could not open file for writing: " + path);
+    }
+    file << dumps(doc, align_columns);
+}
+
+inline Document loads_isonl(const std::string& text) {
+    ISONLParser parser;
+    return parser.parse_to_document(text);
+}
+
+inline std::string dumps_isonl(const Document& doc) {
+    return ISONLSerializer::dumps(doc);
+}
+
+inline std::string dumps_canonical_isonl(const Document& doc) {
+    return ISONLSerializer::dumps_canonical(doc);
+}
+
+inline std::string ison_to_isonl(const std::string& ison_text) {
+    Document doc = parse(ison_text);
+    return dumps_isonl(doc);
+}
+
+inline std::string isonl_to_ison(const std::string& isonl_text) {
+    Document doc = loads_isonl(isonl_text);
+    return dumps(doc);
+}
+
+// =============================================================================
+// Value Helper Functions
+// =============================================================================
+
+inline bool is_null(const Value& v) { return v.is_null(); }
+inline bool is_bool(const Value& v) { return v.is_bool(); }
+inline bool is_int(const Value& v) { return v.is_int(); }
+inline bool is_float(const Value& v) { return v.is_float(); }
+inline bool is_string(const Value& v) { return v.is_string(); }
+inline bool is_reference(const Value& v) { return v.is_reference(); }
+
+inline bool as_bool(const Value& v) { return v.as_bool(); }
+inline int64_t as_int(const Value& v) { return v.as_int(); }
+inline double as_float(const Value& v) { return v.as_float(); }
+inline const std::string& as_string(const Value& v) { return v.as_string(); }
+
+} // namespace ison
+
+#endif // ISON_PARSER_HPP

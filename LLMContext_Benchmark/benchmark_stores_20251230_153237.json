@@ -1,0 +1,599 @@
+{
+  "metadata": {
+    "date": "2025-12-30T15:32:37.630762",
+    "node_count": 1000,
+    "edge_count": 5000
+  },
+  "results": {
+    "ISONGraph": {
+      "total_time_ms": 542.2633,
+      "peak_memory_mb": 0.307647705078125,
+      "memory_after_load_mb": 2.7257919311523438,
+      "serialized_size_bytes": 172347,
+      "token_count": 68975,
+      "nodes_per_1k_tokens": 14.498006524102935,
+      "context_4k_pct": 1683.9599609375,
+      "context_8k_pct": 841.97998046875,
+      "context_32k_pct": 210.4949951171875,
+      "context_128k_pct": 52.623748779296875,
+      "operations": [
+        {
+          "operation": "add_node",
+          "avg_time_us": 0.726,
+          "median_time_us": 0.7,
+          "min_time_us": 0.6,
+          "max_time_us": 1.7,
+          "ops_per_sec": 1377410.4683195592
+        },
+        {
+          "operation": "get_node",
+          "avg_time_us": 0.367,
+          "median_time_us": 0.4,
+          "min_time_us": 0.3,
+          "max_time_us": 0.7,
+          "ops_per_sec": 2724795.6403269754
+        },
+        {
+          "operation": "update_node",
+          "avg_time_us": 0.746,
+          "median_time_us": 0.7,
+          "min_time_us": 0.6,
+          "max_time_us": 1.6,
+          "ops_per_sec": 1340482.5737265416
+        },
+        {
+          "operation": "add_edge",
+          "avg_time_us": 2.076,
+          "median_time_us": 1.8,
+          "min_time_us": 1.6,
+          "max_time_us": 6.6,
+          "ops_per_sec": 481695.5684007707
+        },
+        {
+          "operation": "get_edge",
+          "avg_time_us": 0.27699999999999997,
+          "median_time_us": 0.3,
+          "min_time_us": 0.2,
+          "max_time_us": 0.5,
+          "ops_per_sec": 3610108.303249098
+        },
+        {
+          "operation": "neighbors_1hop",
+          "avg_time_us": 1.24,
+          "median_time_us": 1.2,
+          "min_time_us": 0.8,
+          "max_time_us": 2.3,
+          "ops_per_sec": 806451.6129032258
+        },
+        {
+          "operation": "multi_hop_2",
+          "avg_time_us": 8.52,
+          "median_time_us": 8.4,
+          "min_time_us": 2.7,
+          "max_time_us": 24.7,
+          "ops_per_sec": 117370.89201877936
+        },
+        {
+          "operation": "multi_hop_3",
+          "avg_time_us": 32.358,
+          "median_time_us": 29.25,
+          "min_time_us": 5.7,
+          "max_time_us": 69.6,
+          "ops_per_sec": 30904.258606836025
+        },
+        {
+          "operation": "shortest_path",
+          "avg_time_us": 186.525,
+          "median_time_us": 206.45,
+          "min_time_us": 1.1,
+          "max_time_us": 370.5,
+          "ops_per_sec": 5361.211633829245
+        },
+        {
+          "operation": "has_path",
+          "avg_time_us": 240.945,
+          "median_time_us": 220.10000000000002,
+          "min_time_us": 41.5,
+          "max_time_us": 639.6,
+          "ops_per_sec": 4150.324762912698
+        },
+        {
+          "operation": "has_cycle",
+          "avg_time_us": 13.73,
+          "median_time_us": 13.4,
+          "min_time_us": 13.2,
+          "max_time_us": 15.0,
+          "ops_per_sec": 72833.21194464676
+        },
+        {
+          "operation": "save",
+          "avg_time_us": 3726.31,
+          "median_time_us": 3672.3,
+          "min_time_us": 3503.2,
+          "max_time_us": 4048.8,
+          "ops_per_sec": 268.36199886751234
+        },
+        {
+          "operation": "load",
+          "avg_time_us": 49365.11,
+          "median_time_us": 48633.8,
+          "min_time_us": 46369.5,
+          "max_time_us": 54969.2,
+          "ops_per_sec": 20.25722215548593
+        }
+      ]
+    },
+    "NetworkX": {
+      "total_time_ms": 2017.9886999999999,
+      "peak_memory_mb": 0.4551715850830078,
+      "memory_after_load_mb": 2.102632522583008,
+      "serialized_size_bytes": 509409,
+      "token_count": 185578,
+      "nodes_per_1k_tokens": 5.388569765812758,
+      "context_4k_pct": 4530.712890625,
+      "context_8k_pct": 2265.3564453125,
+      "context_32k_pct": 566.339111328125,
+      "context_128k_pct": 141.58477783203125,
+      "operations": [
+        {
+          "operation": "add_node",
+          "avg_time_us": 1.208,
+          "median_time_us": 1.1,
+          "min_time_us": 1.0,
+          "max_time_us": 3.7,
+          "ops_per_sec": 827814.5695364239
+        },
+        {
+          "operation": "get_node",
+          "avg_time_us": 0.611,
+          "median_time_us": 0.6,
+          "min_time_us": 0.4,
+          "max_time_us": 1.0,
+          "ops_per_sec": 1636661.2111292963
+        },
+        {
+          "operation": "update_node",
+          "avg_time_us": 0.759,
+          "median_time_us": 0.7,
+          "min_time_us": 0.6,
+          "max_time_us": 1.2,
+          "ops_per_sec": 1317523.0566534915
+        },
+        {
+          "operation": "add_edge",
+          "avg_time_us": 2.422,
+          "median_time_us": 2.4,
+          "min_time_us": 2.0,
+          "max_time_us": 3.8,
+          "ops_per_sec": 412881.91577208915
+        },
+        {
+          "operation": "get_edge",
+          "avg_time_us": 0.531,
+          "median_time_us": 0.5,
+          "min_time_us": 0.4,
+          "max_time_us": 0.9,
+          "ops_per_sec": 1883239.1713747645
+        },
+        {
+          "operation": "neighbors_1hop",
+          "avg_time_us": 0.934,
+          "median_time_us": 0.9,
+          "min_time_us": 0.7,
+          "max_time_us": 2.2,
+          "ops_per_sec": 1070663.8115631691
+        },
+        {
+          "operation": "multi_hop_2",
+          "avg_time_us": 4.862,
+          "median_time_us": 4.7,
+          "min_time_us": 2.6,
+          "max_time_us": 8.2,
+          "ops_per_sec": 205676.67626491154
+        },
+        {
+          "operation": "multi_hop_3",
+          "avg_time_us": 18.984,
+          "median_time_us": 18.15,
+          "min_time_us": 4.5,
+          "max_time_us": 41.1,
+          "ops_per_sec": 52675.93763168984
+        },
+        {
+          "operation": "shortest_path",
+          "avg_time_us": 15.14,
+          "median_time_us": 13.5,
+          "min_time_us": 8.9,
+          "max_time_us": 25.2,
+          "ops_per_sec": 66050.19815059444
+        },
+        {
+          "operation": "has_path",
+          "avg_time_us": 13.72,
+          "median_time_us": 12.2,
+          "min_time_us": 6.2,
+          "max_time_us": 24.7,
+          "ops_per_sec": 72886.2973760933
+        },
+        {
+          "operation": "has_cycle",
+          "avg_time_us": 44.745,
+          "median_time_us": 43.349999999999994,
+          "min_time_us": 42.5,
+          "max_time_us": 56.4,
+          "ops_per_sec": 22348.8657950609
+        },
+        {
+          "operation": "save",
+          "avg_time_us": 25143.31,
+          "median_time_us": 25070.4,
+          "min_time_us": 23995.1,
+          "max_time_us": 27949.0,
+          "ops_per_sec": 39.77201092457596
+        },
+        {
+          "operation": "load",
+          "avg_time_us": 176329.14,
+          "median_time_us": 173733.8,
+          "min_time_us": 171127.4,
+          "max_time_us": 191367.0,
+          "ops_per_sec": 5.671212370229901
+        }
+      ]
+    },
+    "igraph": {
+      "total_time_ms": 250.2643,
+      "peak_memory_mb": 0.214080810546875,
+      "memory_after_load_mb": 0.2179088592529297,
+      "serialized_size_bytes": 876335,
+      "token_count": 299987,
+      "nodes_per_1k_tokens": 3.333477784037308,
+      "context_4k_pct": 7323.9013671875,
+      "context_8k_pct": 3661.95068359375,
+      "context_32k_pct": 915.4876708984375,
+      "context_128k_pct": 228.87191772460938,
+      "operations": [
+        {
+          "operation": "add_node",
+          "avg_time_us": 3.22,
+          "median_time_us": 3.0,
+          "min_time_us": 2.5,
+          "max_time_us": 8.3,
+          "ops_per_sec": 310559.0062111801
+        },
+        {
+          "operation": "get_node",
+          "avg_time_us": 0.85,
+          "median_time_us": 0.8,
+          "min_time_us": 0.7,
+          "max_time_us": 1.1,
+          "ops_per_sec": 1176470.5882352942
+        },
+        {
+          "operation": "update_node",
+          "avg_time_us": 0.8450000000000001,
+          "median_time_us": 0.8,
+          "min_time_us": 0.7,
+          "max_time_us": 1.0,
+          "ops_per_sec": 1183431.9526627217
+        },
+        {
+          "operation": "add_edge",
+          "avg_time_us": 109.822,
+          "median_time_us": 105.9,
+          "min_time_us": 91.5,
+          "max_time_us": 198.7,
+          "ops_per_sec": 9105.643677951593
+        },
+        {
+          "operation": "get_edge",
+          "avg_time_us": 0.773,
+          "median_time_us": 0.8,
+          "min_time_us": 0.7,
+          "max_time_us": 1.0,
+          "ops_per_sec": 1293661.0608020697
+        },
+        {
+          "operation": "neighbors_1hop",
+          "avg_time_us": 1.646,
+          "median_time_us": 1.55,
+          "min_time_us": 1.0,
+          "max_time_us": 3.2,
+          "ops_per_sec": 607533.4143377886
+        },
+        {
+          "operation": "multi_hop_2",
+          "avg_time_us": 7.94,
+          "median_time_us": 8.149999999999999,
+          "min_time_us": 2.7,
+          "max_time_us": 20.9,
+          "ops_per_sec": 125944.58438287153
+        },
+        {
+          "operation": "multi_hop_3",
+          "avg_time_us": 38.184,
+          "median_time_us": 34.7,
+          "min_time_us": 14.3,
+          "max_time_us": 93.7,
+          "ops_per_sec": 26188.979677351774
+        },
+        {
+          "operation": "shortest_path",
+          "avg_time_us": 11.555,
+          "median_time_us": 11.399999999999999,
+          "min_time_us": 2.6,
+          "max_time_us": 21.1,
+          "ops_per_sec": 86542.62224145392
+        },
+        {
+          "operation": "has_path",
+          "avg_time_us": 11.415,
+          "median_time_us": 9.45,
+          "min_time_us": 1.7,
+          "max_time_us": 26.9,
+          "ops_per_sec": 87604.02978537013
+        },
+        {
+          "operation": "has_cycle",
+          "avg_time_us": 0.14500000000000002,
+          "median_time_us": 0.1,
+          "min_time_us": 0.1,
+          "max_time_us": 0.3,
+          "ops_per_sec": 6896551.72413793
+        },
+        {
+          "operation": "save",
+          "avg_time_us": 11475.130000000001,
+          "median_time_us": 11229.95,
+          "min_time_us": 11105.3,
+          "max_time_us": 12310.9,
+          "ops_per_sec": 87.14498223549536
+        },
+        {
+          "operation": "load",
+          "avg_time_us": 12111.12,
+          "median_time_us": 12144.7,
+          "min_time_us": 11348.1,
+          "max_time_us": 12691.5,
+          "ops_per_sec": 82.5687467385345
+        }
+      ]
+    },
+    "SQLite": {
+      "total_time_ms": 115.4988,
+      "peak_memory_mb": 0.0272369384765625,
+      "memory_after_load_mb": 0.02783966064453125,
+      "serialized_size_bytes": 638976,
+      "token_count": 363583,
+      "nodes_per_1k_tokens": 2.750403621731489,
+      "context_4k_pct": 8876.5380859375,
+      "context_8k_pct": 4438.26904296875,
+      "context_32k_pct": 1109.5672607421875,
+      "context_128k_pct": 277.3918151855469,
+      "operations": [
+        {
+          "operation": "add_node",
+          "avg_time_us": 1.552,
+          "median_time_us": 1.4,
+          "min_time_us": 1.3,
+          "max_time_us": 7.6,
+          "ops_per_sec": 644329.8969072165
+        },
+        {
+          "operation": "get_node",
+          "avg_time_us": 2.284,
+          "median_time_us": 2.2,
+          "min_time_us": 2.0,
+          "max_time_us": 5.0,
+          "ops_per_sec": 437828.37127845886
+        },
+        {
+          "operation": "update_node",
+          "avg_time_us": 1.948,
+          "median_time_us": 1.9,
+          "min_time_us": 1.8,
+          "max_time_us": 2.2,
+          "ops_per_sec": 513347.022587269
+        },
+        {
+          "operation": "add_edge",
+          "avg_time_us": 4.728,
+          "median_time_us": 4.2,
+          "min_time_us": 3.7,
+          "max_time_us": 9.3,
+          "ops_per_sec": 211505.92216582067
+        },
+        {
+          "operation": "get_edge",
+          "avg_time_us": 1.939,
+          "median_time_us": 1.9,
+          "min_time_us": 1.8,
+          "max_time_us": 4.6,
+          "ops_per_sec": 515729.7576070139
+        },
+        {
+          "operation": "neighbors_1hop",
+          "avg_time_us": 5.35,
+          "median_time_us": 5.05,
+          "min_time_us": 3.1,
+          "max_time_us": 11.7,
+          "ops_per_sec": 186915.8878504673
+        },
+        {
+          "operation": "multi_hop_2",
+          "avg_time_us": 35.35,
+          "median_time_us": 35.2,
+          "min_time_us": 16.5,
+          "max_time_us": 66.3,
+          "ops_per_sec": 28288.543140028287
+        },
+        {
+          "operation": "multi_hop_3",
+          "avg_time_us": 183.012,
+          "median_time_us": 175.95,
+          "min_time_us": 44.5,
+          "max_time_us": 427.7,
+          "ops_per_sec": 5464.122571197517
+        },
+        {
+          "operation": "shortest_path",
+          "avg_time_us": 2560.04,
+          "median_time_us": 2720.75,
+          "min_time_us": 5.6,
+          "max_time_us": 5122.5,
+          "ops_per_sec": 390.6188965797409
+        },
+        {
+          "operation": "has_path",
+          "avg_time_us": 1773.505,
+          "median_time_us": 1436.3,
+          "min_time_us": 15.1,
+          "max_time_us": 4478.6,
+          "ops_per_sec": 563.8551907099219
+        },
+        {
+          "operation": "has_cycle",
+          "avg_time_us": 638.35,
+          "median_time_us": 616.55,
+          "min_time_us": 609.5,
+          "max_time_us": 862.6,
+          "ops_per_sec": 1566.5387326701652
+        },
+        {
+          "operation": "save",
+          "avg_time_us": 321.49,
+          "median_time_us": 317.1,
+          "min_time_us": 312.2,
+          "max_time_us": 336.2,
+          "ops_per_sec": 3110.5166568166974
+        },
+        {
+          "operation": "load",
+          "avg_time_us": 41.53,
+          "median_time_us": 41.25,
+          "min_time_us": 40.6,
+          "max_time_us": 45.5,
+          "ops_per_sec": 24078.979051288225
+        }
+      ]
+    },
+    "DictGraph": {
+      "total_time_ms": 563.6114,
+      "peak_memory_mb": 0.2646636962890625,
+      "memory_after_load_mb": 1.8641281127929688,
+      "serialized_size_bytes": 709994,
+      "token_count": 273977,
+      "nodes_per_1k_tokens": 3.649941418440234,
+      "context_4k_pct": 6688.8916015625,
+      "context_8k_pct": 3344.44580078125,
+      "context_32k_pct": 836.1114501953125,
+      "context_128k_pct": 209.02786254882812,
+      "operations": [
+        {
+          "operation": "add_node",
+          "avg_time_us": 0.394,
+          "median_time_us": 0.4,
+          "min_time_us": 0.3,
+          "max_time_us": 1.2,
+          "ops_per_sec": 2538071.0659898478
+        },
+        {
+          "operation": "get_node",
+          "avg_time_us": 0.411,
+          "median_time_us": 0.4,
+          "min_time_us": 0.3,
+          "max_time_us": 0.7,
+          "ops_per_sec": 2433090.0243309005
+        },
+        {
+          "operation": "update_node",
+          "avg_time_us": 0.59,
+          "median_time_us": 0.6,
+          "min_time_us": 0.4,
+          "max_time_us": 2.0,
+          "ops_per_sec": 1694915.2542372881
+        },
+        {
+          "operation": "add_edge",
+          "avg_time_us": 0.866,
+          "median_time_us": 0.8,
+          "min_time_us": 0.7,
+          "max_time_us": 1.7,
+          "ops_per_sec": 1154734.4110854503
+        },
+        {
+          "operation": "get_edge",
+          "avg_time_us": 0.17500000000000002,
+          "median_time_us": 0.2,
+          "min_time_us": 0.1,
+          "max_time_us": 0.3,
+          "ops_per_sec": 5714285.714285714
+        },
+        {
+          "operation": "neighbors_1hop",
+          "avg_time_us": 0.402,
+          "median_time_us": 0.4,
+          "min_time_us": 0.3,
+          "max_time_us": 0.6,
+          "ops_per_sec": 2487562.189054726
+        },
+        {
+          "operation": "multi_hop_2",
+          "avg_time_us": 4.972,
+          "median_time_us": 4.75,
+          "min_time_us": 1.7,
+          "max_time_us": 8.9,
+          "ops_per_sec": 201126.30732099756
+        },
+        {
+          "operation": "multi_hop_3",
+          "avg_time_us": 19.814,
+          "median_time_us": 18.35,
+          "min_time_us": 5.8,
+          "max_time_us": 42.2,
+          "ops_per_sec": 50469.3650953871
+        },
+        {
+          "operation": "shortest_path",
+          "avg_time_us": 269.45,
+          "median_time_us": 283.4,
+          "min_time_us": 3.0,
+          "max_time_us": 713.9,
+          "ops_per_sec": 3711.2636852848395
+        },
+        {
+          "operation": "has_path",
+          "avg_time_us": 251.72,
+          "median_time_us": 273.25,
+          "min_time_us": 3.8,
+          "max_time_us": 401.8,
+          "ops_per_sec": 3972.6680438582553
+        },
+        {
+          "operation": "has_cycle",
+          "avg_time_us": 3.915,
+          "median_time_us": 3.8499999999999996,
+          "min_time_us": 3.6,
+          "max_time_us": 4.9,
+          "ops_per_sec": 255427.84163473817
+        },
+        {
+          "operation": "save",
+          "avg_time_us": 49977.16,
+          "median_time_us": 47990.4,
+          "min_time_us": 44596.4,
+          "max_time_us": 70614.4,
+          "ops_per_sec": 20.009140175232044
+        },
+        {
+          "operation": "load",
+          "avg_time_us": 5183.51,
+          "median_time_us": 5032.85,
+          "min_time_us": 4607.8,
+          "max_time_us": 6629.9,
+          "ops_per_sec": 192.9194696257941
+        }
+      ]
+    }
+  }
+}

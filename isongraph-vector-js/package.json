@@ -1,0 +1,50 @@
+{
+  "name": "isongraph-vector-js",
+  "version": "1.0.0",
+  "description": "ISONGraph Vector - semantic graph search for JavaScript: embedding similarity combined with graph traversal",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./sqlite": "./src/sqlite-store.js"
+  },
+  "type": "module",
+  "files": [
+    "src/index.js",
+    "src/sqlite-store.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "vitest run"
+  },
+  "keywords": [
+    "ison",
+    "graph",
+    "embeddings",
+    "semantic",
+    "vector"
+  ],
+  "author": "Mahesh Vaikri",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ISON-format/isongraph-vector.git",
+    "directory": "isongraph-vector-js"
+  },
+  "homepage": "https://github.com/ISON-format/isongraph-vector#readme",
+  "bugs": {
+    "url": "https://github.com/ISON-format/isongraph-vector/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ison-graph-js": "^1.4.0"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.10"
+  },
+  "optionalDependencies": {
+    "sqlite-vec": "^0.1.9"
+  }
+}

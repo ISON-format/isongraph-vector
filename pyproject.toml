@@ -1,0 +1,90 @@
+[build-system]
+# 77.0 is the first release that understands the PEP 639 SPDX `license`
+# field and `license-files`.
+requires = ["setuptools>=77.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "isongraph-vector"
+version = "1.0.0"
+description = "Semantic graph extension for ISONGraph with embedding-based similarity search"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    {name = "Mahesh Vaikri"}
+]
+keywords = [
+    "graph",
+    "embeddings",
+    "semantic-search",
+    "ison",
+    "sentence-transformers",
+    "knowledge-graph",
+    "vector-search"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Database :: Database Engines/Servers",
+]
+requires-python = ">=3.9"
+dependencies = [
+    "ison-graph>=1.4.0",
+    "sentence-transformers>=2.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "numpy>=1.21.0",
+    "sqlite-vec>=0.1.6",
+]
+# Vectorized similarity search. Optional: without numpy the store falls
+# back to a pure-Python cosine loop (~20k vectors/sec), which is fine for
+# small graphs and unusable past a few thousand nodes.
+fast = [
+    "numpy>=1.21.0",
+]
+# Answer top-k searches through a sqlite-vec vec0 virtual table instead of
+# scanning from Python. Same results - vec0 runs an exact brute-force KNN in
+# C - roughly 4x faster over 20,000 vectors.
+vec = [
+    "sqlite-vec>=0.1.6",
+]
+
+[project.urls]
+Homepage = "https://github.com/ISON-format/isongraph-vector"
+Documentation = "https://graph.ison.dev/docs/isongraph-vector"
+Repository = "https://github.com/ISON-format/isongraph-vector"
+Issues = "https://github.com/ISON-format/isongraph-vector/issues"
+Changelog = "https://github.com/ISON-format/isongraph-vector/blob/main/CHANGELOG.md"
+
+# The package directory is named `isongraph_vector-py` so it sits
+# alongside the other language ports (`isongraph-vector-{ts,js,rs,cpp}`)
+# with a matching name. That is not a legal Python module name, so the
+# import name is mapped onto it explicitly here rather than discovered.
+# `packages.find` with `where = ["src"]` used to be declared instead, and
+# there has never been a `src/` directory - `pip install .` failed outright
+# with "error in 'egg_base' option: 'src' does not exist".
+[tool.setuptools]
+packages = ["isongraph_vector"]
+
+[tool.setuptools.package-dir]
+isongraph_vector = "isongraph_vector-py"
+
+[tool.setuptools.package-data]
+isongraph_vector = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+addopts = "-v --tb=short"
