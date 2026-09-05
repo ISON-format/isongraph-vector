@@ -1,8 +1,11 @@
-<p align="center">
-  <img src="../../logo/ison_graph_logo_stretch.png" alt="ISONGraph Logo">
-</p>
-
 # ISONGraph LLM Context Window Benchmark
+
+> This report measures **ISON graph serialization**, not embeddings. It was
+> extracted alongside `isongraph-vector` and kept because it still runs, but it
+> exercises `ison-graph`; nothing here touches `SemanticGraph` or
+> `EmbeddingStore`. The argument it makes — that a compact serialization fits
+> more graph in a context window — is the same one `semantic_subgraph` makes
+> one level up, by sending less of the graph in the first place.
 
 **Focus: Token Efficiency, Serialization Size, and Context Window Capacity**
 

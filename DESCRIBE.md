@@ -27,14 +27,19 @@ surface similarity.
 Six implementations of the same library, plus a benchmark suite that
 belongs to a different package:
 
-| Port | Lines | Tests |
+| Port | Implementation | Tests |
 | --- | ---: | ---: |
-| Python (`isongraph_vector-py/`) | ~1,200 | 54 |
-| C++ (`isongraph-vector-cpp/`, header-only) | ~1,000 | 49 |
-| C# (`isongraph-vector-csharp/`) | ~700 | 40 |
-| TypeScript (`isongraph-vector-ts/`) | ~640 | 47 |
-| JavaScript (`isongraph-vector-js/`) | ~600 | 45 |
-| Rust (`isongraph-vector-rs/`) | ~900 | 30 + 1 doctest |
+| Rust (`isongraph-vector-rs/`) | 2,368 | 47 |
+| C++ (`isongraph-vector-cpp/`, header-only) | 1,806 | 67 |
+| Python (`isongraph_vector-py/`) | 1,745 | 68 |
+| TypeScript (`isongraph-vector-ts/`) | 1,390 | 66 |
+| C# (`isongraph-vector-csharp/`) | 1,386 | 59 |
+| JavaScript (`isongraph-vector-js/`) | 1,132 | 64 |
+
+Line counts are implementation only, excluding tests. Rust leads because
+its store, its SQLite backend and its tests all live in the crate; C++ is
+close behind because it carries its own MD5 and a hand-written JSON
+reader rather than pulling in dependencies.
 
 `LLMContext_Benchmark/` (3,269 lines) measures ISON *serialization* token
 efficiency against NetworkX/igraph/SQLite/JSON. It contains zero
@@ -50,13 +55,14 @@ two tables, so a database file written by one opens in another.
 
 ## Maturity
 
-Real, working, tested — 372 tests across six languages, all passing,
+Real, working, tested — 371 tests across six languages, all passing,
 all six verified by actually building and running them rather than by
 reading the code and assuming it worked.
 
 That method is the point. Every defect below was found by running
-something, and several had been sitting in the code across all five
-ports for months:
+something, and several had been sitting in the code for months across
+the five ports that existed at the time — the C# port was written later,
+against the fixed behaviour:
 
 - **The package could not be built or installed at all.**
   `pyproject.toml` declared `packages.find` with `where = ["src"]` and
@@ -68,7 +74,7 @@ ports for months:
   it explicitly via `[tool.setuptools.package-dir]`, and a root
   `conftest.py` does the same for a checkout. Wheel verified.
 
-- **A directly-matching node lost its own score — in all five ports.**
+- **A directly-matching node lost its own score — in every port then written.**
   In `semantic_multi_hop`, a seed was inserted only `if node_ref not in
   results`, while the neighbour branch right below it compared scores
   before overwriting. So a node that was itself a strong direct match,
@@ -99,8 +105,8 @@ ports for months:
   escaped it only because `hash * 1103515245` overflows float64, which
   also meant its vectors did not match the other ports at all. Replaced
   everywhere with FNV-1a seeding an xorshift32, taking the top 24 bits.
-  The five ports now produce **byte-identical vectors for the same
-  text**, asserted against the same golden values in all five suites.
+  All six ports now produce **byte-identical vectors for the same
+  text**, asserted against the same golden values in all six suites.
 
 - **Nothing validated vector dimensions.** A 2-dim vector added to a
   384-dim store scored a plausible-looking 0.06 against a 384-dim query
@@ -189,7 +195,7 @@ plus:
 
 **Encoders** — `SentenceTransformerEncoder` (default `all-MiniLM-L6-v2`,
 real model, requires `sentence-transformers`) or `MockEncoder`
-(deterministic, zero dependencies, identical across all five ports — has
+(deterministic, zero dependencies, identical across all six ports — has
 no real semantic structure, don't use it to validate relevance quality,
 only plumbing).
 
@@ -230,13 +236,29 @@ results = graph.semantic_multi_hop(
 )
 for r in results:
     print(f"{r.node_ref}: score={r.score:.4f}, hops={r.hop_count}, path={r.path}")
-# Bob (data scientist) matches directly at hop 0; Alice and Charlie show
-# up at hop 1 via KNOWS, with score decayed by `decay ** hop_count`.
 
 # Keep the whole thing, embeddings included
 graph.save("social.isong")
 graph = SemanticGraph.load("social.isong", encoder=graph.encoder)
 ```
+
+With the real `all-MiniLM-L6-v2` encoder that prints:
+
+```text
+('person', 2): score=0.4585, hops=0, path=[('person', 2)]
+('person', 3): score=0.3668, hops=1, path=[('person', 2), ('person', 3)]
+```
+
+Bob is the data scientist, so he matches "machine learning" directly and
+seeds the search at hop 0. Charlie is one `KNOWS` hop out and arrives
+decayed by `decay ** hop_count`.
+
+Alice is the instructive absence. She is in the graph, and she is one hop
+from Bob — but `KNOWS` edges are directed and traversal follows
+`Direction.OUT`, so from Bob the search reaches who *Bob* knows, not who
+knows Bob. Pass `direction=Direction.BOTH` to walk the relationship in
+either direction. Her own similarity to "machine learning" is also below
+the default `threshold` of 0.3, so she never seeds the search either.
 
 ## Limitations
 

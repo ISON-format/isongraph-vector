@@ -523,7 +523,7 @@ public sealed class SemanticGraph
     public Node AddNode(
         string nodeType,
         string nodeId,
-        IDictionary<string, object?>? properties = null,
+        Dictionary<string, object?>? properties = null,
         string? embedText = null)
     {
         var node = _graph.AddNode(nodeType, nodeId, properties);

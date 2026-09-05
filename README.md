@@ -4,196 +4,242 @@
 [![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**Semantic Graph Extension** - Combines ISONGraph with embedding-based similarity search for semantic multi-hop traversal.
+**Semantic search over an ISON graph — find the nodes that mean what you asked,
+then walk the graph from there.**
 
-## Features
+## The problem this solves
 
-- **EmbeddingStore**: vector storage with cosine similarity search (SQLite-backed in Python, in-memory elsewhere)
-- **SemanticGraph**: ISONGraph extended with embedding capabilities
-- **Semantic Multi-Hop**: combines embedding similarity with graph traversal
-- **Semantic Subgraph**: extract the on-topic slice of a graph, ready to serialize into an LLM context
-- **Portable embeddings**: one JSON format read and written by all five language ports
-- **sentence-transformers**: `all-MiniLM-L6-v2` by default, or any model you name
+[ISONGraph](https://github.com/ISON-format/isongraph) is a good graph. It stores
+nodes and edges compactly, walks relationships, finds shortest paths. What it
+cannot do is answer *"which node is about machine learning?"* — traversal needs
+a starting node, and you have to already know which one.
 
-## Language ports
+Vector search has the opposite shape. It will find the three nodes closest in
+meaning to a query, and then stop. It knows nothing about who those nodes are
+connected to.
 
-The same library, implemented six times. Each directory is a self-contained,
-separately published package with its own README.
+`isongraph-vector` puts the two together. A query finds its seeds by meaning,
+traversal takes over from there, and relevance decays with each hop — so the
+answer is "these nodes are about your question, and these others are one or two
+relationships away from them, in that order."
+
+```text
+person:1  score=1.0000  hops=0     ← matched the query directly
+person:2  score=0.8000  hops=1     ← reached via KNOWS, decayed once
+person:3  score=0.6400  hops=2     ← two hops out
+```
+
+## Six languages, one library
+
+Each directory is a self-contained, separately published package with its own
+README. The behaviour is the same in all six; the idioms are native to each.
 
 | Port | Directory | Package | Base library | Tests |
 | --- | --- | --- | --- | ---: |
 | Python | [`isongraph_vector-py/`](isongraph_vector-py/) | `isongraph-vector` | `ison-graph` 1.4.0 | 68 |
-| C# | [`isongraph-vector-csharp/`](isongraph-vector-csharp/) | `IsonGraph.Vector` | `IsonGraph` 1.4.0 | 59 |
+| C++ | [`isongraph-vector-cpp/`](isongraph-vector-cpp/) | headers | vendored `ison-graph-cpp` 1.4.0 | 67 |
 | TypeScript | [`isongraph-vector-ts/`](isongraph-vector-ts/) | `isongraph-vector-ts` | `ison-graph-ts` 1.4.0 | 66 |
 | JavaScript | [`isongraph-vector-js/`](isongraph-vector-js/) | `isongraph-vector-js` | `ison-graph-js` 1.4.0 | 64 |
+| C# | [`isongraph-vector-csharp/`](isongraph-vector-csharp/) | `IsonGraph.Vector` | `IsonGraph` 1.4.0 | 59 |
 | Rust | [`isongraph-vector-rs/`](isongraph-vector-rs/) | `isongraph-vector-rs` | `ison-graph` 1.4 | 47 |
-| C++ (header-only) | [`isongraph-vector-cpp/`](isongraph-vector-cpp/) | headers | vendored `ison-graph-cpp` 1.4.0 | 67 |
 
-Feature parity is deliberate but not total:
+Parity is deliberate but not total:
 
 | Capability | Python | C# | TS | JS | Rust | C++ |
 | --- | :---: | :---: | :---: | :---: | :---: | :---: |
-| Persistent store (SQLite) | yes | yes | yes | yes | yes | yes |
+| Semantic multi-hop, path, subgraph | yes | yes | yes | yes | yes | yes |
+| `MockEncoder`, byte-identical everywhere | yes | yes | yes | yes | yes | yes |
+| Portable embedding JSON | yes | yes | yes | yes | yes | yes |
+| SQLite store, shared schema | yes | yes | yes | yes | yes | yes |
 | sqlite-vec search backend | yes | yes | yes | yes | yes | yes |
 | Real encoder (sentence-transformers) | yes | - | - | - | - | - |
-| `MockEncoder` (identical vectors in every port) | yes | yes | yes | yes | yes | yes |
-| Semantic multi-hop, path, subgraph | yes | yes | yes | yes | yes | yes |
-| Portable embedding JSON | yes | yes | yes | yes | yes | yes |
-| Thread-safe store | yes | yes | - | - | - | - |
 | Graph save/load with embeddings | yes | - | - | - | - | - |
 | Extends the base graph | subclass | composition | subclass | subclass | composition | composition |
 
-The Python port is the reference implementation; the others are
-mock-encoder-only, and their in-memory store remains the default. `MockEncoder`
-produces byte-identical vectors in all six, so a store built by one really can
-be searched by another - the C#, TypeScript, JavaScript, Rust and C++ suites
-each prove it by importing an embedding payload captured from the Python port.
+Python is the reference implementation: the only port with a real transformer
+encoder and graph persistence. The other five are `MockEncoder`-only and expect
+you to supply an encoder over whatever model you already run.
 
-Every port can also persist to SQLite, and they all write the **same schema**,
-so a database file written by one opens directly in another. Verified, not
-assumed: Python opens databases written by the Rust and Node ports and reads
-byte-identical vectors out of them.
-
-C#, Rust and C++ wrap the base graph rather than subclassing it: `ISONGraph` is
-`sealed` in C#, and Rust and C++ have no inheritance to use here. The underlying
-graph stays reachable (`Graph`, `graph()`, `graph_mut()`).
+C#, Rust and C++ wrap the base graph rather than subclassing it — `ISONGraph`
+is `sealed` in C#, and Rust and C++ have no inheritance to use here. The
+underlying graph stays reachable through `Graph`, `graph()` and `graph_mut()`.
 
 ## Installation
 
 ```bash
-pip install isongraph-vector          # Python
-pip install isongraph-vector[fast]    # + numpy, vectorized search
-pip install isongraph-vector[vec]     # + sqlite-vec, KNN inside SQLite
+pip install isongraph-vector             # Python
+pip install isongraph-vector[fast]       # + numpy, ~100x faster search
+pip install isongraph-vector[vec]        # + sqlite-vec
+
+dotnet add package IsonGraph.Vector      # C#
+npm install isongraph-vector-ts          # TypeScript
+npm install isongraph-vector-js          # JavaScript
+cargo add isongraph-vector-rs            # Rust
 ```
 
-```bash
-dotnet add package IsonGraph.Vector   # C#
-npm install isongraph-vector-ts       # TypeScript
-npm install isongraph-vector-js       # JavaScript
-cargo add isongraph-vector-rs         # Rust
-```
-
-C++ is header-only: add `isongraph-vector-cpp/include` (and the vendored
-`vendor/ison-graph-cpp`) to your include path, or use the provided
+C++ is header-only: add `isongraph-vector-cpp/include` and its vendored
+`vendor/ison-graph-cpp` to your include path, or use the provided
 `CMakeLists.txt`.
 
-## Quick Start
+## Quick start
 
 ```python
-from isongraph_vector import SemanticGraph
+from isongraph_vector import SemanticGraph, MockEncoder
 
-# Create semantic graph
-graph = SemanticGraph(name="social")
+graph = SemanticGraph(name="social", encoder=MockEncoder(384))
 
-# Add nodes with auto-embedding
-graph.add_node('person', 1, name='Alice',
-               _embed_text='Alice is a software engineer who builds APIs')
-graph.add_node('person', 2, name='Bob',
-               _embed_text='Bob is a data scientist analyzing ML models')
-graph.add_node('person', 3, name='Charlie',
-               _embed_text='Charlie is a product manager planning roadmaps')
-
-# Add relationships
+graph.add_node('person', 1, name='Alice', description='software engineer')
+graph.add_node('person', 2, name='Bob', description='data scientist')
+graph.add_node('person', 3, name='Carol', description='product manager')
 graph.add_edge('KNOWS', ('person', 1), ('person', 2))
 graph.add_edge('KNOWS', ('person', 2), ('person', 3))
 
-# Similarity search
-results = graph.similarity_search("machine learning", top_k=3)
-for r in results:
-    print(f"{r.node_ref}: {r.score:.4f}")
-
-# Semantic multi-hop search
-results = graph.semantic_multi_hop(
-    query="software engineer",
-    rel_type='KNOWS',
-    max_hops=2
-)
-for r in results:
-    print(f"{r.node_ref}: score={r.score:.4f}, hops={r.hop_count}")
+for r in graph.semantic_multi_hop('Alice software engineer',
+                                  rel_type='KNOWS', max_hops=2, threshold=-1.0):
+    print(f"{r.node_ref}  score={r.score:.4f}  hops={r.hop_count}")
 ```
 
-## Core Components
+```text
+('person', 1)  score=1.0000  hops=0
+('person', 2)  score=0.8000  hops=1
+('person', 3)  score=0.6400  hops=2
+```
 
-### EmbeddingStore
+Alice seeds the search at hop 0 because she matches the query. Bob and Carol
+are reached by traversal, decayed by `decay ** hops`.
 
-Embedding storage with similarity search:
+That `threshold=-1.0` is a `MockEncoder` concession worth understanding early.
+The mock encoder is deterministic and dependency-free, but its vectors are
+hash-derived noise with no meaning. Being near-orthogonal, and cosine
+similarity being signed, mock scores straddle zero — so the sensible default of
+0.3 rejects every seed. With a real encoder, leave the default alone.
+
+The same program in each language is in that port's README, with the same
+output.
+
+## How the search works
+
+`semantic_multi_hop` does three things:
+
+1. **Seed.** Score every embedded node against the query; keep the top *k*
+   above `threshold`.
+2. **Traverse.** Breadth-first out from each seed along `rel_type`, up to
+   `max_hops`.
+3. **Score.** `max(seed_similarity, 0) * decay ** hop_count`, keeping the best
+   score per node.
+
+A node that is itself a seed always keeps its own, direct similarity at hop 0.
+It is never demoted to a decayed score because a better seed happened to reach
+it first — a bug that lived in all five original ports and is now pinned by a
+regression test in each.
+
+The clamp at zero matters too. Cosine similarity is signed, and multiplying a
+*negative* seed score by 0.8 moves it toward zero — so without the clamp,
+everything a badly-matching seed touched would outrank the seed itself, and
+relevance would grow with distance.
+
+### Blending in a node's own relevance
+
+By default a node's score comes purely from its seed and its distance. Raise
+`blend` and each node's own similarity to the query is mixed in:
 
 ```python
-from isongraph_vector import EmbeddingStore, SentenceTransformerEncoder
-
-encoder = SentenceTransformerEncoder()  # all-MiniLM-L6-v2
-store = EmbeddingStore(db_path="embeddings.db", encoder=encoder)
-
-store.add(('person', 1), 'Alice is a software engineer')
-store.add(('person', 2), 'Bob is a data scientist')
-
-# One batched encoder call instead of one per text
-store.add_batch([
-    (('person', 3), 'Charlie plans roadmaps'),
-    (('person', 4), 'Diana designs interfaces'),
-])
-
-results = store.similarity_search("engineer", top_k=5)
-results = store.similarity_search("tech role", node_type='person')
+results = graph.semantic_multi_hop(query, blend=0.5)
+# score = (1 - blend) * seed_score * decay**hops + blend * own_similarity
 ```
 
-The store is safe to share across threads: every operation is serialized on a
-lock, and the SQLite connection is opened with `check_same_thread=False` so a
-request handled on a different thread than the one that built the store works.
+Use it when a node two hops out is itself highly relevant and should outrank a
+closer but unrelated neighbour. Seeds score the same either way, so raising it
+only reorders what you reached.
 
-Vectors are validated. The store pins its dimension to the first vector it
-sees and raises `DimensionMismatchError` on anything else - cosine similarity
-over a mismatched pair returns a plausible-looking number rather than an error,
-so silence here means silently wrong scores.
+### Extracting the slice that matters
 
-### Storage and search backends
+`semantic_subgraph` runs the same search and returns a real `SemanticGraph` —
+the matching nodes, every edge induced between them, and their embeddings:
 
-Every port ships an in-memory store and a SQLite-backed one. The SQLite store
-can additionally index vectors with sqlite-vec, moving top-k search into a
-`vec0` virtual table:
+```python
+sub = graph.semantic_subgraph("who works on machine learning?", max_hops=2)
+sub.save("context.isong")
+```
+
+This is what makes an ISON graph useful as LLM context. Instead of serializing
+a whole knowledge graph into a prompt, you serialize the part the question is
+about — the same argument ISON makes about token efficiency, one level up.
+
+### The rest
+
+- `similarity_search(query, top_k, node_type, threshold)` — plain vector search.
+- `similar_to_node(ref)` — "more like this", using a node's own stored vector.
+  No query text, no encoder call.
+- `semantic_path(query, target)` — reach a specific node from a
+  semantically-relevant start.
+- `embed_all_nodes()` — backfill an existing graph, batched.
+
+## Storing the vectors
+
+Every port ships an in-memory store and a SQLite-backed one, and the SQLite
+store can index vectors with sqlite-vec:
 
 | Port | SQLite store | Enable it |
 | --- | --- | --- |
 | Python | built in | `EmbeddingStore(db_path=..., sqlite_vec=True)`, `[vec]` extra |
-| C# | `IsonGraph.Vector.Sqlite` package | `new SqliteEmbeddingStore(path, encoder, sqliteVec: true)` |
-| TypeScript | `isongraph-vector-ts/sqlite` entry | `new SqliteEmbeddingStore(path, encoder, true)` |
-| JavaScript | `isongraph-vector-js/sqlite` entry | `new SqliteEmbeddingStore(path, encoder, true)` |
+| C# | `IsonGraph.Vector.Sqlite` | `new SqliteEmbeddingStore(path, encoder, sqliteVec: true)` |
+| TypeScript | `isongraph-vector-ts/sqlite` | `new SqliteEmbeddingStore(path, encoder, true)` |
+| JavaScript | `isongraph-vector-js/sqlite` | `new SqliteEmbeddingStore(path, encoder, true)` |
 | Rust | `sqlite` feature | `SqliteEmbeddingStore::open(path, encoder, true)` |
 | C++ | `-DISONGRAPH_VECTOR_SQLITE=ON` | `SqliteEmbeddingStore(path, encoder, true)` |
 
 Each is optional and off by default, so the core packages stay light: Python
 falls back to a numpy or pure-Python scan, the Node ports keep working in a
-browser (the SQLite store is a separate entry point that imports `node:sqlite`),
+browser (their SQLite store is a separate entry point importing `node:sqlite`),
 Rust needs a feature flag, and the C++ header stays dependency-free until you
-ask for the store.
+ask.
 
 In Python the three backends line up like this:
 
 | Backend | Requires | How it searches |
 | --- | --- | --- |
 | Pure Python | nothing | cosine loop over every vector |
-| numpy (default when installed) | `numpy` | one matrix-vector product against a cached matrix |
-| sqlite-vec (`sqlite_vec=True`) | `sqlite-vec` | `vec0` virtual table, KNN in C |
+| numpy (used automatically) | `[fast]` | one matrix-vector product against a cached matrix |
+| sqlite-vec | `[vec]` | `vec0` virtual table, KNN in C |
 
-numpy alone takes a query over 5,000 nodes from 246 ms to 2.5 ms. Turning on
-sqlite-vec moves the top-k search into SQLite:
+numpy alone takes a query over 5,000 nodes from 246 ms to 2.5 ms. sqlite-vec
+goes further, but only at scale:
 
-```python
-store = EmbeddingStore(db_path="embeddings.db", encoder=encoder, sqlite_vec=True)
-graph = SemanticGraph(embedding_db="embeddings.db", sqlite_vec=True)
+| Vectors | numpy scan | sqlite-vec | |
+| ---: | ---: | ---: | --- |
+| 1,000 | 0.47 ms | 0.59 ms | slower — don't bother |
+| 5,000 | 4.01 ms | 1.75 ms | 2.3x |
+| 20,000 | 27.63 ms | 6.80 ms | 4.1x |
+
+Indexing costs writes — 20,000 rows take 0.16 s to insert without it and 0.43 s
+with — which is why it stays opt-in.
+
+**Turning it on does not change your results.** `vec0` runs an exact
+brute-force KNN in C, not an approximate index: measured identical top-10
+ordering over 50 queries against 20,000 vectors, with scores within 2e-07 of
+the scan. It buys speed, not a trade-off. Two paths keep scanning regardless —
+`score_map()` and blended multi-hop, which need a score for every node rather
+than a top-k. Type filtering stays exact because the node type is a `vec0`
+metadata column, narrowing the search rather than filtering its output.
+
+## One format, six languages
+
+`MockEncoder` produces **byte-identical vectors in all six ports**: a 32-bit
+FNV-1a hash of the UTF-8 bytes seeds an xorshift32 generator, and the top 24
+bits of each state become a value in [-1, 1). The same golden vectors are
+asserted in every suite.
+
+That is what makes the interchange formats meaningful rather than aspirational.
+All six write the same embedding payload:
+
+```json
+{"format": "ison-embeddings", "version": 1, "dimension": 384, "count": 1,
+ "embeddings": [{"type": "person", "id": 1, "id_type": "int",
+                 "text": "Alice is a software engineer", "vector": [0.83, -0.82]}]}
 ```
 
-```bash
-pip install 'isongraph-vector[vec]'          # Python
-dotnet add package IsonGraph.Vector.Sqlite   # C#
-npm install sqlite-vec                       # TypeScript / JavaScript
-cargo add isongraph-vector-rs --features sqlite
-cmake -S . -B build -DISONGRAPH_VECTOR_SQLITE=ON   # C++
-```
-
-#### The shared database format
-
-All six ports write the same two tables, so the files are interchangeable:
+…and the same SQLite schema:
 
 ```sql
 CREATE TABLE embeddings (
@@ -203,253 +249,95 @@ CREATE TABLE embeddings (
     text TEXT, model TEXT, created_at TIMESTAMP,
     UNIQUE(node_type, node_id));
 
-CREATE VIRTUAL TABLE vec_embeddings USING vec0(   -- only when the index is on
+CREATE VIRTUAL TABLE vec_embeddings USING vec0(   -- only when indexed
     node_type text, embedding float[N] distance_metric=cosine);
 ```
 
-Opening a database that was written without the index, with the index on,
-backfills it. Writes are an UPSERT rather than `INSERT OR REPLACE`, because
-REPLACE assigns a new rowid and would orphan the matching `vec0` entry.
+So a database written by the Rust port opens in Python, and the other way
+round. This is verified, not assumed: Python opens databases written by the
+Rust and Node ports and reads byte-identical vectors, and the C#, TypeScript,
+JavaScript, Rust and C++ suites each import a payload captured from Python.
 
-**Results do not change.** `vec0` runs an exact brute-force KNN in C, so this
-is a speed change, not an accuracy trade: measured identical top-10 ordering
-over 50 queries against 20,000 vectors, with scores within 2e-07 of the scan.
-Whether it pays depends on scale:
+Opening a database written without the index, with the index on, backfills it.
+Writes use an UPSERT rather than `INSERT OR REPLACE`, because REPLACE assigns a
+new rowid and would orphan the matching `vec0` entry.
 
-| Vectors | Scan (numpy) | sqlite-vec | |
-| ---: | ---: | ---: | --- |
-| 1,000 | 0.47 ms | 0.59 ms | slower - do not bother |
-| 5,000 | 4.01 ms | 1.75 ms | 2.3x faster |
-| 20,000 | 27.63 ms | 6.80 ms | 4.1x faster |
+## Persistence
 
-Indexing costs writes: 20,000 rows take 0.16 s to insert without it and 0.43 s
-with it. Below a few thousand vectors the scan wins outright, which is why the
-default is off.
-
-Two things keep using the exact scan even when it is on: `score_map()`, and
-`semantic_multi_hop(..., blend > 0)`, which needs a score for every node rather
-than a top-k. `node_type` filtering stays exact too - the type is a `vec0`
-metadata column, so it narrows the search rather than filtering its output.
-
-### SemanticGraph
-
-ISONGraph extended with embeddings:
+The ISON graph format carries nodes and edges, not vectors, so the Python port
+writes both halves:
 
 ```python
-from isongraph_vector import SemanticGraph
-
-# Auto-embed from fields
-graph = SemanticGraph(
-    auto_embed=True,
-    embed_fields=['name', 'description']
-)
-
-graph.add_node('article', 1,
-    name='Python Tutorial',
-    description='Learn Python programming basics'
-)
-# Automatically embeds: "Python Tutorial Learn Python programming basics"
-
-# Manual embedding
-graph.embed_node(('article', 1), 'Custom embedding text')
-
-# Batch embed all nodes (one encoder call per batch)
-count = graph.embed_all_nodes()
-count = graph.embed_all_nodes(skip_existing=True)   # only what is missing
-```
-
-In the TypeScript, JavaScript, Rust and C++ ports the plain `addNode` /
-`add_node` auto-embeds too, so the same code behaves the same way everywhere.
-
-Since ISONGraph 1.4.0 property values are typed, so auto-embedding renders them
-to text: nulls are skipped, and booleans use the ISON spelling (`true`/`false`)
-rather than each language's own. That keeps the same property bag producing the
-same embedding text - and so the same vector - in all six ports, which a golden
-test in each suite pins down. Whole-number floats are the exception: Python
-renders `1.0` as `"1.0"` where the others render `"1"`. Pass an explicit
-`_embed_text` when the exact wording matters.
-
-### Semantic Multi-Hop Search
-
-Combines embedding similarity with graph traversal:
-
-```python
-results = graph.semantic_multi_hop(
-    query="machine learning engineer",
-    rel_type='KNOWS',           # Relationship to follow
-    max_hops=3,                 # Maximum traversal depth
-    top_k_seeds=5,              # Similar nodes to start from
-    top_k_results=10,           # Results to return
-    decay=0.8,                  # Score decay per hop
-    threshold=0.3,              # Minimum similarity for seeds
-    blend=0.0                   # Mix in each node's own relevance (0-1)
-)
-
-for result in results:
-    print(result.node_ref, result.score, result.hop_count, result.path)
-```
-
-Scoring is `max(seed_similarity, 0) * decay ** hop_count`. A node that is
-itself a seed always keeps its own, direct similarity at hop 0 - it is never
-demoted to a decayed score just because a better seed happened to reach it
-first.
-
-`blend` mixes each node's own similarity to the query into its traversal
-score:
-
-```python
-score = (1 - blend) * seed_score * decay**hops + blend * own_similarity
-```
-
-At `blend=0` (the default) scoring is pure seed-and-decay. Raise it when a
-node found two hops out but highly relevant in its own right should not be
-buried under a closer, unrelated neighbour. Seeds score the same either way.
-
-### More Like This
-
-```python
-similar = graph.similar_to_node(('person', 1), top_k=5)
-```
-
-Searches with the node's own stored vector - no query text, no encoder call -
-and excludes the node itself.
-
-### Semantic Subgraph
-
-Extract the slice of a graph a question is actually about:
-
-```python
-sub = graph.semantic_subgraph(
-    query="who works on machine learning?",
-    rel_type='KNOWS',
-    max_hops=2,
-    top_k_results=25,
-)
-sub.save("context.isong")     # small, on-topic graph to inject into a prompt
-```
-
-The result is a full `SemanticGraph`: the matching nodes, every edge induced
-between them, and their embeddings. It can be traversed, searched or
-serialized on its own.
-
-### Semantic Path Finding
-
-```python
-result = graph.semantic_path(
-    query="Python developer",
-    target_ref=('person', 5),
-    rel_type='KNOWS',
-    max_hops=4
-)
-
-if result:
-    print(f"Found path with score {result.score:.4f}")
-    print(f"Path: {result.path}")
-```
-
-### Persistence
-
-```python
-graph.save("social.isong")
-# writes social.isong AND social.isong.embeddings.json
-
+graph.save("social.isong")        # + social.isong.embeddings.json
 graph = SemanticGraph.load("social.isong", encoder=my_encoder)
 ```
 
-The ISON graph format carries nodes and edges only, so embeddings go to a JSON
-sidecar that `load` picks up automatically. Pass the `encoder=` you saved
-with: without it, the first text search on a loaded graph builds a
-`SentenceTransformerEncoder` and downloads a model.
+Pass the `encoder=` you saved with. Without it, the first text search on a
+loaded graph constructs a `SentenceTransformerEncoder` and downloads a model.
 
-The sidecar is the portable cross-language format - `EmbeddingStore` in every
-port reads and writes it:
+The other five ports persist embeddings to SQLite and exchange the portable
+payload, but the graph itself stays in memory there.
 
-```python
-payload = store.export_embeddings()   # dict, JSON-serializable
-store.import_embeddings(payload)
-store.save_embeddings("vectors.json")
-store.load_embeddings("vectors.json")
-```
+## Typed properties
 
-```rust
-let json = store.to_json()?;          // Rust
-store.from_json(&json, false)?;
-```
+Since ISONGraph 1.4.0 a property value can be a string, a number, a bool or
+null. Auto-embedding has to turn those into text, and the ports agree on how:
+nulls are skipped, and booleans render as ISON spells them — `true`/`false`,
+not Python's `True` or .NET's `True`. A golden test in all six asserts that the
+same property bag yields the same string, because different text means a
+different vector and would quietly break the cross-port guarantee.
 
-```cpp
-std::string json = store.toJson();    // C++
-store.fromJson(json);
-```
+One loose end: whole-number floats. Python renders `1.0` as `"1.0"` where the
+other five render `"1"`. Pass an explicit embed text when the exact wording
+matters.
 
-## Architecture
+## Honest limits
 
-```
-+------------------------------------------------------------------+
-|                    SemanticGraph                                  |
-+------------------------------------------------------------------+
-|                                                                  |
-|  ISONGraph (base)          EmbeddingStore                        |
-|  - Nodes & Edges           - SQLite backend (Python)             |
-|  - Multi-hop traversal     - sentence-transformers               |
-|  - Path finding            - Cosine similarity (numpy optional)  |
-|                                                                  |
-|                     Combined via:                                 |
-|                                                                  |
-|  semantic_multi_hop() = similarity_search() + graph.multi_hop()  |
-|  semantic_path()      = similarity_search() + graph.shortest_path|
-|  semantic_subgraph()  = semantic_multi_hop() + induced edges     |
-|                                                                  |
-+------------------------------------------------------------------+
-```
+- **Search is brute force in every backend**, sqlite-vec included — all of them
+  linear in the number of nodes. This is built for an application's own
+  knowledge graph, not as a vector-database replacement. For vectors on both
+  nodes *and* edges, ANN indexing and link prediction, RudraDB is the right
+  tool; these are not really competitors despite the surface similarity.
+- **One embedding per node**, from one text field or a concatenation. No
+  multi-vector nodes, no edge embeddings.
+- **`MockEncoder` has no semantic structure.** It exists so tests and demos
+  need no model download. Never use it to judge relevance quality.
+- **`SemanticGraph.load()` reaches into ISONGraph's private attributes** to
+  copy loaded state across. Verified working on 1.4.0, but it is a private-API
+  dependency.
+- **The C++ base library is vendored, not versioned.** Nothing signals when
+  ISONGraph moves on.
 
-## Comparison with RudraDB
-
-| Feature | RudraDB | isongraph-vector |
-|---------|---------|----------------------|
-| Graph storage | Native | SQLite via ISONGraph |
-| Embeddings | Built-in | sentence-transformers |
-| Vector search | Native | Brute-force cosine (vectorized with numpy) |
-| Multi-hop | Native | Python BFS/DFS |
-| Auto-relationships | Trishul | Manual |
-| Performance | Optimized | Good to a few hundred thousand vectors |
-| License | Proprietary | MIT (Open Source) |
-
-## API Reference
+## API reference
 
 ### EmbeddingStore
 
 | Method | Description |
-|--------|-------------|
-| `add(node_ref, text, vector=None)` | Add embedding |
+| --- | --- |
+| `add(node_ref, text, vector=None)` | Add one embedding |
 | `add_batch(entries)` | Add many, encoding in one batched call |
-| `get(node_ref)` | Get embedding record |
-| `remove(node_ref)` | Remove embedding |
+| `get(node_ref)` / `remove(node_ref)` | Fetch or delete one record |
 | `similarity_search(query, top_k, node_type, threshold)` | Find similar nodes (`top_k=None` returns all) |
-| `sqlite_vec` | Whether top-k search runs through the vec0 index |
 | `score_map(query, node_type=None)` | Score every node, keyed by ref |
 | `export_embeddings()` / `import_embeddings(payload)` | Portable cross-language payload |
-| `save_embeddings(path)` / `load_embeddings(path)` | Same payload, as a JSON file |
-| `dimension` | Vector width this store holds |
-| `count()` | Count embeddings |
-| `clear()` | Clear all embeddings |
-| `close()` | Close the database connection |
+| `save_embeddings(path)` / `load_embeddings(path)` | The same payload as a file |
+| `dimension` / `sqlite_vec` | Vector width; whether the index is in use |
+| `count()` / `clear()` / `close()` | Size, reset, release |
 
 ### SemanticGraph
 
 | Method | Description |
-|--------|-------------|
-| `add_node(..., _embed_text=)` | Add node with embedding |
-| `embed_node(node_ref, text)` | Add/update embedding |
-| `embed_nodes(items)` | Batch embed (node_ref, text) pairs |
-| `get_embedding(node_ref)` | Get embedding record |
-| `similarity_search(query, top_k, ...)` | Find similar nodes |
-| `similar_to_node(node_ref, top_k, ...)` | More like this |
+| --- | --- |
+| `add_node(..., _embed_text=)` | Add a node, embedding it |
+| `embed_node(ref, text)` / `embed_nodes(items)` | Embed one or many |
+| `get_embedding(ref)` | Fetch a node's record |
+| `similarity_search(query, ...)` | Find similar nodes |
+| `similar_to_node(ref, ...)` | More like this |
 | `semantic_multi_hop(query, ..., blend=0.0)` | Semantic traversal |
 | `semantic_path(query, target, ...)` | Semantic path finding |
 | `semantic_subgraph(query, ...)` | On-topic slice as a new graph |
-| `embed_all_nodes(text_fn=None, skip_existing=False)` | Batch embed nodes |
-| `save(path, embeddings=True)` | Save graph and embedding sidecar |
-| `load(path, encoder=None, ...)` | Load both back |
+| `embed_all_nodes(text_fn=None, skip_existing=False)` | Backfill, batched |
+| `save(path, embeddings=True)` / `load(path, encoder=None, ...)` | Persist both halves |
 | `encoder` / `set_encoder(encoder)` | Inspect or install the encoder |
 | `close()` | Release the embedding database |
 
@@ -459,34 +347,37 @@ store.fromJson(json);
 derive from it (and from `ValueError` in Python, so existing `except
 ValueError` handlers keep working).
 
+Vectors are validated: a store pins its dimension to the first vector it sees
+and rejects anything else. Cosine similarity over a mismatched pair returns a
+plausible-looking number rather than an error, so silence there would mean
+silently wrong scores.
+
 ## Testing
 
 ```bash
-pytest tests/                              # Python, MockEncoder (no downloads)
-USE_REAL_ENCODER=1 pytest tests/           # Python, real sentence-transformers
+pytest tests/                                            # Python, 68
+cd isongraph-vector-csharp && dotnet test                # C#, 59
+cd isongraph-vector-ts && npm test                       # TypeScript, 66
+cd isongraph-vector-js && npm test                       # JavaScript, 64
+cd isongraph-vector-rs && cargo test --features sqlite   # Rust, 47
 
-cd isongraph-vector-csharp && dotnet test   # C#
-cd isongraph-vector-ts && npm test          # TypeScript (npm run typecheck for tsc)
-cd isongraph-vector-js && npm test          # JavaScript
-cd isongraph-vector-rs && cargo test        # Rust
-
-cd isongraph-vector-cpp && cmake -S . -B build && cmake --build build
-./build/test_isongraph_vector               # C++
+cd isongraph-vector-cpp
+cmake -S . -B build -DISONGRAPH_VECTOR_SQLITE=ON && cmake --build build
+./build/test_isongraph_vector && ./build/test_isongraph_vector_sqlite   # C++, 67
 ```
 
-`pytest` works straight from a checkout: [`conftest.py`](conftest.py) binds the
-import name `isongraph_vector` to the `isongraph_vector-py/` directory, which
-is named to line up with the other ports and so cannot be imported directly.
-An installed copy takes precedence.
+371 tests in total. `pytest` works straight from a checkout:
+[`conftest.py`](conftest.py) binds the import name `isongraph_vector` to the
+`isongraph_vector-py/` directory, which is named to line up with the other
+ports and so cannot be imported directly. An installed copy takes precedence.
 
-A note on thresholds in tests: `MockEncoder` produces near-orthogonal vectors,
-and cosine similarity is signed, so mock scores straddle zero. Tests that want
-every match pass `threshold=-1.0` rather than relying on the 0.0 default.
+`USE_REAL_ENCODER=1 pytest tests/` runs the Python suite against real
+sentence-transformers instead of the mock.
 
 ## Dependencies
 
-```
-ison-graph>=1.0.0
+```text
+ison-graph>=1.4.0
 sentence-transformers>=2.2.0
 numpy>=1.21.0            # optional, via the "fast" extra
 sqlite-vec>=0.1.6        # optional, via the "vec" extra
@@ -498,9 +389,9 @@ See [CHANGELOG.md](CHANGELOG.md).
 
 ## Links
 
-- Repository: https://github.com/ISON-format/isongraph-vector
-- Documentation: https://graph.ison.dev/docs/isongraph-vector
-- Issues: https://github.com/ISON-format/isongraph-vector/issues
+- Repository: <https://github.com/ISON-format/isongraph-vector>
+- Documentation: <https://graph.ison.dev/docs/isongraph-vector>
+- Issues: <https://github.com/ISON-format/isongraph-vector/issues>
 
 ## Author
 
@@ -508,5 +399,5 @@ Mahesh Vaikri
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+MIT License — see [LICENSE](LICENSE) for details.
 Copyright (c) 2026 ISON - Mahesh Vaikri.

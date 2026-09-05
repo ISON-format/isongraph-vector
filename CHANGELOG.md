@@ -31,12 +31,12 @@ JavaScript, Rust and C++.
 - Graph persistence in Python: `save()` writes an embeddings sidecar next to
   the graph file and `load()` restores it. `load()` takes an `encoder=`
   argument so a reloaded graph does not silently download a model.
-- A portable embedding payload (`ison-embeddings`, version 1) that all five
+- A portable embedding payload (`ison-embeddings`, version 1) that all six
   ports read and write, so a store built by one can be searched by another.
   Exposed as `export_embeddings` / `import_embeddings` (`to_json` / `from_json`
   in Rust, `toJson` / `fromJson` in C++).
 - `MockEncoder` - deterministic, dependency-free, and byte-identical across all
-  five ports, so cross-port stores and tests line up exactly.
+  six ports, so cross-port stores and tests line up exactly.
 - Optional numpy fast path for Python similarity search, roughly two orders of
   magnitude faster than the pure-Python fallback, via the `fast` extra.
 - A SQLite-backed store in every port, optionally indexed with sqlite-vec.
@@ -55,7 +55,7 @@ JavaScript, Rust and C++.
   `vec0` metadata column, so it narrows the search rather than filtering its
   results.
 - Typed errors: `EmbeddingError`, `DimensionMismatchError`, `NoEncoderError`.
-- 372 tests across the six ports, including cross-port checks that import an
+- 371 tests across the six ports, including cross-port checks that import an
   embedding payload produced by the Python port, checks in every port that the
   sqlite-vec backend returns exactly what the scan returns, and a golden
   embedding-text assertion shared by all six.

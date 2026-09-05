@@ -103,7 +103,7 @@ The benchmark generates three output files:
 ## Why ISONGraph Wins
 
 ### 1. Tabular Format (No Key Repetition)
-```
+```text
 # ISONGraph: Headers appear once
 nodes.person
 id name age
@@ -115,7 +115,7 @@ id name age
 ```
 
 ### 2. Compact Node References
-```
+```text
 # ISONGraph: 11 characters
 :person:1
 
@@ -124,7 +124,7 @@ id name age
 ```
 
 ### 3. Minimal Punctuation
-```
+```text
 # ISONGraph: Whitespace delimited
 1 Alice 28 true 1500
 
