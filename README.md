@@ -203,25 +203,47 @@ In Python the three backends line up like this:
 | numpy (used automatically) | `[fast]` | one matrix-vector product against a cached matrix |
 | sqlite-vec | `[vec]` | `vec0` virtual table, KNN in C |
 
-numpy alone takes a query over 5,000 nodes from 246 ms to 2.5 ms. sqlite-vec
-goes further, but only at scale:
-
-| Vectors | numpy scan | sqlite-vec | |
-| ---: | ---: | ---: | --- |
-| 1,000 | 0.47 ms | 0.59 ms | slower — don't bother |
-| 5,000 | 4.01 ms | 1.75 ms | 2.3x |
-| 20,000 | 27.63 ms | 6.80 ms | 4.1x |
-
-Indexing costs writes — 20,000 rows take 0.16 s to insert without it and 0.43 s
-with — which is why it stays opt-in.
+numpy alone takes a query over 5,000 nodes from 246 ms to 2.5 ms. Indexing
+costs writes — 20,000 rows take 0.16 s to insert without it and 0.43 s with —
+which is why it stays opt-in.
 
 **Turning it on does not change your results.** `vec0` runs an exact
-brute-force KNN in C, not an approximate index: measured identical top-10
-ordering over 50 queries against 20,000 vectors, with scores within 2e-07 of
-the scan. It buys speed, not a trade-off. Two paths keep scanning regardless —
-`score_map()` and blended multi-hop, which need a score for every node rather
-than a top-k. Type filtering stays exact because the node type is a `vec0`
-metadata column, narrowing the search rather than filtering its output.
+brute-force KNN in C, not an approximate index. Two paths keep scanning
+regardless — `score_map()` and blended multi-hop, which need a score for every
+node rather than a top-k. Type filtering stays exact because the node type is a
+`vec0` metadata column, narrowing the search rather than filtering its output.
+
+### Measured retrieval
+
+All six ports, 20,000 vectors of 384 dimensions, top-10, `threshold=-1.0` so
+every candidate is scored. Median of five runs on one Windows machine, using
+`MockEncoder` so every port scores byte-identical vectors:
+
+| Port | In-process scan | SQLite scan | sqlite-vec | Recall |
+| --- | ---: | ---: | ---: | ---: |
+| C# | 7.7 ms | 42 ms | 7.6 ms | 1.000 |
+| C++ | 11.6 ms | 18.8 ms | 7.1 ms | 1.000 |
+| Rust | 11.8 ms | 21.0 ms | 8.2 ms | 1.000 |
+| Python (numpy) | 14.7 ms | — | 7.2 ms | 1.000 |
+| TypeScript / JavaScript | 14.9 ms | 61 ms | 7.4 ms | 1.000 |
+
+**Recall is 1.000 everywhere**, which is the number that matters most: `vec0`
+is an exact brute-force KNN, so the index returns precisely what the scan
+returns. It was measured as the overlap of the top-10 from the index against
+the top-10 from the exact scan, over 20 queries per port. Not an approximation
+with a good hit rate — the same answers.
+
+The timings say something less flattering about the SQLite scan than about the
+index. Reading 20,000 blobs back out of SQLite and scoring them costs far more
+than scoring them in memory, in every port. If you turn the SQLite store on and
+leave `sqlite_vec` off, expect the scan column. Python has no separate SQLite
+scan row because its store is SQLite-backed either way; its numpy path caches a
+decoded matrix, so it behaves like the in-process column.
+
+Treat the absolute numbers as one machine's shape, not a benchmark. The ratios
+are the durable part: the index is worth roughly 2x over an in-process scan and
+3-8x over a SQLite scan at this size, and *costs* you below a few thousand
+vectors, where the scan wins outright.
 
 ## One format, six languages
 

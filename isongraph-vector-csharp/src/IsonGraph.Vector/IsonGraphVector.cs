@@ -206,30 +206,38 @@ public sealed class EmbeddingStore
 
     private static string Key(NodeRef nodeRef) => $"{nodeRef.Type}:{nodeRef.Id}";
 
-    private void CheckDimension(IReadOnlyList<float> vector, string what)
+    private void CheckDimension(ReadOnlySpan<float> vector, string what)
     {
-        if (vector.Count == 0)
+        if (vector.Length == 0)
             throw new DimensionMismatchException($"{what} is empty");
         if (_dimension is null)
-            _dimension = vector.Count;
-        else if (vector.Count != _dimension)
+            _dimension = vector.Length;
+        else if (vector.Length != _dimension)
             throw new DimensionMismatchException(
-                $"{what} has {vector.Count} dimensions, store holds {_dimension}");
+                $"{what} has {vector.Length} dimensions, store holds {_dimension}");
     }
 
-    private void CheckQuery(IReadOnlyList<float> vector)
+    private void CheckQuery(ReadOnlySpan<float> vector)
     {
-        if (vector.Count == 0)
+        if (vector.Length == 0)
             throw new DimensionMismatchException("query vector is empty");
-        if (_dimension is not null && vector.Count != _dimension)
+        if (_dimension is not null && vector.Length != _dimension)
             throw new DimensionMismatchException(
-                $"query vector has {vector.Count} dimensions, store holds {_dimension}");
+                $"query vector has {vector.Length} dimensions, store holds {_dimension}");
     }
 
-    private static float CosineSimilarity(IReadOnlyList<float> v1, IReadOnlyList<float> v2)
+    /// <summary>
+    /// Cosine similarity over two vectors.
+    ///
+    /// Spans rather than IReadOnlyList: through the interface every element
+    /// access is a dispatch, which measured roughly twenty times slower than
+    /// the Rust and C++ ports scoring the same vectors. The stored vectors are
+    /// float[], so a span costs nothing and the JIT indexes them directly.
+    /// </summary>
+    private static float CosineSimilarity(ReadOnlySpan<float> v1, ReadOnlySpan<float> v2)
     {
         float dot = 0f, norm1 = 0f, norm2 = 0f;
-        int n = Math.Min(v1.Count, v2.Count);
+        int n = Math.Min(v1.Length, v2.Length);
         for (int i = 0; i < n; i++)
         {
             dot += v1[i] * v2[i];

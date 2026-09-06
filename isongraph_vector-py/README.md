@@ -132,11 +132,13 @@ scale — and it is worth being precise about when:
 
 | Vectors | numpy scan | sqlite-vec | |
 | ---: | ---: | ---: | --- |
-| 1,000 | 0.47 ms | 0.59 ms | slower — don't bother |
-| 5,000 | 4.01 ms | 1.75 ms | 2.3x |
-| 20,000 | 27.63 ms | 6.80 ms | 4.1x |
+| 1,000 | 0.45 ms | 0.78 ms | slower — don't bother |
+| 5,000 | 3.11 ms | 1.92 ms | 1.6x |
+| 20,000 | 14.7 ms | 7.2 ms | 2.0x |
 
-It also makes writes about 2.7x more expensive, which is why it is opt-in:
+Recall of the index against the exact scan is **1.000** — the same answers, not
+an approximation with a good hit rate. It also makes writes about 2.7x more
+expensive, which is why it is opt-in:
 
 ```python
 store = EmbeddingStore(db_path="embeddings.db", encoder=encoder, sqlite_vec=True)
