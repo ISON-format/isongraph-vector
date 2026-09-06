@@ -369,9 +369,14 @@ public:
             }
         }
 
-        std::sort(results.begin(), results.end());
+        // Selecting the top k rather than ordering every candidate: this is
+        // O(n log k) where a full sort is O(n log n), and returns the same
+        // rows in the same order.
         if (results.size() > topK) {
+            std::partial_sort(results.begin(), results.begin() + topK, results.end());
             results.resize(topK);
+        } else {
+            std::sort(results.begin(), results.end());
         }
 
         return results;

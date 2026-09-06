@@ -55,7 +55,7 @@ two tables, so a database file written by one opens in another.
 
 ## Maturity
 
-Real, working, tested — 378 tests across six languages, all passing,
+Real, working, tested — 391 tests across six languages, all passing,
 all six verified by actually building and running them rather than by
 reading the code and assuming it worked.
 
@@ -151,17 +151,21 @@ returns everything, `score_map` (score every node in one scan), `count`,
 Three search backends, all returning the same results. Pure Python
 scores every vector in a loop. With numpy installed (the `fast` extra,
 the default when present) the scan becomes one matrix-vector product
-against a cached matrix: 2.5 ms rather than 246 ms per query over 5,000
+against a cached matrix: 2.6 ms rather than 182 ms per query over 5,000
 nodes. With `sqlite_vec=True` (the `vec` extra) top-k queries are
 answered by a sqlite-vec `vec0` virtual table instead — `vec0` runs an
 exact brute-force KNN in C, so this buys speed without trading accuracy:
 identical top-10 ordering over 50 queries against 20,000 vectors, scores
-within 2e-07. It earns its keep only at scale — 0.8x at 1,000 vectors,
-2.3x at 5,000, 4.1x at 20,000 — and costs writes (20,000 rows in 0.43 s
+within 2e-07. It earns its keep only at scale — 0.6x at 1,000 vectors,
+1.3x at 5,000, 1.4x at 20,000 — and costs writes (20,000 rows in 0.43 s
 rather than 0.16 s), which is why it is opt-in. `score_map()` and
 blended multi-hop keep scanning, because they need a score for every
 node rather than a top-k; `node_type` filtering stays exact either way,
-since the type is a `vec0` metadata column.
+since the type is a `vec0` metadata column. A bounded `top_k` is
+answered by `heapq.nlargest` rather than by sorting every candidate —
+the other five ports do the same with `std::partial_sort`,
+`select_nth_unstable_by` or a bounded insertion, and every suite asserts
+the selection returns what a full sort would.
 
 **`SemanticGraph(ISONGraph)`** — every real `ISONGraph` method still
 works (`add_edge`, `neighbors`, `shortest_path`, `save`/`load`, ...)

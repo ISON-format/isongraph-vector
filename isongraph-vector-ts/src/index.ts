@@ -202,6 +202,32 @@ export interface ExportedEmbeddings {
 }
 
 /**
+ * Keep the best `k` results without ordering all of them.
+ *
+ * Sorting every candidate to return ten is O(n log n) where this is O(n·k)
+ * with early rejection — for the small k a search actually asks for, that is
+ * a large saving over 20,000 candidates. Insertion goes *after* equal scores,
+ * so the order matches what a stable descending sort would produce.
+ */
+export function selectTopK(results: SimilarityResult[], k: number): SimilarityResult[] {
+  if (k <= 0) return [];
+  if (results.length <= k) return results.sort((a, b) => b.score - a.score);
+
+  const top: SimilarityResult[] = [];
+  for (const candidate of results) {
+    if (top.length === k && candidate.score <= top[k - 1].score) continue;
+    let i = top.length < k ? top.length : k - 1;
+    while (i > 0 && top[i - 1].score < candidate.score) {
+      top[i] = top[i - 1];
+      i--;
+    }
+    top[i] = candidate;
+    if (top.length > k) top.length = k;
+  }
+  return top;
+}
+
+/**
  * In-memory embedding storage with brute-force cosine similarity search.
  */
 export class EmbeddingStore {
@@ -355,8 +381,8 @@ export class EmbeddingStore {
       }
     }
 
-    results.sort((a, b) => b.score - a.score);
-    return topK === null ? results : results.slice(0, topK);
+    if (topK === null) return results.sort((a, b) => b.score - a.score);
+    return selectTopK(results, topK);
   }
 
   /**

@@ -19,6 +19,9 @@
  * const hits = store.similaritySearch('engineering', 5);
  * ```
  *
+ * Generated from the TypeScript port's src/sqlite-store.ts, so the two stay
+ * behaviourally identical. Edit that file rather than this one.
+ *
  * @author Mahesh Vaikri
  * @version 1.0.0
  */
@@ -26,7 +29,7 @@
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { DatabaseSync } from 'node:sqlite';
-import { DimensionMismatchError, EmbeddingError, NoEncoderError, EMBEDDING_FORMAT, EMBEDDING_FORMAT_VERSION, } from './index.js';
+import { DimensionMismatchError, EmbeddingError, NoEncoderError, EMBEDDING_FORMAT, EMBEDDING_FORMAT_VERSION, selectTopK, } from './index.js';
 /** Virtual table holding the vec0 index, alongside the `embeddings` table. */
 export const VEC_TABLE = 'vec_embeddings';
 /** SQLite-backed embedding storage. */
@@ -358,10 +361,10 @@ export class SqliteEmbeddingStore {
         if (this._sqliteVec && topK !== null && topK > 0 && queryVector.some(v => v !== 0)) {
             return this._vecSearch(queryVector, topK, nodeType, threshold);
         }
-        const results = this._scan(queryVector, nodeType)
-            .filter(r => r.score >= threshold)
-            .sort((a, b) => b.score - a.score);
-        return topK === null ? results : results.slice(0, topK);
+        const results = this._scan(queryVector, nodeType).filter(r => r.score >= threshold);
+        if (topK === null)
+            return results.sort((a, b) => b.score - a.score);
+        return selectTopK(results, topK);
     }
     /**
      * Cosine score for every embedded node, keyed by `type:id`.

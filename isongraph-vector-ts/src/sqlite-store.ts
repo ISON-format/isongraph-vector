@@ -38,6 +38,7 @@ import {
   type ExportedEmbedding,
   type ExportedEmbeddings,
   type SimilarityResult,
+  selectTopK,
 } from './index.js';
 
 /** Virtual table holding the vec0 index, alongside the `embeddings` table. */
@@ -436,10 +437,9 @@ export class SqliteEmbeddingStore {
       return this._vecSearch(queryVector, topK, nodeType, threshold);
     }
 
-    const results = this._scan(queryVector, nodeType)
-      .filter(r => r.score >= threshold)
-      .sort((a, b) => b.score - a.score);
-    return topK === null ? results : results.slice(0, topK);
+    const results = this._scan(queryVector, nodeType).filter(r => r.score >= threshold);
+    if (topK === null) return results.sort((a, b) => b.score - a.score);
+    return selectTopK(results, topK);
   }
 
   /**

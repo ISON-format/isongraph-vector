@@ -206,6 +206,41 @@ public sealed class EmbeddingStore
 
     private static string Key(NodeRef nodeRef) => $"{nodeRef.Type}:{nodeRef.Id}";
 
+    /// <summary>
+    /// Keep the best <paramref name="k"/> results without ordering all of them.
+    ///
+    /// Sorting every candidate to return ten is O(n log n) where this is
+    /// O(n·k) with early rejection — for the small k a search actually asks
+    /// for, that is a large saving over 20,000 candidates. Insertion goes
+    /// after equal scores, so the order matches a stable descending sort.
+    /// </summary>
+    internal static List<SimilarityResult> SelectTopK(List<SimilarityResult> results, int k)
+    {
+        if (k <= 0) return new List<SimilarityResult>();
+        if (results.Count <= k)
+        {
+            results.Sort((a, b) => b.Score.CompareTo(a.Score));
+            return results;
+        }
+
+        var top = new List<SimilarityResult>(k);
+        foreach (var candidate in results)
+        {
+            if (top.Count == k && candidate.Score <= top[k - 1].Score) continue;
+
+            int i = top.Count < k ? top.Count : k - 1;
+            if (top.Count < k) top.Add(candidate);
+            while (i > 0 && top[i - 1].Score < candidate.Score)
+            {
+                top[i] = top[i - 1];
+                i--;
+            }
+            top[i] = candidate;
+        }
+        return top;
+    }
+
+
     private void CheckDimension(ReadOnlySpan<float> vector, string what)
     {
         if (vector.Length == 0)
@@ -339,10 +374,12 @@ public sealed class EmbeddingStore
                     results.Add(new SimilarityResult(record.NodeRef, score, record.Text));
             }
 
-            results.Sort((a, b) => b.Score.CompareTo(a.Score));
-            return topK is null || results.Count <= topK
-                ? results
-                : results.GetRange(0, topK.Value);
+            if (topK is null)
+            {
+                results.Sort((a, b) => b.Score.CompareTo(a.Score));
+                return results;
+            }
+            return SelectTopK(results, topK.Value);
         }
     }
 

@@ -39,7 +39,15 @@ static REGISTER_VEC: Once = Once::new();
 /// is opened, so this is done once per process rather than per store.
 fn register_sqlite_vec() {
     REGISTER_VEC.call_once(|| unsafe {
-        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+        // The signature is spelled out rather than inferred: sqlite3_auto_extension
+        // takes an entry point whose arguments are all raw pointers, so an
+        // inferred transmute would silently accept the wrong shape.
+        type EntryPoint = unsafe extern "C" fn(
+            *mut rusqlite::ffi::sqlite3,
+            *mut *mut std::os::raw::c_char,
+            *const rusqlite::ffi::sqlite3_api_routines,
+        ) -> std::os::raw::c_int;
+        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<*const (), EntryPoint>(
             sqlite_vec::sqlite3_vec_init as *const (),
         )));
     });
@@ -157,7 +165,9 @@ impl SqliteEmbeddingStore {
 
         let indexed: i64 = self
             .conn
-            .query_row(&format!("SELECT COUNT(*) FROM {VEC_TABLE}"), [], |r| r.get(0))
+            .query_row(&format!("SELECT COUNT(*) FROM {VEC_TABLE}"), [], |r| {
+                r.get(0)
+            })
             .map_err(sql_err)?;
         let stored: i64 = self
             .conn
@@ -334,7 +344,9 @@ impl SqliteEmbeddingStore {
                 .map_err(sql_err)?;
             self.conn
                 .execute(
-                    &format!("INSERT INTO {VEC_TABLE}(rowid, node_type, embedding) VALUES (?, ?, ?)"),
+                    &format!(
+                        "INSERT INTO {VEC_TABLE}(rowid, node_type, embedding) VALUES (?, ?, ?)"
+                    ),
                     params![rowid, node_id.node_type, blob],
                 )
                 .map_err(sql_err)?;
@@ -608,8 +620,21 @@ impl SqliteEmbeddingStore {
                 text,
             })
             .collect();
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        results.truncate(top_k);
+        // Selecting the top k rather than ordering every candidate: O(n log k)
+        // against O(n log n), same rows in the same order.
+        let by_score = |a: &SimilarityResult, b: &SimilarityResult| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        };
+        if top_k == 0 {
+            return Ok(Vec::new());
+        }
+        if results.len() > top_k {
+            results.select_nth_unstable_by(top_k - 1, by_score);
+            results.truncate(top_k);
+        }
+        results.sort_by(by_score);
         Ok(results)
     }
 
@@ -648,8 +673,7 @@ impl SqliteEmbeddingStore {
             })
             .map_err(sql_err)?;
 
-        let embeddings: Vec<ExportedEmbedding> =
-            rows.collect::<Result<_, _>>().map_err(sql_err)?;
+        let embeddings: Vec<ExportedEmbedding> = rows.collect::<Result<_, _>>().map_err(sql_err)?;
         Ok(ExportedEmbeddings {
             format: EMBEDDING_FORMAT.to_string(),
             version: EMBEDDING_FORMAT_VERSION,
@@ -684,7 +708,7 @@ impl SqliteEmbeddingStore {
         let model = "unknown".to_string();
         let mut written = 0;
         for item in &payload.embeddings {
-            let node_id = NodeId::new(&item.node_type, &item.id.as_string());
+            let node_id = NodeId::new(&item.node_type, item.id.as_string());
             self.check_dimension(&item.vector, "vector")?;
             self.write_row(&node_id, &item.vector, &item.text, &model, &item.id_type)?;
             written += 1;

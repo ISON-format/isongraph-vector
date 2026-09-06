@@ -594,6 +594,39 @@ class TestSeedScoring:
         assert results[('person', 2)].score == pytest.approx(0.0)
 
 
+class TestTopKSelection:
+    """Selecting the top k must return exactly what sorting all of them would."""
+
+    def test_matches_a_full_sort_including_ties(self, encoder):
+        store = EmbeddingStore(db_path=':memory:', encoder=encoder)
+        store.add_batch([(('n', str(i)), f'text {i}') for i in range(500)])
+        # deliberate ties: several nodes sharing one vector
+        for i in range(5):
+            store.add(('tie', str(i)), 'tied', vector=[1.0] + [0.0] * 383)
+
+        for k in (1, 5, 10, 50, 200):
+            for qi in range(5):
+                query = encoder.encode(f'text {qi * 17}')
+                got = store.similarity_search(query, top_k=k, threshold=-1.0)
+                everything = store.similarity_search(query, top_k=None, threshold=-1.0)
+                assert [(r.node_ref, r.score) for r in got] ==                        [(r.node_ref, r.score) for r in everything[:k]], f'k={k}'
+        store.close()
+
+    def test_top_k_larger_than_the_store(self, encoder):
+        store = EmbeddingStore(db_path=':memory:', encoder=encoder)
+        store.add_batch([(('n', str(i)), f'text {i}') for i in range(3)])
+        results = store.similarity_search('anything', top_k=100, threshold=-1.0)
+        assert len(results) == 3
+        assert results == sorted(results, key=lambda r: r.score, reverse=True)
+        store.close()
+
+    def test_top_k_zero_returns_nothing(self, encoder):
+        store = EmbeddingStore(db_path=':memory:', encoder=encoder)
+        store.add(('n', '1'), 'one')
+        assert store.similarity_search('anything', top_k=0, threshold=-1.0) == []
+        store.close()
+
+
 class TestThreadSafety:
     """A shared sqlite connection needs a lock, not just check_same_thread."""
 

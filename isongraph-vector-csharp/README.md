@@ -124,13 +124,21 @@ using var store = new SqliteEmbeddingStore("embeddings.db", encoder, sqliteVec: 
 
 It does not change what you get back. `vec0` runs an exact brute-force KNN in
 C, not an approximate index — measured identical ordering and scores within
-2e-07 of the scan. Measured over 20,000 vectors of 384 dimensions, top-10, median of five
-runs: **42 ms** for the SQLite scan, **7.6 ms** through the index, and
-**7.7 ms** for the in-memory store. Recall of the index against the exact
-scan is **1.000** — the same answers, faster. Below a few thousand vectors
-the scan wins outright, which is why the index is opt-in. Filtering by node type stays
-exact too: the type is a `vec0` metadata column, so it narrows the search
-rather than filtering its results.
+2e-07 of the scan. Measured over 20,000 vectors of 384 dimensions, top-10,
+median of five runs: **37 ms** for the SQLite scan, **7.1 ms** through the
+index, and **5.9 ms** for the in-memory store. Recall of the index against the
+exact scan is **1.000** — the same answers, faster. Below a few thousand
+vectors the scan wins outright, which is why the index is opt-in.
+
+Note which pair that speedup is between: the index replaces the SQLite scan,
+not the in-memory store. `IsonGraph.Vector`'s own store is faster still at
+this size, because it never leaves managed memory. Reach for the index when
+the vectors have to be on disk anyway.
+
+Top-k results come out of a bounded insertion rather than sorting all of them,
+which is where a third of the query time used to go. Filtering by node type
+stays exact too: the type is a `vec0` metadata column, so it narrows the
+search rather than filtering its results.
 
 `Dispose` closes the connection and clears the ADO.NET pool, so the database
 file is genuinely released and can be moved or deleted.
@@ -172,7 +180,7 @@ store.FromJson(json);
 ## Tests
 
 ```bash
-dotnet test        # 59 tests
+dotnet test        # 61 tests
 ```
 
 ## Links

@@ -21,9 +21,9 @@
 //!
 //! Author: Mahesh Vaikri
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use ison_graph_rs::{ISONGraph, Node, NodeId, Direction, Value};
+use ison_graph_rs::{Direction, ISONGraph, Node, NodeId, Value};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet, VecDeque};
 use thiserror::Error;
 
 /// Property values are ISON values, re-exported so callers do not need a
@@ -60,7 +60,11 @@ pub enum EmbeddingError {
     /// widths would degrade silently. A store pins its dimension to the first
     /// vector it sees.
     #[error("{what} has {got} dimensions, store holds {expected}")]
-    DimensionMismatch { what: String, got: usize, expected: usize },
+    DimensionMismatch {
+        what: String,
+        got: usize,
+        expected: usize,
+    },
     #[error("{0} is empty")]
     EmptyVector(String),
     #[error("blend must be in [0, 1], got {0}")]
@@ -394,7 +398,7 @@ impl EmbeddingStore {
         let mut results: Vec<SimilarityResult> = self
             .embeddings
             .values()
-            .filter(|record| node_type.map_or(true, |t| record.node_id.node_type == t))
+            .filter(|record| node_type.is_none_or(|t| record.node_id.node_type == t))
             .filter_map(|record| {
                 let score = Self::cosine_similarity(query_vector, &record.vector);
                 if score >= threshold {
@@ -409,8 +413,21 @@ impl EmbeddingStore {
             })
             .collect();
 
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        results.truncate(top_k);
+        // Selecting the top k rather than ordering every candidate: O(n log k)
+        // against O(n log n), same rows in the same order.
+        let by_score = |a: &SimilarityResult, b: &SimilarityResult| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        };
+        if top_k == 0 {
+            return Ok(Vec::new());
+        }
+        if results.len() > top_k {
+            results.select_nth_unstable_by(top_k - 1, by_score);
+            results.truncate(top_k);
+        }
+        results.sort_by(by_score);
 
         Ok(results)
     }
@@ -424,7 +441,12 @@ impl EmbeddingStore {
         Ok(self
             .embeddings
             .iter()
-            .map(|(key, record)| (key.clone(), Self::cosine_similarity(query_vector, &record.vector)))
+            .map(|(key, record)| {
+                (
+                    key.clone(),
+                    Self::cosine_similarity(query_vector, &record.vector),
+                )
+            })
             .collect())
     }
 
@@ -489,7 +511,7 @@ impl EmbeddingStore {
 
         let mut written = 0;
         for item in &payload.embeddings {
-            let node_id = NodeId::new(&item.node_type, &item.id.as_string());
+            let node_id = NodeId::new(&item.node_type, item.id.as_string());
             self.add(node_id, &item.text, Some(item.vector.clone()))?;
             written += 1;
         }
@@ -810,7 +832,7 @@ impl SemanticGraph {
             // hop 1, down a path it never needed.)
             let replace_seed = results
                 .get(&seed_key)
-                .map_or(true, |existing| existing.score < seed.score);
+                .is_none_or(|existing| existing.score < seed.score);
             if replace_seed {
                 results.insert(
                     seed_key.clone(),
@@ -836,7 +858,9 @@ impl SemanticGraph {
                 }
 
                 let node_ref = (&node_id.node_type as &str, &node_id.id as &str);
-                let neighbors = self.graph.neighbors(&node_ref, options.rel_type, options.direction);
+                let neighbors =
+                    self.graph
+                        .neighbors(&node_ref, options.rel_type, options.direction);
 
                 for neighbor in neighbors {
                     let neighbor_key = format!("{}:{}", neighbor.node_type, neighbor.id);
@@ -856,7 +880,7 @@ impl SemanticGraph {
 
                     let should_update = results
                         .get(&neighbor_key)
-                        .map_or(true, |existing| existing.score < new_score);
+                        .is_none_or(|existing| existing.score < new_score);
 
                     if should_update {
                         results.insert(
@@ -876,7 +900,11 @@ impl SemanticGraph {
         }
 
         let mut sorted: Vec<SemanticSearchResult> = results.into_values().collect();
-        sorted.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         sorted.truncate(options.top_k_results);
 
         Ok(sorted)
@@ -933,7 +961,10 @@ impl SemanticGraph {
         for seed in seeds {
             let start = (&seed.node_id.node_type as &str, &seed.node_id.id as &str);
             let end = (&target.node_type as &str, &target.id as &str);
-            if let Some(path) = self.graph.shortest_path(&start, &end, rel_type, max_hops, direction) {
+            if let Some(path) = self
+                .graph
+                .shortest_path(&start, &end, rel_type, max_hops, direction)
+            {
                 let hops = path.length();
                 return Ok(Some(SemanticSearchResult {
                     node_id: target.clone(),
@@ -967,15 +998,13 @@ impl SemanticGraph {
             .map(|r| format!("{}:{}", r.node_id.node_type, r.node_id.id))
             .collect();
 
-        let mut sub = SemanticGraph::with_options(
-            name,
-            encoder,
-            false,
-            self.embed_fields.clone(),
-        );
+        let mut sub = SemanticGraph::with_options(name, encoder, false, self.embed_fields.clone());
 
         for result in &results {
-            let node = match self.graph.get_node(&result.node_id.node_type, &result.node_id.id) {
+            let node = match self
+                .graph
+                .get_node(&result.node_id.node_type, &result.node_id.id)
+            {
                 Ok(node) => node,
                 Err(_) => continue,
             };
@@ -997,7 +1026,13 @@ impl SemanticGraph {
             }
         }
 
-        for rel_type in self.graph.edge_types().into_iter().cloned().collect::<Vec<String>>() {
+        for rel_type in self
+            .graph
+            .edge_types()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<String>>()
+        {
             for edge in self.graph.edges_of_type(&rel_type) {
                 let source_key = format!("{}:{}", edge.source.node_type, edge.source.id);
                 let target_key = format!("{}:{}", edge.target.node_type, edge.target.id);
@@ -1078,9 +1113,14 @@ mod tests {
 
     /// Asserted identically in the Python, TypeScript, JavaScript and C++
     /// suites - keeping the ports bit-identical is what lets an embedding
-    /// store written by one be searched by another.
+    /// store written by one be searched by another. Written at the same
+    /// precision as the other ports' goldens so the two can be compared by
+    /// eye, which is why clippy's excessive_precision is off here.
+    #[allow(clippy::excessive_precision)]
     const GOLDEN_HELLO: [f32; 4] = [0.8381705284, -0.8255031109, 0.5899617672, 0.4615051746];
+    #[allow(clippy::excessive_precision)]
     const GOLDEN_ISON: [f32; 4] = [-0.3658730984, -0.2765417099, 0.2944871187, -0.6502785683];
+    #[allow(clippy::excessive_precision)]
     const GOLDEN_EMPTY: [f32; 4] = [-0.4520676136, -0.3797093630, 0.3339765072, 0.9023951292];
 
     fn seeded_graph() -> SemanticGraph {
@@ -1099,7 +1139,11 @@ mod tests {
         // person:1 matches the query perfectly, person:2 slightly less well.
         graph
             .embedding_store_mut()
-            .add(NodeId::new("person", "1"), "a", Some(vec![1.0, 0.0, 0.0, 0.0]))
+            .add(
+                NodeId::new("person", "1"),
+                "a",
+                Some(vec![1.0, 0.0, 0.0, 0.0]),
+            )
             .unwrap();
         graph
             .embedding_store_mut()
@@ -1148,7 +1192,11 @@ mod tests {
     #[test]
     fn test_mock_encoder_matches_other_ports() {
         let encoder = MockEncoder::new(4);
-        for (text, want) in [("hello", GOLDEN_HELLO), ("ison", GOLDEN_ISON), ("", GOLDEN_EMPTY)] {
+        for (text, want) in [
+            ("hello", GOLDEN_HELLO),
+            ("ison", GOLDEN_ISON),
+            ("", GOLDEN_EMPTY),
+        ] {
             let got = encoder.encode(text);
             for (i, expected) in want.iter().enumerate() {
                 assert!(
@@ -1168,7 +1216,11 @@ mod tests {
         let encoder = MockEncoder::new(8);
         let mut seen: HashSet<Vec<u32>> = HashSet::new();
         for i in 0..5000 {
-            let bits: Vec<u32> = encoder.encode(&format!("text{i}")).iter().map(|v| v.to_bits()).collect();
+            let bits: Vec<u32> = encoder
+                .encode(&format!("text{i}"))
+                .iter()
+                .map(|v| v.to_bits())
+                .collect();
             seen.insert(bits);
         }
         assert_eq!(seen.len(), 5000);
@@ -1187,7 +1239,9 @@ mod tests {
         let mut store = EmbeddingStore::new(Some(Box::new(encoder)));
 
         let node_id = NodeId::new("person", "1");
-        store.add(node_id.clone(), "Alice is an engineer", None).unwrap();
+        store
+            .add(node_id.clone(), "Alice is an engineer", None)
+            .unwrap();
 
         let record = store.get(&node_id).unwrap();
         assert_eq!(record.text, "Alice is an engineer");
@@ -1209,18 +1263,26 @@ mod tests {
         let encoder = MockEncoder::new(384);
         let mut store = EmbeddingStore::new(Some(Box::new(encoder)));
 
-        store.add(NodeId::new("person", "1"), "software engineer", None).unwrap();
-        store.add(NodeId::new("person", "2"), "data scientist", None).unwrap();
+        store
+            .add(NodeId::new("person", "1"), "software engineer", None)
+            .unwrap();
+        store
+            .add(NodeId::new("person", "2"), "data scientist", None)
+            .unwrap();
 
         // Use negative threshold to get all results with mock encoder
-        let results = store.similarity_search("software engineer", 2, None, -1.0).unwrap();
+        let results = store
+            .similarity_search("software engineer", 2, None, -1.0)
+            .unwrap();
         assert_eq!(results.len(), 2);
     }
 
     #[test]
     fn test_dimension_mismatch_is_rejected() {
         let mut store = EmbeddingStore::new(Some(Box::new(MockEncoder::new(8))));
-        store.add(NodeId::new("a", "1"), "full width", None).unwrap();
+        store
+            .add(NodeId::new("a", "1"), "full width", None)
+            .unwrap();
 
         let err = store.add(NodeId::new("a", "2"), "too short", Some(vec![1.0, 0.0]));
         assert!(matches!(err, Err(EmbeddingError::DimensionMismatch { .. })));
@@ -1233,10 +1295,70 @@ mod tests {
     }
 
     #[test]
+    fn test_top_k_selection_matches_a_full_sort() {
+        // Selecting the best k must return what ordering everything would.
+        let encoder = MockEncoder::new(64);
+        let mut store = EmbeddingStore::new(Some(Box::new(MockEncoder::new(64))));
+        let texts: Vec<String> = (0..500).map(|i| format!("text {i}")).collect();
+        let entries: Vec<(NodeId, &str)> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (NodeId::new("n", i.to_string()), t.as_str()))
+            .collect();
+        store.add_batch(&entries).unwrap();
+
+        for k in [1usize, 5, 10, 50, 200] {
+            for qi in 0..5 {
+                let query = encoder.encode(&format!("text {}", qi * 17));
+                let got = store
+                    .similarity_search_vector(&query, k, None, -1.0)
+                    .unwrap();
+                let all = store
+                    .similarity_search_vector(&query, usize::MAX, None, -1.0)
+                    .unwrap();
+                let want = &all[..k.min(all.len())];
+                assert_eq!(got.len(), want.len(), "k={k}");
+                for (a, b) in got.iter().zip(want.iter()) {
+                    assert_eq!(a.node_id, b.node_id, "k={k}");
+                    assert_eq!(a.score, b.score, "k={k}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_top_k_edges() {
+        let mut store = EmbeddingStore::new(Some(Box::new(MockEncoder::new(16))));
+        store
+            .add_batch(&[
+                (NodeId::new("n", "1"), "one"),
+                (NodeId::new("n", "2"), "two"),
+            ])
+            .unwrap();
+        let q = MockEncoder::new(16).encode("anything");
+        assert_eq!(
+            store
+                .similarity_search_vector(&q, 100, None, -1.0)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            store
+                .similarity_search_vector(&q, 0, None, -1.0)
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
     fn test_dimension_pinned_by_first_vector() {
         let mut store = EmbeddingStore::new(None);
         assert_eq!(store.dimension(), None);
-        store.add(NodeId::new("a", "1"), "x", Some(vec![1.0, 0.0, 0.0])).unwrap();
+        store
+            .add(NodeId::new("a", "1"), "x", Some(vec![1.0, 0.0, 0.0]))
+            .unwrap();
         assert_eq!(store.dimension(), Some(3));
     }
 
@@ -1254,7 +1376,14 @@ mod tests {
         let encoder = MockEncoder::new(384);
         let mut graph = SemanticGraph::new("test", Box::new(encoder));
 
-        graph.add_node("person", "1", vec![("name", Value::String("Alice".to_string()))], Some("Alice is an engineer")).unwrap();
+        graph
+            .add_node(
+                "person",
+                "1",
+                vec![("name", Value::String("Alice".to_string()))],
+                Some("Alice is an engineer"),
+            )
+            .unwrap();
 
         assert_eq!(graph.graph().node_count(), 1);
         assert_eq!(graph.embedding_store().count(), 1);
@@ -1263,7 +1392,17 @@ mod tests {
     #[test]
     fn test_add_node_auto_embeds_from_properties() {
         let mut graph = SemanticGraph::new("test", Box::new(MockEncoder::new(16)));
-        graph.add_node("person", "1", vec![("name", Value::String("Alice".to_string())), ("description", Value::String("engineer".to_string()))], None).unwrap();
+        graph
+            .add_node(
+                "person",
+                "1",
+                vec![
+                    ("name", Value::String("Alice".to_string())),
+                    ("description", Value::String("engineer".to_string())),
+                ],
+                None,
+            )
+            .unwrap();
 
         assert_eq!(graph.embedding_store().count(), 1);
         let record = graph.get_embedding(&NodeId::new("person", "1")).unwrap();
@@ -1275,11 +1414,17 @@ mod tests {
         let encoder = MockEncoder::new(384);
         let mut graph = SemanticGraph::new("test", Box::new(encoder));
 
-        graph.add_node("person", "1", vec![], Some("software engineer")).unwrap();
-        graph.add_node("person", "2", vec![], Some("data scientist")).unwrap();
+        graph
+            .add_node("person", "1", vec![], Some("software engineer"))
+            .unwrap();
+        graph
+            .add_node("person", "2", vec![], Some("data scientist"))
+            .unwrap();
 
         // Use negative threshold to get all results with mock encoder
-        let results = graph.similarity_search("software engineer", 5, None, -1.0).unwrap();
+        let results = graph
+            .similarity_search("software engineer", 5, None, -1.0)
+            .unwrap();
         assert!(!results.is_empty());
     }
 
@@ -1288,13 +1433,29 @@ mod tests {
         let encoder = MockEncoder::new(384);
         let mut graph = SemanticGraph::new("test", Box::new(encoder));
 
-        graph.add_node("person", "1", vec![], Some("software engineer")).unwrap();
-        graph.add_node("person", "2", vec![], Some("manager")).unwrap();
+        graph
+            .add_node("person", "1", vec![], Some("software engineer"))
+            .unwrap();
+        graph
+            .add_node("person", "2", vec![], Some("manager"))
+            .unwrap();
 
-        graph.graph_mut().add_edge("KNOWS", ("person", "1"), ("person", "2"), vec![]).unwrap();
+        graph
+            .graph_mut()
+            .add_edge("KNOWS", ("person", "1"), ("person", "2"), vec![])
+            .unwrap();
 
         let results = graph
-            .semantic_multi_hop("software", Some("KNOWS"), 2, 5, 10, Direction::Out, 0.8, -1.0)
+            .semantic_multi_hop(
+                "software",
+                Some("KNOWS"),
+                2,
+                5,
+                10,
+                Direction::Out,
+                0.8,
+                -1.0,
+            )
             .unwrap();
 
         assert!(!results.is_empty());
@@ -1308,14 +1469,20 @@ mod tests {
         // seed(1.0) * decay(0.8) = 0.8, at hop 1, down a path through
         // person:1 that it never needed.
         let mut graph = seeded_graph();
-        graph.embedding_store_mut().set_encoder(Box::new(FixedEncoder));
+        graph
+            .embedding_store_mut()
+            .set_encoder(Box::new(FixedEncoder));
 
         let results = graph
             .semantic_multi_hop("query", Some("KNOWS"), 2, 5, 10, Direction::Out, 0.8, 0.3)
             .unwrap();
 
         let second = results.iter().find(|r| r.node_id.id == "2").unwrap();
-        assert!((second.score - 0.9).abs() < 1e-6, "score was {}", second.score);
+        assert!(
+            (second.score - 0.9).abs() < 1e-6,
+            "score was {}",
+            second.score
+        );
         assert_eq!(second.hop_count, 0);
         assert_eq!(second.path, vec![NodeId::new("person", "2")]);
     }
@@ -1323,7 +1490,9 @@ mod tests {
     #[test]
     fn test_traversal_still_reaches_non_seeds() {
         let mut graph = seeded_graph();
-        graph.embedding_store_mut().set_encoder(Box::new(FixedEncoder));
+        graph
+            .embedding_store_mut()
+            .set_encoder(Box::new(FixedEncoder));
         graph.add_node("person", "3", vec![], None).unwrap();
         graph
             .graph_mut()
@@ -1331,7 +1500,11 @@ mod tests {
             .unwrap();
         graph
             .embedding_store_mut()
-            .add(NodeId::new("person", "3"), "c", Some(vec![0.0, 0.0, 1.0, 0.0]))
+            .add(
+                NodeId::new("person", "3"),
+                "c",
+                Some(vec![0.0, 0.0, 1.0, 0.0]),
+            )
             .unwrap();
 
         let results = graph
@@ -1345,12 +1518,7 @@ mod tests {
 
     #[test]
     fn test_negative_seed_does_not_grow_with_distance() {
-        let mut graph = SemanticGraph::with_options(
-            "neg",
-            Box::new(FixedEncoder),
-            false,
-            vec![],
-        );
+        let mut graph = SemanticGraph::with_options("neg", Box::new(FixedEncoder), false, vec![]);
         graph.add_node("person", "1", vec![], None).unwrap();
         graph.add_node("person", "2", vec![], None).unwrap();
         graph
@@ -1359,11 +1527,19 @@ mod tests {
             .unwrap();
         graph
             .embedding_store_mut()
-            .add(NodeId::new("person", "1"), "a", Some(vec![-1.0, 0.0, 0.0, 0.0]))
+            .add(
+                NodeId::new("person", "1"),
+                "a",
+                Some(vec![-1.0, 0.0, 0.0, 0.0]),
+            )
             .unwrap();
         graph
             .embedding_store_mut()
-            .add(NodeId::new("person", "2"), "b", Some(vec![0.0, 0.0, 1.0, 0.0]))
+            .add(
+                NodeId::new("person", "2"),
+                "b",
+                Some(vec![0.0, 0.0, 1.0, 0.0]),
+            )
             .unwrap();
 
         let results = graph
@@ -1393,11 +1569,38 @@ mod tests {
         for id in ["1", "2", "3"] {
             graph.add_node("person", id, vec![], None).unwrap();
         }
-        graph.graph_mut().add_edge("KNOWS", ("person", "1"), ("person", "2"), vec![]).unwrap();
-        graph.graph_mut().add_edge("KNOWS", ("person", "1"), ("person", "3"), vec![]).unwrap();
-        graph.embedding_store_mut().add(NodeId::new("person", "1"), "seed", Some(vec![1.0, 0.0, 0.0, 0.0])).unwrap();
-        graph.embedding_store_mut().add(NodeId::new("person", "2"), "off", Some(vec![0.0, 1.0, 0.0, 0.0])).unwrap();
-        graph.embedding_store_mut().add(NodeId::new("person", "3"), "on", Some(vec![0.8, 0.6, 0.0, 0.0])).unwrap();
+        graph
+            .graph_mut()
+            .add_edge("KNOWS", ("person", "1"), ("person", "2"), vec![])
+            .unwrap();
+        graph
+            .graph_mut()
+            .add_edge("KNOWS", ("person", "1"), ("person", "3"), vec![])
+            .unwrap();
+        graph
+            .embedding_store_mut()
+            .add(
+                NodeId::new("person", "1"),
+                "seed",
+                Some(vec![1.0, 0.0, 0.0, 0.0]),
+            )
+            .unwrap();
+        graph
+            .embedding_store_mut()
+            .add(
+                NodeId::new("person", "2"),
+                "off",
+                Some(vec![0.0, 1.0, 0.0, 0.0]),
+            )
+            .unwrap();
+        graph
+            .embedding_store_mut()
+            .add(
+                NodeId::new("person", "3"),
+                "on",
+                Some(vec![0.8, 0.6, 0.0, 0.0]),
+            )
+            .unwrap();
 
         let base_options = MultiHopOptions {
             rel_type: Some("KNOWS"),
@@ -1407,7 +1610,9 @@ mod tests {
             ..Default::default()
         };
 
-        let plain = graph.semantic_multi_hop_with("query", &base_options).unwrap();
+        let plain = graph
+            .semantic_multi_hop_with("query", &base_options)
+            .unwrap();
         let plain2 = plain.iter().find(|r| r.node_id.id == "2").unwrap().score;
         let plain3 = plain.iter().find(|r| r.node_id.id == "3").unwrap().score;
         assert!((plain2 - plain3).abs() < 1e-6);
@@ -1415,7 +1620,10 @@ mod tests {
         let blended = graph
             .semantic_multi_hop_with(
                 "query",
-                &MultiHopOptions { blend: 0.5, ..base_options },
+                &MultiHopOptions {
+                    blend: 0.5,
+                    ..base_options
+                },
             )
             .unwrap();
         let blended2 = blended.iter().find(|r| r.node_id.id == "2").unwrap().score;
@@ -1428,7 +1636,10 @@ mod tests {
         let graph = seeded_graph();
         let result = graph.semantic_multi_hop_with(
             "query",
-            &MultiHopOptions { blend: 1.5, ..Default::default() },
+            &MultiHopOptions {
+                blend: 1.5,
+                ..Default::default()
+            },
         );
         assert!(matches!(result, Err(EmbeddingError::InvalidBlend(_))));
     }
@@ -1439,23 +1650,41 @@ mod tests {
         for id in ["1", "2", "3"] {
             graph.add_node("person", id, vec![], None).unwrap();
         }
-        graph.graph_mut().add_edge("KNOWS", ("person", "1"), ("person", "2"), vec![]).unwrap();
-        graph.graph_mut().add_edge("KNOWS", ("person", "2"), ("person", "3"), vec![]).unwrap();
+        graph
+            .graph_mut()
+            .add_edge("KNOWS", ("person", "1"), ("person", "2"), vec![])
+            .unwrap();
+        graph
+            .graph_mut()
+            .add_edge("KNOWS", ("person", "2"), ("person", "3"), vec![])
+            .unwrap();
         // Distinct vectors, and a threshold that admits only person:1, so the
         // seed is deterministic. Giving every node the same vector leaves the
         // seed order to HashMap iteration, and a run that seeds on the target
         // finds the zero-hop path from the target to itself.
         graph
             .embedding_store_mut()
-            .add(NodeId::new("person", "1"), "a", Some(vec![1.0, 0.0, 0.0, 0.0]))
+            .add(
+                NodeId::new("person", "1"),
+                "a",
+                Some(vec![1.0, 0.0, 0.0, 0.0]),
+            )
             .unwrap();
         graph
             .embedding_store_mut()
-            .add(NodeId::new("person", "2"), "b", Some(vec![0.0, 1.0, 0.0, 0.0]))
+            .add(
+                NodeId::new("person", "2"),
+                "b",
+                Some(vec![0.0, 1.0, 0.0, 0.0]),
+            )
             .unwrap();
         graph
             .embedding_store_mut()
-            .add(NodeId::new("person", "3"), "c", Some(vec![0.0, 0.0, 1.0, 0.0]))
+            .add(
+                NodeId::new("person", "3"),
+                "c",
+                Some(vec![0.0, 0.0, 1.0, 0.0]),
+            )
             .unwrap();
 
         let result = graph
@@ -1474,7 +1703,11 @@ mod tests {
         let result = result.expect("a path should exist");
         assert_eq!(result.node_id, NodeId::new("person", "3"));
         assert_eq!(result.hop_count, 2);
-        assert!((result.score - 0.81).abs() < 1e-5, "score was {}", result.score);
+        assert!(
+            (result.score - 0.81).abs() < 1e-5,
+            "score was {}",
+            result.score
+        );
         assert_eq!(result.path.last().unwrap(), &NodeId::new("person", "3"));
     }
 
@@ -1488,15 +1721,32 @@ mod tests {
         // the target to itself would legitimately be found at zero hops.)
         graph
             .embedding_store_mut()
-            .add(NodeId::new("person", "1"), "a", Some(vec![1.0, 0.0, 0.0, 0.0]))
+            .add(
+                NodeId::new("person", "1"),
+                "a",
+                Some(vec![1.0, 0.0, 0.0, 0.0]),
+            )
             .unwrap();
         graph
             .embedding_store_mut()
-            .add(NodeId::new("person", "2"), "b", Some(vec![0.0, 1.0, 0.0, 0.0]))
+            .add(
+                NodeId::new("person", "2"),
+                "b",
+                Some(vec![0.0, 1.0, 0.0, 0.0]),
+            )
             .unwrap();
 
         let result = graph
-            .semantic_path("query", &NodeId::new("person", "2"), Some("KNOWS"), 5, 3, Direction::Out, 0.9, 0.5)
+            .semantic_path(
+                "query",
+                &NodeId::new("person", "2"),
+                Some("KNOWS"),
+                5,
+                3,
+                Direction::Out,
+                0.9,
+                0.5,
+            )
             .unwrap();
         assert!(result.is_none());
     }
@@ -1504,9 +1754,30 @@ mod tests {
     #[test]
     fn test_similar_to_node_excludes_itself() {
         let mut graph = SemanticGraph::new("similar", Box::new(MockEncoder::new(16)));
-        graph.add_node("person", "1", vec![("name", Value::String("Alice".to_string()))], None).unwrap();
-        graph.add_node("person", "2", vec![("name", Value::String("Bob".to_string()))], None).unwrap();
-        graph.add_node("person", "3", vec![("name", Value::String("Carol".to_string()))], None).unwrap();
+        graph
+            .add_node(
+                "person",
+                "1",
+                vec![("name", Value::String("Alice".to_string()))],
+                None,
+            )
+            .unwrap();
+        graph
+            .add_node(
+                "person",
+                "2",
+                vec![("name", Value::String("Bob".to_string()))],
+                None,
+            )
+            .unwrap();
+        graph
+            .add_node(
+                "person",
+                "3",
+                vec![("name", Value::String("Carol".to_string()))],
+                None,
+            )
+            .unwrap();
 
         let results = graph
             .similar_to_node(&NodeId::new("person", "1"), 2, None, -1.0)
@@ -1517,20 +1788,50 @@ mod tests {
 
     #[test]
     fn test_similar_to_node_without_embedding() {
-        let mut graph = SemanticGraph::with_options("similar", Box::new(MockEncoder::new(16)), false, vec![]);
+        let mut graph =
+            SemanticGraph::with_options("similar", Box::new(MockEncoder::new(16)), false, vec![]);
         graph.add_node("person", "9", vec![], None).unwrap();
-        let results = graph.similar_to_node(&NodeId::new("person", "9"), 5, None, -1.0).unwrap();
+        let results = graph
+            .similar_to_node(&NodeId::new("person", "9"), 5, None, -1.0)
+            .unwrap();
         assert!(results.is_empty());
     }
 
     #[test]
     fn test_semantic_subgraph_is_a_working_graph() {
         let mut graph = SemanticGraph::new("full", Box::new(MockEncoder::new(16)));
-        graph.add_node("person", "1", vec![("name", Value::String("Alice".to_string()))], None).unwrap();
-        graph.add_node("person", "2", vec![("name", Value::String("Bob".to_string()))], None).unwrap();
-        graph.add_node("person", "3", vec![("name", Value::String("Carol".to_string()))], None).unwrap();
-        graph.graph_mut().add_edge("KNOWS", ("person", "1"), ("person", "2"), vec![]).unwrap();
-        graph.graph_mut().add_edge("KNOWS", ("person", "2"), ("person", "3"), vec![]).unwrap();
+        graph
+            .add_node(
+                "person",
+                "1",
+                vec![("name", Value::String("Alice".to_string()))],
+                None,
+            )
+            .unwrap();
+        graph
+            .add_node(
+                "person",
+                "2",
+                vec![("name", Value::String("Bob".to_string()))],
+                None,
+            )
+            .unwrap();
+        graph
+            .add_node(
+                "person",
+                "3",
+                vec![("name", Value::String("Carol".to_string()))],
+                None,
+            )
+            .unwrap();
+        graph
+            .graph_mut()
+            .add_edge("KNOWS", ("person", "1"), ("person", "2"), vec![])
+            .unwrap();
+        graph
+            .graph_mut()
+            .add_edge("KNOWS", ("person", "2"), ("person", "3"), vec![])
+            .unwrap();
 
         let sub = graph
             .semantic_subgraph(
@@ -1619,7 +1920,14 @@ mod tests {
             vec!["name".to_string()],
         );
         for i in 0..10 {
-            graph.add_node("doc", &i.to_string(), vec![("name", Value::String("Document".to_string()))], None).unwrap();
+            graph
+                .add_node(
+                    "doc",
+                    &i.to_string(),
+                    vec![("name", Value::String("Document".to_string()))],
+                    None,
+                )
+                .unwrap();
         }
         let count = graph.embed_all_nodes(None::<fn(&Node) -> String>).unwrap();
         assert_eq!(count, 10);
@@ -1629,17 +1937,27 @@ mod tests {
     #[test]
     fn test_embeddings_round_trip_through_json() {
         let mut store = EmbeddingStore::new(Some(Box::new(MockEncoder::new(8))));
-        store.add(NodeId::new("person", "1"), "Alice", None).unwrap();
-        store.add(NodeId::new("account", "007"), "Bond", None).unwrap();
+        store
+            .add(NodeId::new("person", "1"), "Alice", None)
+            .unwrap();
+        store
+            .add(NodeId::new("account", "007"), "Bond", None)
+            .unwrap();
 
         let json = store.to_json().unwrap();
         assert!(json.contains(EMBEDDING_FORMAT));
 
         let mut other = EmbeddingStore::new(Some(Box::new(MockEncoder::new(8))));
         assert_eq!(other.from_json(&json, false).unwrap(), 2);
-        assert_eq!(other.get(&NodeId::new("person", "1")).unwrap().text, "Alice");
+        assert_eq!(
+            other.get(&NodeId::new("person", "1")).unwrap().text,
+            "Alice"
+        );
         // a numeric-looking string id keeps its exact form
-        assert_eq!(other.get(&NodeId::new("account", "007")).unwrap().text, "Bond");
+        assert_eq!(
+            other.get(&NodeId::new("account", "007")).unwrap().text,
+            "Bond"
+        );
     }
 
     #[test]
@@ -1651,15 +1969,25 @@ mod tests {
 
         let mut store = EmbeddingStore::new(Some(Box::new(MockEncoder::new(4))));
         assert_eq!(store.from_json(python_payload, false).unwrap(), 2);
-        assert_eq!(store.get(&NodeId::new("person", "1")).unwrap().text, "Alice");
-        assert_eq!(store.get(&NodeId::new("account", "007")).unwrap().text, "Bond");
+        assert_eq!(
+            store.get(&NodeId::new("person", "1")).unwrap().text,
+            "Alice"
+        );
+        assert_eq!(
+            store.get(&NodeId::new("account", "007")).unwrap().text,
+            "Bond"
+        );
 
         // and the vectors match what this port encodes for the same text
         let encoder = MockEncoder::new(4);
         let expected = encoder.encode("Alice");
         let stored = &store.get(&NodeId::new("person", "1")).unwrap().vector;
         for (i, want) in expected.iter().enumerate() {
-            assert!((stored[i] - want).abs() < 1e-6, "component {i}: {} vs {want}", stored[i]);
+            assert!(
+                (stored[i] - want).abs() < 1e-6,
+                "component {i}: {} vs {want}",
+                stored[i]
+            );
         }
     }
 

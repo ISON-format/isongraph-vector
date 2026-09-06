@@ -50,12 +50,21 @@ JavaScript, Rust and C++.
   Python and reading byte-identical vectors.
 - sqlite-vec answers top-k queries from a `vec0` virtual table rather than
   scanning. Exact, not approximate - identical ordering and scores within
-  2e-07 of the scan - and about 4x faster over 20,000 vectors, though slower
-  below a few thousand, which is why it is opt-in. `node_type` filtering is a
-  `vec0` metadata column, so it narrows the search rather than filtering its
+  2e-07 of the scan. Over a SQLite scan it is worth 2x (C++) to 8x (Node) at
+  20,000 vectors; over an in-process scan the margin narrows to 1.3-1.4x, and
+  for C# it inverts, its in-memory scan at 5.9 ms beating the 7.1 ms round
+  trip through `vec0`. Below a few thousand vectors the scan wins outright
+  everywhere, which is why it is opt-in. `node_type` filtering is a `vec0`
+  metadata column, so it narrows the search rather than filtering its
   results.
+- Top-k results come out of a partial selection rather than a full sort in
+  every port - `heapq.nlargest` in Python, `std::partial_sort` in C++,
+  `select_nth_unstable_by` in Rust, a bounded insertion in C#, TypeScript and
+  JavaScript. Ordering 20,000 candidates to return ten was costing about a
+  third of each query. Every suite asserts the selection returns what a full
+  sort would.
 - Typed errors: `EmbeddingError`, `DimensionMismatchError`, `NoEncoderError`.
-- 378 tests across the six ports, including cross-port checks that import an
+- 391 tests across the six ports, including cross-port checks that import an
   embedding payload produced by the Python port, checks in every port that the
   sqlite-vec backend returns exactly what the scan returns, and a golden
   embedding-text assertion shared by all six.
@@ -74,15 +83,19 @@ JavaScript, Rust and C++.
   significant figures.
 - Rust `add_node` takes `Vec<(&str, PropertyValue)>`; `add_node_with_embed`
   keeps its string-valued signature and lifts values for you. The C# port
-  takes `IDictionary<string, object?>`.
+  takes a concrete `Dictionary<string, object?>` so a collection initializer
+  (`new() { ["name"] = "Alice" }`) target-types against it.
 
 ### Notes
 
 - The Python import name is `isongraph_vector`; the other ports are published as
   `IsonGraph.Vector` (NuGet), `isongraph-vector-ts`, `isongraph-vector-js` and
   `isongraph-vector-rs`, with the C++ port consumed as headers.
-- Only the Python port persists graphs. The others are in-memory and use
-  `MockEncoder`; they can still exchange embeddings through the portable
-  payload.
+- Only the Python port persists whole graphs to `.isong` with an embeddings
+  sidecar. Every port persists embeddings, through its SQLite store or the
+  portable payload.
+- Only the Python port ships a real encoder (`SentenceTransformerEncoder`).
+  The other five ship `MockEncoder` and the encoder interface; bring your own
+  model.
 - Similarity search is brute force. There is no ANN index: this is built for an
   application's own knowledge graph, not as a vector-database replacement.

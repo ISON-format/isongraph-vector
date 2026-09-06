@@ -515,12 +515,14 @@ public sealed class SqliteEmbeddingStore : IDisposable
 
             var results = Scan(queryVector, nodeType)
                 .Where(r => r.Score >= threshold)
-                .OrderByDescending(r => r.Score)
                 .Select(r => new SimilarityResult(r.NodeRef, r.Score, r.Text))
                 .ToList();
-            return topK is null || results.Count <= topK
-                ? results
-                : results.GetRange(0, topK.Value);
+            if (topK is null)
+            {
+                results.Sort((a, b) => b.Score.CompareTo(a.Score));
+                return results;
+            }
+            return EmbeddingStore.SelectTopK(results, topK.Value);
         }
     }
 

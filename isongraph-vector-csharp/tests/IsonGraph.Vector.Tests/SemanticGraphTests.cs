@@ -177,6 +177,51 @@ public class EmbeddingStoreTests
     }
 }
 
+public class TopKSelectionTests
+{
+    [Fact]
+    public void MatchesAFullSortIncludingTies()
+    {
+        // Selecting the best k must return what ordering everything would.
+        var encoder = new MockEncoder(64);
+        var store = new EmbeddingStore(encoder);
+        store.AddBatch(Enumerable.Range(0, 500)
+            .Select(i => (new NodeRef("n", i.ToString()), $"text {i}")).ToList());
+        var tied = new float[64];
+        tied[0] = 1f;
+        for (int i = 0; i < 5; i++) store.Add(new NodeRef("tie", i.ToString()), "tied", tied);
+
+        foreach (var k in new[] { 1, 5, 10, 50, 200 })
+        {
+            for (int qi = 0; qi < 5; qi++)
+            {
+                var query = encoder.Encode($"text {qi * 17}");
+                var got = store.SimilaritySearchVector(query, k, null, -1.0f);
+                var all = store.SimilaritySearchVector(query, null, null, -1.0f);
+                var want = all.Take(k).ToList();
+
+                // Scores, not identities: List.Sort is unstable, so which of
+                // several equally-scoring nodes lands where is arbitrary.
+                Assert.Equal(want.Count, got.Count);
+                Assert.Equal(want.Select(r => r.Score), got.Select(r => r.Score));
+            }
+        }
+    }
+
+    [Fact]
+    public void HandlesKLargerThanTheStoreAndZero()
+    {
+        var store = new EmbeddingStore(new MockEncoder(16));
+        store.AddBatch(new[]
+        {
+            (new NodeRef("n", "1"), "one"),
+            (new NodeRef("n", "2"), "two"),
+        });
+        Assert.Equal(2, store.SimilaritySearch("anything", 100, null, -1.0f).Count);
+        Assert.Empty(store.SimilaritySearch("anything", 0, null, -1.0f));
+    }
+}
+
 public class DimensionValidationTests
 {
     [Fact]

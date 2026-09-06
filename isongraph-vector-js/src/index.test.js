@@ -568,3 +568,31 @@ describe('typed property rendering', () => {
   });
 
 });
+
+describe('top-k selection', () => {
+  // Selecting the best k must return exactly what sorting all of them would,
+  // ties included - the insertion goes after equal scores, matching a stable
+  // descending sort.
+  it('matches a full sort including ties', () => {
+    const encoder = new MockEncoder(64);
+    const store = new EmbeddingStore(encoder);
+    store.addBatch(Array.from({ length: 500 }, (_, i) => [['n', String(i)], `text ${i}`]));
+    for (let i = 0; i < 5; i++) store.add(['tie', String(i)], 'tied', [1, ...Array(63).fill(0)]);
+
+    for (const k of [1, 5, 10, 50, 200]) {
+      for (let qi = 0; qi < 5; qi++) {
+        const query = encoder.encode(`text ${qi * 17}`);
+        const got = store.similaritySearch(query, k, undefined, -1.0);
+        const all = store.similaritySearch(query, null, undefined, -1.0);
+        expect(got.map(r => [r.nodeRef, r.score])).toEqual(all.slice(0, k).map(r => [r.nodeRef, r.score]));
+      }
+    }
+  });
+
+  it('handles a k larger than the store, and zero', () => {
+    const store = new EmbeddingStore(new MockEncoder(16));
+    store.addBatch([[['n', '1'], 'one'], [['n', '2'], 'two'], [['n', '3'], 'three']]);
+    expect(store.similaritySearch('anything', 100, undefined, -1.0).length).toBe(3);
+    expect(store.similaritySearch('anything', 0, undefined, -1.0)).toEqual([]);
+  });
+});

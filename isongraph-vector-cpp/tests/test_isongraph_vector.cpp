@@ -193,6 +193,39 @@ TEST(embedding_store_filter_by_type) {
     ASSERT_EQ(results[0].node_ref.type, "company");
 }
 
+TEST(top_k_selection_matches_a_full_sort) {
+    // Selecting the best k must return what ordering everything would.
+    auto encoder = std::make_shared<MockEncoder>(64);
+    EmbeddingStore store(encoder);
+    for (int i = 0; i < 500; ++i) {
+        store.add(NodeRef("n", std::to_string(i)), "text " + std::to_string(i));
+    }
+
+    for (size_t k : {size_t(1), size_t(5), size_t(10), size_t(50), size_t(200)}) {
+        for (int qi = 0; qi < 5; ++qi) {
+            auto query = encoder->encode("text " + std::to_string(qi * 17));
+            auto got = store.similaritySearchVector(query, k, "", -1.0f);
+            auto all = store.similaritySearchVector(query, 100000, "", -1.0f);
+            size_t want = std::min(k, all.size());
+            ASSERT_EQ(got.size(), want);
+            // Scores, not identities: std::sort and std::partial_sort are
+            // both unstable, so the order among equal scores is arbitrary.
+            for (size_t i = 0; i < want; ++i) {
+                ASSERT_EQ(got[i].score, all[i].score);
+            }
+        }
+    }
+}
+
+TEST(top_k_edges) {
+    auto encoder = std::make_shared<MockEncoder>(16);
+    EmbeddingStore store(encoder);
+    store.add(NodeRef("n", "1"), "one");
+    store.add(NodeRef("n", "2"), "two");
+    ASSERT_EQ(store.similaritySearch("anything", 100, "", -1.0f).size(), 2u);
+    ASSERT_EQ(store.similaritySearch("anything", 0, "", -1.0f).size(), 0u);
+}
+
 TEST(embedding_store_threshold) {
     auto encoder = std::make_shared<MockEncoder>();
     EmbeddingStore store(encoder);

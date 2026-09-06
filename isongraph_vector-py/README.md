@@ -126,15 +126,15 @@ Search runs three ways, in increasing order of speed and dependencies:
 | numpy | `[fast]` | one matrix-vector product against a cached matrix |
 | sqlite-vec | `[vec]` | `vec0` virtual table, KNN in C |
 
-numpy alone takes a query over 5,000 nodes from 246 ms to 2.5 ms, and is used
+numpy alone takes a query over 5,000 nodes from 182 ms to 2.6 ms, and is used
 automatically whenever it is importable. sqlite-vec goes further, but only at
 scale — and it is worth being precise about when:
 
 | Vectors | numpy scan | sqlite-vec | |
 | ---: | ---: | ---: | --- |
-| 1,000 | 0.45 ms | 0.78 ms | slower — don't bother |
-| 5,000 | 3.11 ms | 1.92 ms | 1.6x |
-| 20,000 | 14.7 ms | 7.2 ms | 2.0x |
+| 1,000 | 0.41 ms | 0.67 ms | slower — don't bother |
+| 5,000 | 2.55 ms | 1.98 ms | 1.3x |
+| 20,000 | 10.9 ms | 7.6 ms | 1.4x |
 
 Recall of the index against the exact scan is **1.000** — the same answers, not
 an approximation with a good hit rate. It also makes writes about 2.7x more
@@ -195,7 +195,7 @@ store.import_embeddings(payload)
 ## Tests
 
 ```bash
-pytest tests/                     # 70 tests, MockEncoder, no downloads
+pytest tests/                     # 73 tests, MockEncoder, no downloads
 USE_REAL_ENCODER=1 pytest tests/  # against real sentence-transformers
 ```
 

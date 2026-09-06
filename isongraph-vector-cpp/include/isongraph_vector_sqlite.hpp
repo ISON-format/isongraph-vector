@@ -626,11 +626,16 @@ public:
         results.erase(std::remove_if(results.begin(), results.end(),
                                      [&](const SimilarityResult& r) { return r.score < threshold; }),
                       results.end());
-        std::sort(results.begin(), results.end(),
-                  [](const SimilarityResult& a, const SimilarityResult& b) {
-                      return a.score > b.score;
-                  });
-        if (results.size() > topK) results.resize(topK);
+        auto by_score = [](const SimilarityResult& a, const SimilarityResult& b) {
+            return a.score > b.score;
+        };
+        // Top-k selection rather than a full ordering; same rows, same order.
+        if (results.size() > topK) {
+            std::partial_sort(results.begin(), results.begin() + topK, results.end(), by_score);
+            results.resize(topK);
+        } else {
+            std::sort(results.begin(), results.end(), by_score);
+        }
         return results;
     }
 

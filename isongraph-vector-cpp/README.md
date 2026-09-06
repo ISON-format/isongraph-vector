@@ -113,7 +113,8 @@ in one batched encoder call.
 ## Storing the vectors
 
 The default store is in memory, and the library stays header-only and
-dependency-free that way. Turn the option on and you get a SQLite-backed store:
+dependency-free that way. Turn the option on and you get a SQLite-backed
+store:
 
 ```bash
 cmake -S . -B build -DISONGRAPH_VECTOR_SQLITE=ON
@@ -135,15 +136,19 @@ store.addBatch({                          // one encoder call, one transaction
 ```
 
 Pass `true` as the third constructor argument and top-k searches are answered
-by a sqlite-vec `vec0` virtual table instead of a scan. It does not change what
-you get back: `vec0` runs an exact brute-force KNN in C, not an approximate
-index — measured identical ordering and scores within 2e-07 of the scan. Measured over 20,000 vectors of 384 dimensions, top-10, median of five
-runs: **18.8 ms** for the SQLite scan, **7.1 ms** through the index, and
-**11.6 ms** for the in-memory store. Recall of the index against the exact
-scan is **1.000** — the same answers, faster. Below a few thousand vectors
-the scan wins outright, which is why the index is opt-in. Filtering by node type stays exact too: the type is
-a `vec0` metadata column, so it narrows the search rather than filtering its
-results.
+by a sqlite-vec `vec0` virtual table instead of a scan. It does not change
+what you get back: `vec0` runs an exact brute-force KNN in C, not an
+approximate index — measured identical ordering and scores within 2e-07 of the
+scan. Measured over 20,000 vectors of 384 dimensions, top-10, median of five
+runs: **14.7 ms** for the SQLite scan, **7.0 ms** through the index, and
+**9.1 ms** for the in-memory store. Recall of the index against the exact scan
+is **1.000** — the same answers, faster. Below a few thousand vectors the scan
+wins outright, which is why the index is opt-in.
+
+Top-k results come out of `std::partial_sort` rather than sorting all of them,
+which is where a third of the query time used to go. Filtering by node type
+stays exact too: the type is a `vec0` metadata column, so it narrows the
+search rather than filtering its results.
 
 The fetched SQLite targets are build-tree only and are not installed. A
 consumer who wants the store either builds with the option on, or links their
@@ -181,7 +186,7 @@ row written by Python byte for byte.
 
 ```bash
 cmake -S . -B build && cmake --build build
-./build/test_isongraph_vector                 # 53 tests
+./build/test_isongraph_vector                 # 55 tests
 
 cmake -S . -B build -DISONGRAPH_VECTOR_SQLITE=ON && cmake --build build
 ./build/test_isongraph_vector_sqlite          # + 16 SQLite tests

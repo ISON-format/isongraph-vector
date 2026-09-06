@@ -203,7 +203,7 @@ In Python the three backends line up like this:
 | numpy (used automatically) | `[fast]` | one matrix-vector product against a cached matrix |
 | sqlite-vec | `[vec]` | `vec0` virtual table, KNN in C |
 
-numpy alone takes a query over 5,000 nodes from 246 ms to 2.5 ms. Indexing
+numpy alone takes a query over 5,000 nodes from 182 ms to 2.6 ms. Indexing
 costs writes — 20,000 rows take 0.16 s to insert without it and 0.43 s with —
 which is why it stays opt-in.
 
@@ -221,11 +221,11 @@ every candidate is scored. Median of five runs on one Windows machine, using
 
 | Port | In-process scan | SQLite scan | sqlite-vec | Recall |
 | --- | ---: | ---: | ---: | ---: |
-| C# | 7.7 ms | 42 ms | 7.6 ms | 1.000 |
-| C++ | 11.6 ms | 18.8 ms | 7.1 ms | 1.000 |
-| Rust | 11.8 ms | 21.0 ms | 8.2 ms | 1.000 |
-| Python (numpy) | 14.7 ms | — | 7.2 ms | 1.000 |
-| TypeScript / JavaScript | 14.9 ms | 61 ms | 7.4 ms | 1.000 |
+| C# | 5.9 ms | 37 ms | 7.1 ms | 1.000 |
+| C++ | 9.1 ms | 14.7 ms | 7.0 ms | 1.000 |
+| Python (numpy) | 10.9 ms | — | 7.6 ms | 1.000 |
+| Rust | 9.9 ms | 19.0 ms | 6.9 ms | 1.000 |
+| TypeScript / JavaScript | 10.1 ms | 54 ms | 7.1 ms | 1.000 |
 
 **Recall is 1.000 everywhere**, which is the number that matters most: `vec0`
 is an exact brute-force KNN, so the index returns precisely what the scan
@@ -240,10 +240,21 @@ leave `sqlite_vec` off, expect the scan column. Python has no separate SQLite
 scan row because its store is SQLite-backed either way; its numpy path caches a
 decoded matrix, so it behaves like the in-process column.
 
-Treat the absolute numbers as one machine's shape, not a benchmark. The ratios
-are the durable part: the index is worth roughly 2x over an in-process scan and
-3-8x over a SQLite scan at this size, and *costs* you below a few thousand
-vectors, where the scan wins outright.
+Every port returns the top *k* by selection rather than by ordering all the
+candidates — `heapq.nlargest` in Python, `partial_sort` in C++,
+`select_nth_unstable` in Rust, a bounded insertion in C#, TypeScript and
+JavaScript. Sorting 20,000 candidates to return ten was costing a third of the
+query; the results are identical either way.
+
+Treat the absolute numbers as one machine's shape, not a benchmark — they move
+noticeably with machine load, and the Node figures move with JIT warmth, which
+is why every figure is a median of five. The ratios are the durable part. Over
+a SQLite scan the index is worth 2x (C++) to 8x (Node) at this size: it is
+always the right choice if your vectors live in SQLite anyway. Over an
+in-process scan it is a much closer call — 1.3-1.4x for C++, Python, Rust and
+Node, and a slight *loss* for C#, whose in-memory scan at 5.9 ms already beats
+the 7.1 ms round trip through `vec0`. And below a few thousand vectors the scan
+wins outright everywhere, which is why the index is opt-in in every port.
 
 ## One format, six languages
 
@@ -379,18 +390,18 @@ silently wrong scores.
 ## Testing
 
 ```bash
-pytest tests/                                            # Python, 70
-cd isongraph-vector-csharp && dotnet test                # C#, 59
-cd isongraph-vector-ts && npm test                       # TypeScript, 67
-cd isongraph-vector-js && npm test                       # JavaScript, 65
-cd isongraph-vector-rs && cargo test --features sqlite   # Rust, 48
+pytest tests/                                            # Python, 73
+cd isongraph-vector-csharp && dotnet test                # C#, 61
+cd isongraph-vector-ts && npm test                       # TypeScript, 69
+cd isongraph-vector-js && npm test                       # JavaScript, 67
+cd isongraph-vector-rs && cargo test --features sqlite   # Rust, 50
 
 cd isongraph-vector-cpp
 cmake -S . -B build -DISONGRAPH_VECTOR_SQLITE=ON && cmake --build build
-./build/test_isongraph_vector && ./build/test_isongraph_vector_sqlite   # C++, 69
+./build/test_isongraph_vector && ./build/test_isongraph_vector_sqlite   # C++, 71
 ```
 
-378 tests in total. `pytest` works straight from a checkout:
+391 tests in total. `pytest` works straight from a checkout:
 [`conftest.py`](conftest.py) binds the import name `isongraph_vector` to the
 `isongraph_vector-py/` directory, which is named to line up with the other
 ports and so cannot be imported directly. An installed copy takes precedence.

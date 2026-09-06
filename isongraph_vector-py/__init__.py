@@ -44,6 +44,7 @@ from __future__ import annotations
 import sqlite3
 import struct
 import hashlib
+import heapq
 import json
 import threading
 from abc import ABC, abstractmethod
@@ -321,8 +322,8 @@ class EmbeddingStore:
                  extra). Results are the same: vec0 runs an exact
                  brute-force KNN in C, so this is a speed change and not an
                  accuracy trade - measured identical top-10 ordering, scores
-                 within 2e-07 of the scan, and about 4x faster over 20,000
-                 vectors.
+                 within 2e-07 of the scan, and about 1.4x faster over
+                 20,000 vectors.
 
         Raises:
             EmbeddingError: sqlite_vec=True but the package is not installed
@@ -910,8 +911,15 @@ class EmbeddingStore:
             for ref, score, text in scored
             if score >= threshold
         ]
-        results.sort(key=lambda x: x.score, reverse=True)
-        return results if top_k is None else results[:top_k]
+        if top_k is None:
+            results.sort(key=lambda x: x.score, reverse=True)
+            return results
+
+        # Selecting the top k rather than sorting all of them. Ordering 20,000
+        # candidates to return ten cost about 3 ms of a 15 ms query; nlargest
+        # is O(n log k) and returns exactly what sorted(...)[:k] would, ties
+        # included.
+        return heapq.nlargest(top_k, results, key=lambda x: x.score)
 
     def score_map(
         self,

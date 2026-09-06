@@ -151,13 +151,18 @@ store.add_batch(&[                       // one encoder call, one transaction
 
 Pass `true` for that last argument and top-k searches are answered by a
 sqlite-vec `vec0` virtual table instead of a scan. It does not change what you
-get back: `vec0` runs an exact brute-force KNN in C, not an approximate index —
-measured identical ordering and scores within 2e-07 of the scan. Measured over 20,000 vectors of 384 dimensions, top-10, median of five
-runs: **21.0 ms** for the SQLite scan, **8.2 ms** through the index, and
-**11.8 ms** for the in-memory store. Recall of the index against the exact
-scan is **1.000** — the same answers, faster. Below a few thousand vectors
-the scan wins outright, which is why the index is opt-in. Filtering by node type stays exact too: the type is a `vec0`
-metadata column, so it narrows the search rather than filtering its results.
+get back: `vec0` runs an exact brute-force KNN in C, not an approximate index
+— measured identical ordering and scores within 2e-07 of the scan. Measured
+over 20,000 vectors of 384 dimensions, top-10, median of five runs:
+**19.0 ms** for the SQLite scan, **6.9 ms** through the index, and **9.9 ms**
+for the in-memory store. Recall of the index against the exact scan is
+**1.000** — the same answers, faster. Below a few thousand vectors the scan
+wins outright, which is why the index is opt-in.
+
+Top-k results come out of `select_nth_unstable_by` rather than sorting all of
+them, which is where a third of the query time used to go. Filtering by node
+type stays exact too: the type is a `vec0` metadata column, so it narrows the
+search rather than filtering its results.
 
 ## One format, six languages
 
@@ -193,7 +198,7 @@ store.from_json(&json, false)?;
 ## Tests
 
 ```bash
-cargo test                      # 33 unit tests + 1 doctest
+cargo test                      # 35 unit tests + 1 doctest
 cargo test --features sqlite    # + 14 SQLite tests
 ```
 
