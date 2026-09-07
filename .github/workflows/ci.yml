@@ -29,14 +29,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Windows is here because it is where the port is developed, and
-        # sqlite3 extension loading differs by platform.
-        #
-        # pyproject.toml declares requires-python >=3.9, which this matrix no
-        # longer reaches down to. The source carries no 3.10+ syntax, so the
-        # floor is plausible - but it is now a claim rather than a measurement.
+        # 3.10 is the floor declared in pyproject.toml, so it is tested
+        # rather than assumed. Windows is here because it is where the port is
+        # developed, and sqlite3 extension loading differs by platform.
         os: [ubuntu-latest]
-        python: ['3.12', '3.13']
+        python: ['3.10', '3.12', '3.13']
         include:
           - os: windows-latest
             python: '3.12'

@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/ISON-format/isongraph-vector/actions/workflows/ci.yml/badge.svg)](https://github.com/ISON-format/isongraph-vector/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/isongraph-vector.svg)](https://pypi.org/project/isongraph-vector/)
-[![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Semantic search over an ISON graph — find the nodes that mean what you asked,
@@ -437,8 +437,8 @@ to float32, so a store built from either is identical. Only the text differs.
 ### Continuous integration
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs all six suites plus
-the interchange check on every push and pull request. Python is tested on 3.12
-and 3.13, and once more with numpy and sqlite-vec uninstalled, because the
+the interchange check on every push and pull request. Python is tested on 3.10,
+3.12 and 3.13, and once more with numpy and sqlite-vec uninstalled, because the
 pure-Python cosine loop and the table scan are real fallbacks that nothing else
 exercises. Rust, C++ and C# run on Linux, Windows and macOS. The Node ports run
 the full suite on Node 24 and the runtime-agnostic half on 20 and 22, which is
