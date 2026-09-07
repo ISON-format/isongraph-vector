@@ -223,9 +223,16 @@ jobs:
         run: cargo test
       - name: Test (sqlite feature)
         run: cargo test --features sqlite
+      # --target-dir keeps the unpacked crate out of ./target, which
+      # Swatinem/rust-cache prunes on the way out. It walks the tree looking
+      # for test artifacts, finds target/package/<crate>/tests/ has no target
+      # or trybuild subdirectory, and logs an ##[error] annotation for each -
+      # harmless, the job still passes, but it makes every Rust run look
+      # broken in the UI.
       - name: Package
         if: matrix.os == 'ubuntu-latest'
-        run: cargo package --allow-dirty
+        run: cargo package --allow-dirty --target-dir "${{ runner.temp }}/pkg"
+
 
   cpp:
     name: C++ on ${{ matrix.os }}
