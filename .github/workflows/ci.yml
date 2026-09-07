@@ -135,7 +135,16 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
           cache-dependency-path: isongraph-vector-ts/package-lock.json
-      - run: npm ci
+
+      # npm install rather than npm ci. The lockfile is generated on Windows,
+      # where npm declines to resolve the optional peer dependencies of
+      # @napi-rs/wasm-runtime - a transitive of vitest's rolldown wasm binding
+      # that only applies on Linux. npm ci then refuses the lock as out of sync
+      # ("Missing: @emnapi/core ... from lock file") on every Linux runner.
+      # The lock still pins local development; this only relaxes CI, and only
+      # for dev dependencies, since a published library's lockfile has no
+      # bearing on what a consumer installs.
+      - run: npm install --no-audit --no-fund
       - run: npm run typecheck
       - run: npm run build
 
@@ -171,7 +180,9 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
           cache-dependency-path: isongraph-vector-js/package-lock.json
-      - run: npm ci
+      # npm install rather than npm ci, for the reason given in the
+      # TypeScript job above.
+      - run: npm install --no-audit --no-fund
       - name: Test (all, including the SQLite store)
         if: matrix.node >= 24
         run: npm test
@@ -202,6 +213,10 @@ jobs:
           workspaces: isongraph-vector-rs
       - name: Format
         run: cargo fmt --check
+      # -D warnings against the floating stable toolchain, deliberately: a new
+      # Rust release adding a lint should be a red build rather than something
+      # that accumulates unnoticed. It costs an occasional small fix - 1.98
+      # added chunks_exact_to_as_chunks, which caught a real improvement.
       - name: Clippy
         run: cargo clippy --all-targets --features sqlite -- -D warnings
       - name: Test (default features)
@@ -263,7 +278,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install "ison-graph>=1.4.0"
-          npm --prefix isongraph-vector-js ci
+          npm --prefix isongraph-vector-js install --no-audit --no-fund
 
       - name: Build the Rust writer
         run: cargo build --example cross_port_write --features sqlite

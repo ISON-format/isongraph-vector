@@ -9,6 +9,7 @@ Set USE_REAL_ENCODER=1 to test with actual SentenceTransformer.
 import importlib.util
 import os
 import random
+import sqlite3
 import threading
 import pytest
 import tempfile
@@ -944,9 +945,27 @@ class TestMockEncoderQuality:
 # sqlite-vec backend
 # =============================================================================
 
+def _can_load_sqlite_extensions() -> bool:
+    """Whether this interpreter can load a SQLite extension at all.
+
+    CPython only exposes enable_load_extension when it was configured with
+    --enable-loadable-sqlite-extensions, and several common builds are not:
+    the macOS builds from python.org and actions/setup-python among them. The
+    package being installed therefore does not mean vec0 can be loaded, and
+    the store raises EmbeddingError rather than pretending otherwise.
+    """
+    try:
+        with sqlite3.connect(":memory:") as conn:
+            return hasattr(conn, "enable_load_extension")
+    except sqlite3.Error:  # pragma: no cover - a broken sqlite3 build
+        return False
+
+
 sqlite_vec_installed = pytest.mark.skipif(
-    importlib.util.find_spec("sqlite_vec") is None,
-    reason="sqlite-vec is not installed (pip install 'isongraph-vector[vec]')",
+    importlib.util.find_spec("sqlite_vec") is None
+    or not _can_load_sqlite_extensions(),
+    reason="needs sqlite-vec (pip install 'isongraph-vector[vec]') and a "
+           "Python built with --enable-loadable-sqlite-extensions",
 )
 
 

@@ -149,6 +149,20 @@ brute-force KNN in C, not an approximate index — measured identical top-10
 ordering over 50 queries against 20,000 vectors, with scores within 2e-07 of
 the scan. It is a speed change, not an accuracy trade.
 
+It does need a Python that can load SQLite extensions, which is not a given.
+CPython only exposes `enable_load_extension` when it was configured with
+`--enable-loadable-sqlite-extensions`, and several common builds are not —
+the macOS builds from python.org and `actions/setup-python` among them. On
+those, `sqlite_vec=True` raises `EmbeddingError` rather than silently
+scanning, and the suite skips its sqlite-vec tests. Check with:
+
+```python
+import sqlite3
+hasattr(sqlite3.connect(":memory:"), "enable_load_extension")
+```
+
+Homebrew's `python@3.12` and most Linux distribution builds do support it.
+
 ## Saving a graph
 
 The ISON graph format carries nodes and edges, not vectors, so `save` writes
@@ -177,6 +191,9 @@ store.import_embeddings(payload)
 
 ## Things that will bite you
 
+- **sqlite-vec needs a Python built for loadable extensions.** Not all are,
+  notably the macOS python.org builds. The scan and the numpy path work
+  everywhere.
 - **Search is brute force in every backend**, sqlite-vec included. All three
   are linear in the number of nodes. This is built for an application's own
   knowledge graph, not as a vector-database replacement.

@@ -209,7 +209,9 @@ costs writes — 20,000 rows take 0.16 s to insert without it and 0.43 s with �
 which is why it stays opt-in.
 
 **Turning it on does not change your results.** `vec0` runs an exact
-brute-force KNN in C, not an approximate index. Two paths keep scanning
+brute-force KNN in C, not an approximate index. It does need a Python built
+with `--enable-loadable-sqlite-extensions`, which the macOS python.org builds
+are not; there it raises rather than silently scanning. Two paths keep scanning
 regardless — `score_map()` and blended multi-hop, which need a score for every
 node rather than a top-k. Type filtering stays exact because the node type is a
 `vec0` metadata column, narrowing the search rather than filtering its output.

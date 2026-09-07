@@ -232,9 +232,14 @@ impl SqliteEmbeddingStore {
     }
 
     fn unpack(bytes: &[u8]) -> Vec<f32> {
+        // as_chunks rather than chunks_exact(4): the chunk width is a constant,
+        // so this hands back [u8; 4] arrays and from_le_bytes takes them
+        // directly, with no per-element indexing and no bounds checks.
         bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect()
     }
 
