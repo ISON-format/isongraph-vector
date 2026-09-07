@@ -17,9 +17,14 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.10" />
-    <!-- Ships the native vec0 binaries per RID. Only a prerelease exists on
-         NuGet; the extension itself is the same C code the other ports use. -->
-    <PackageReference Include="sqlite-vec" Version="0.1.7-alpha.2.1" />
+    <!-- Ships the native vec0 binaries per RID, under runtimes/{rid}/native.
+         asg017's own sqlite-vec package has never left prerelease on NuGet
+         (0.1.7-alpha.2.1 is its newest), and a stable 1.0.0 cannot depend on a
+         prerelease - dotnet pack refuses it with NU5104. This is a
+         redistribution of the same upstream C, at 0.1.9: the version the Rust,
+         Node and C++ ports already use. Revisit if asg017 publishes a stable
+         package. -->
+    <PackageReference Include="HiraokaHyperTools.sqlite-vec" Version="0.1.9" />
   </ItemGroup>
 
   <PropertyGroup>

@@ -36,6 +36,13 @@ md-5 = { version = "0.10", optional = true }
 [dev-dependencies]
 tempfile = "3"
 
+# The cross-port interchange writer used by CI. Gated on the feature it needs,
+# so `cargo test` and `cargo build --examples` without it skip the example
+# rather than failing to compile it.
+[[example]]
+name = "cross_port_write"
+required-features = ["sqlite"]
+
 [features]
 default = []
 # Persistent storage in SQLite, with sqlite-vec answering top-k searches.

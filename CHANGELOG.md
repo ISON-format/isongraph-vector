@@ -64,6 +64,12 @@ JavaScript, Rust and C++.
   third of each query. Every suite asserts the selection returns what a full
   sort would.
 - Typed errors: `EmbeddingError`, `DimensionMismatchError`, `NoEncoderError`.
+- Continuous integration across all six ports, plus a cross-port interchange
+  job that has one port write a SQLite database and a JSON payload and another
+  read both back, comparing float32 vectors exactly. Python is also run once
+  with numpy and sqlite-vec uninstalled, so the pure-Python cosine loop and the
+  table-scan fallback are exercised rather than assumed. Rust, C++ and C# build
+  on Linux, Windows and macOS.
 - 391 tests across the six ports, including cross-port checks that import an
   embedding payload produced by the Python port, checks in every port that the
   sqlite-vec backend returns exactly what the scan returns, and a golden
@@ -85,6 +91,13 @@ JavaScript, Rust and C++.
   keeps its string-valued signature and lifts values for you. The C# port
   takes a concrete `Dictionary<string, object?>` so a collection initializer
   (`new() { ["name"] = "Alice" }`) target-types against it.
+- Rust re-exports `NodeId` alongside `PropertyValue`. It appears in every store
+  signature, so without the re-export a caller who never touches `ISONGraph`
+  directly still needed `ison-graph` in their `Cargo.toml` to name one.
+- The `/sqlite` entry point of the TypeScript and JavaScript ports needs Node
+  24, because it imports `node:sqlite`. The main entry point stays
+  runtime-agnostic and runs on Node 18 and up, or in a browser; `npm run
+  test:core` covers that half alone.
 
 ### Notes
 
@@ -97,5 +110,16 @@ JavaScript, Rust and C++.
 - Only the Python port ships a real encoder (`SentenceTransformerEncoder`).
   The other five ship `MockEncoder` and the encoder interface; bring your own
   model.
+- `IsonGraph.Vector.Sqlite` takes its vec0 natives from
+  `HiraokaHyperTools.sqlite-vec` 0.1.9. asg017's own NuGet package has never
+  left prerelease, and NuGet refuses to pack a stable package with a
+  prerelease dependency (NU5104), so a stable 1.0.0 was not possible against
+  it. The redistribution carries the same upstream C at the version the Rust,
+  Node and C++ ports already use.
 - Similarity search is brute force. There is no ANN index: this is built for an
   application's own knowledge graph, not as a vector-database replacement.
+- Payload vectors are float32 in every port, but the JSON text differs: Rust
+  writes the shortest form that round-trips as f32 (`0.33590567`), Python
+  widens to float64 first (`0.33590567111968994`). Same number, and importing
+  narrows back, so a store built from either payload is identical - but two
+  ports' payload files will not diff clean.

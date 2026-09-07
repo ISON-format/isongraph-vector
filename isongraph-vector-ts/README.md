@@ -122,7 +122,13 @@ store.close();
 
 It is a separate entry point on purpose: it imports `node:sqlite`, so pulling
 it into the main module would break browser bundles. Node's built-in SQLite
-means no native module to install.
+means no native module to install - but it does set a floor: **the `/sqlite`
+entry point needs Node 24**, while the main entry point runs on Node 18 and up,
+and in a browser. CI enforces exactly that split, running the full suite on
+Node 24 and the main-entry tests on 20 and 22.
+
+`npm run test:core` runs the main-entry tests alone, which is what to use if
+your Node is too old for `node:sqlite`.
 
 Pass `true` as the third argument and top-k searches are answered by a
 sqlite-vec `vec0` virtual table instead of a scan:
@@ -171,15 +177,17 @@ store.importEmbeddings(payload);
 - **Auto-embed renders typed properties.** Since ISONGraph 1.4.0 a property can
   be a number, a bool or null. Nulls are skipped and booleans render as `true`
   and `false`, so the same graph produces the same text in every port.
-- **The SQLite store is Node-only.** The in-memory store, and everything built
-  on it, runs anywhere.
+- **The SQLite store is Node-only, and needs Node 24.** It imports
+  `node:sqlite`. The in-memory store, and everything built on it, runs
+  anywhere - Node 18 and up, or a browser.
 
 ## Tests
 
 ```bash
-npm test           # 69 tests
-npm run typecheck  # tsc --noEmit, tests included
-npm run build      # emits dist/, library only
+npm test             # 69 tests, needs Node 24 for the SQLite half
+npm run test:core    # 53 tests, main entry only, Node 18 and up
+npm run typecheck    # tsc --noEmit, tests included
+npm run build        # emits dist/, library only
 ```
 
 ## Links

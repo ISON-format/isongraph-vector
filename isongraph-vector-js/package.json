@@ -15,7 +15,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:core": "vitest run src/index.test.js"
   },
   "keywords": [
     "ison",

@@ -91,7 +91,9 @@ Property values are typed. Since ISONGraph 1.4.0 a property can be a string, a
 number, a bool or null, which is what `PropertyValue` is (a re-export of
 `ison_rs::Value`, so you do not need a direct dependency on `ison-graph` to
 build a property list). If all your values are strings,
-`add_node_with_embed` takes plain `&str` and lifts them for you.
+`add_node_with_embed` takes plain `&str` and lifts them for you. `NodeId` is
+re-exported for the same reason - it appears in every store signature, so
+naming one should not cost you a second dependency.
 
 `ISONGraph` is wrapped by composition rather than inherited from, so the
 underlying graph stays available through `graph()` and `graph_mut()` — which is
@@ -134,8 +136,7 @@ positional form for callers who prefer it over the options struct.
 The default store is in memory. With the `sqlite` feature, embeddings persist:
 
 ```rust
-use isongraph_vector_rs::{MockEncoder, SqliteEmbeddingStore};
-use ison_graph_rs::NodeId;
+use isongraph_vector_rs::{MockEncoder, NodeId, SqliteEmbeddingStore};
 
 let mut store = SqliteEmbeddingStore::open(
     "embeddings.db",
@@ -188,6 +189,9 @@ store.from_json(&json, false)?;
 - **`MockEncoder` has no semantic structure.** Use it to test plumbing, never
   to judge relevance quality. This port ships no real encoder — implement
   `EmbeddingEncoder` over the model of your choice.
+- **`NodeId` is string-typed here.** The shared payload format carries an
+  `id_type` of `str` or `int`; this port reads and preserves `int` written by
+  another, but every id it originates is a string.
 - **Seed order among equal scores is not deterministic.** The store is a
   `HashMap`, so ties can be broken differently between runs. It only shows up
   with hand-crafted identical vectors; distinct texts give distinct scores.
@@ -200,6 +204,8 @@ store.from_json(&json, false)?;
 ```bash
 cargo test                      # 35 unit tests + 1 doctest
 cargo test --features sqlite    # + 14 SQLite tests
+cargo clippy --all-targets --features sqlite -- -D warnings
+cargo fmt --check
 ```
 
 ## Links

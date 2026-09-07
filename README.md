@@ -1,5 +1,6 @@
 # isongraph-vector
 
+[![CI](https://github.com/ISON-format/isongraph-vector/actions/workflows/ci.yml/badge.svg)](https://github.com/ISON-format/isongraph-vector/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/isongraph-vector.svg)](https://pypi.org/project/isongraph-vector/)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -408,6 +409,40 @@ ports and so cannot be imported directly. An installed copy takes precedence.
 
 `USE_REAL_ENCODER=1 pytest tests/` runs the Python suite against real
 sentence-transformers instead of the mock.
+
+### Cross-port interchange
+
+A port can pass every one of its own tests and still drift from the format the
+other five write. [`scripts/cross_port/`](scripts/cross_port/) closes that gap:
+one port writes a SQLite database and a JSON payload, another reads both back
+and checks the vectors against what it encodes for the same text itself.
+
+```bash
+node scripts/cross_port/node_write.mjs /tmp/x.db /tmp/x.json
+python scripts/cross_port/py_read.py  /tmp/x.db /tmp/x.json
+```
+
+The fixtures are chosen for the three things a shared format gets wrong: a
+string id, an integer id, and non-ASCII text. Vectors are compared exactly,
+because `MockEncoder` is byte-identical across the ports and a tolerance would
+hide the drift this exists to catch.
+
+The payload is compared *after* importing it, not as JSON text, and the reason
+is worth knowing if you ever diff two ports' payload files. Every vector is
+float32, but the ports serialise it differently: Rust writes the shortest form
+that round-trips as f32 (`0.33590567`) while Python widens to float64 first
+(`0.33590567111968994`). Those are the same number, and importing narrows back
+to float32, so a store built from either is identical. Only the text differs.
+
+### Continuous integration
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs all six suites plus
+the interchange check on every push and pull request. Python is tested on 3.9,
+3.12 and 3.13, and once more with numpy and sqlite-vec uninstalled, because the
+pure-Python cosine loop and the table scan are real fallbacks that nothing else
+exercises. Rust, C++ and C# run on Linux, Windows and macOS. The Node ports run
+the full suite on Node 24 and the runtime-agnostic half on 20 and 22, which is
+what their browser-safe main entry point claims to support.
 
 ## Dependencies
 

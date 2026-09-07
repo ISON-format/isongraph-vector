@@ -61,10 +61,10 @@ public sealed class SqliteEmbeddingStore : IDisposable
     ///
     /// SQLite resolves an extension name through the OS loader, which searches
     /// the working directory and PATH - not the paths .NET uses to resolve
-    /// package assets. The sqlite-vec package ships its natives under
-    /// runtimes/{rid}/native and its .targets only performs a platform check,
-    /// so a bare LoadExtension("vec0") finds nothing in a library or test
-    /// project. Probing the package layout explicitly covers that.
+    /// package assets. The vec0 natives ship under runtimes/{rid}/native and
+    /// the package's .targets only performs a platform check, so a bare
+    /// LoadExtension("vec0") finds nothing in a library or test project.
+    /// Probing the package layout explicitly covers that.
     /// </summary>
     private static void LoadVecExtension(SqliteConnection conn)
     {

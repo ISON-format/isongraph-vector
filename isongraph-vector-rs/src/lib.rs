@@ -21,7 +21,7 @@
 //!
 //! Author: Mahesh Vaikri
 
-use ison_graph_rs::{Direction, ISONGraph, Node, NodeId, Value};
+use ison_graph_rs::{Direction, ISONGraph, Node, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use thiserror::Error;
@@ -29,6 +29,11 @@ use thiserror::Error;
 /// Property values are ISON values, re-exported so callers do not need a
 /// direct dependency on `ison-graph` to build a property list.
 pub use ison_graph_rs::Value as PropertyValue;
+
+/// Node identity, re-exported for the same reason: it appears in every store
+/// signature, so a caller who never touches `ISONGraph` directly would
+/// otherwise still need `ison-graph` in their Cargo.toml just to name one.
+pub use ison_graph_rs::NodeId;
 
 /// SQLite-backed storage, behind the `sqlite` feature.
 #[cfg(feature = "sqlite")]

@@ -1,0 +1,292 @@
+# CI for isongraph-vector.
+#
+# Six language ports share one SQLite schema, one JSON payload format and one
+# MockEncoder, so this does two things: run each port's own suite, and prove
+# the sharing is real by having one port read what another wrote. The second
+# is the part worth having - a port can pass its own tests and still drift
+# from the format the others use.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# A new push supersedes a run still in flight for the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python ${{ matrix.python }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the floor declared in pyproject.toml, so it is tested rather
+        # than assumed. Windows is here because it is where the port is
+        # developed, and sqlite3 extension loading differs by platform.
+        os: [ubuntu-latest]
+        python: ['3.9', '3.12', '3.13']
+        include:
+          - os: windows-latest
+            python: '3.12'
+          - os: macos-latest
+            python: '3.12'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      # sentence-transformers is a declared dependency but only imported
+      # inside SentenceTransformerEncoder.__init__, and the suite runs on
+      # MockEncoder. Installing it would pull torch for no coverage, so the
+      # runtime dependency and the optional extras are installed directly.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "ison-graph>=1.4.0" pytest
+          python -m pip install "numpy>=1.21.0" "sqlite-vec>=0.1.6"
+
+      - name: Test
+        run: pytest
+
+      # The fallbacks for a missing numpy and a missing sqlite-vec are real
+      # code paths - the store degrades to a pure-Python cosine loop and to a
+      # table scan. Nothing exercises them if every job has both installed.
+      - name: Test without the optional extras
+        run: |
+          python -m pip uninstall -y numpy sqlite-vec
+          pytest
+
+  packaging:
+    name: Python packaging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build and check metadata
+        # The package directory is isongraph_vector-py, which is not a legal
+        # module name; the mapping lives in [tool.setuptools.package-dir]. An
+        # earlier version of that config pointed at a src/ directory that never
+        # existed and pip install failed outright, so the build is checked here
+        # rather than discovered at publish time.
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+          python -m twine check dist/*
+      - name: Verify the wheel imports
+        run: |
+          python -m pip install "ison-graph>=1.4.0"
+          python -m pip install --no-deps dist/*.whl
+          cd "$RUNNER_TEMP"
+          python -c "import isongraph_vector as v; print(v.__version__, v.MockEncoder(8).encode('hello')[:2])"
+
+  csharp:
+    name: C# on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Restore
+        run: dotnet restore isongraph-vector-csharp/IsonGraph.Vector.sln
+      - name: Build
+        run: dotnet build isongraph-vector-csharp/IsonGraph.Vector.sln --no-restore -c Release
+      - name: Test
+        run: dotnet test isongraph-vector-csharp/IsonGraph.Vector.sln --no-build -c Release --verbosity normal
+      - name: Pack
+        run: dotnet pack isongraph-vector-csharp/IsonGraph.Vector.sln --no-build -c Release -o nupkgs
+      - uses: actions/upload-artifact@v4
+        if: matrix.os == 'ubuntu-latest'
+        with:
+          name: nupkgs
+          path: nupkgs/*.nupkg
+
+  typescript:
+    name: TypeScript on Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22, 24]
+    defaults:
+      run:
+        working-directory: isongraph-vector-ts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: isongraph-vector-ts/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+
+      # The full suite needs node:sqlite, which the /sqlite entry point imports
+      # and which older Node does not have. The main entry point claims to run
+      # anywhere, including a browser, so it is tested on every version in the
+      # matrix; the SQLite half only where the runtime can load it.
+      - name: Test (all, including the SQLite store)
+        if: matrix.node >= 24
+        run: npm test
+      - name: Test (main entry only - no node:sqlite on this runtime)
+        if: matrix.node < 24
+        run: npm run test:core
+
+      - name: Check the publishable file list
+        if: matrix.node >= 24
+        run: npm pack --dry-run
+
+  javascript:
+    name: JavaScript on Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22, 24]
+    defaults:
+      run:
+        working-directory: isongraph-vector-js
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: isongraph-vector-js/package-lock.json
+      - run: npm ci
+      - name: Test (all, including the SQLite store)
+        if: matrix.node >= 24
+        run: npm test
+      - name: Test (main entry only - no node:sqlite on this runtime)
+        if: matrix.node < 24
+        run: npm run test:core
+      - name: Check the publishable file list
+        if: matrix.node >= 24
+        run: npm pack --dry-run
+
+  rust:
+    name: Rust on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    defaults:
+      run:
+        working-directory: isongraph-vector-rs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: isongraph-vector-rs
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets --features sqlite -- -D warnings
+      - name: Test (default features)
+        run: cargo test
+      - name: Test (sqlite feature)
+        run: cargo test --features sqlite
+      - name: Package
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo package --allow-dirty
+
+  cpp:
+    name: C++ on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # The SQLite build fetches the SQLite and sqlite-vec amalgamations and
+      # compiles them, which dominates the job. They are pinned by SHA256 in
+      # CMakeLists.txt, so the hash of that file is a sound cache key.
+      - name: Cache fetched amalgamations
+        uses: actions/cache@v4
+        with:
+          path: isongraph-vector-cpp/build/_deps
+          key: cpp-deps-${{ matrix.os }}-${{ hashFiles('isongraph-vector-cpp/CMakeLists.txt') }}
+
+      - name: Configure
+        run: cmake -S isongraph-vector-cpp -B isongraph-vector-cpp/build -DISONGRAPH_VECTOR_SQLITE=ON -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build isongraph-vector-cpp/build --config Release
+      - name: Test
+        run: ctest --test-dir isongraph-vector-cpp/build -C Release --output-on-failure
+
+      # The library is header-only and its install rules exist so a consumer
+      # can find_package() it. Nothing else here would notice if they broke.
+      - name: Install
+        run: cmake --install isongraph-vector-cpp/build --config Release --prefix "${{ runner.temp }}/prefix"
+
+  cross-port:
+    name: Cross-port interchange
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: isongraph-vector-rs
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "ison-graph>=1.4.0"
+          npm --prefix isongraph-vector-js ci
+
+      - name: Build the Rust writer
+        run: cargo build --example cross_port_write --features sqlite
+        working-directory: isongraph-vector-rs
+
+      # Each direction writes a SQLite database and a JSON payload in one port
+      # and verifies both in another, comparing float32 vectors exactly. The
+      # C# and C++ ports are covered by their own suites, which assert the same
+      # golden vectors and import a payload captured from Python.
+      - name: Node writes, Python reads
+        run: |
+          node scripts/cross_port/node_write.mjs "$RUNNER_TEMP/node.db" "$RUNNER_TEMP/node.json"
+          python scripts/cross_port/py_read.py "$RUNNER_TEMP/node.db" "$RUNNER_TEMP/node.json"
+
+      - name: Python writes, Node reads
+        run: |
+          python scripts/cross_port/py_write.py "$RUNNER_TEMP/py.db" "$RUNNER_TEMP/py.json"
+          node scripts/cross_port/node_read.mjs "$RUNNER_TEMP/py.db" "$RUNNER_TEMP/py.json"
+
+      - name: Rust writes, Python and Node read
+        run: |
+          cargo run --quiet --manifest-path isongraph-vector-rs/Cargo.toml \
+            --example cross_port_write --features sqlite -- \
+            "$RUNNER_TEMP/rs.db" "$RUNNER_TEMP/rs.json"
+          python scripts/cross_port/py_read.py "$RUNNER_TEMP/rs.db" "$RUNNER_TEMP/rs.json"
+          node scripts/cross_port/node_read.mjs "$RUNNER_TEMP/rs.db" "$RUNNER_TEMP/rs.json"

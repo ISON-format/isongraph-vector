@@ -15,7 +15,7 @@
     <!-- The native vec0 binaries do not flow through a ProjectReference the
          way they do for a NuGet consumer of IsonGraph.Vector.Sqlite, so the
          test project references the package directly to get them copied. -->
-    <PackageReference Include="sqlite-vec" Version="0.1.7-alpha.2.1" />
+    <PackageReference Include="HiraokaHyperTools.sqlite-vec" Version="0.1.9" />
     <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2">
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>

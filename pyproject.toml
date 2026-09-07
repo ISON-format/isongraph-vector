@@ -56,7 +56,8 @@ fast = [
 ]
 # Answer top-k searches through a sqlite-vec vec0 virtual table instead of
 # scanning from Python. Same results - vec0 runs an exact brute-force KNN in
-# C - roughly 4x faster over 20,000 vectors.
+# C - roughly 1.4x faster than the numpy scan over 20,000 vectors, and slower
+# below a few thousand.
 vec = [
     "sqlite-vec>=0.1.6",
 ]

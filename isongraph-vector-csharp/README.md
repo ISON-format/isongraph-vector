@@ -173,9 +173,12 @@ store.FromJson(json);
   spells them (`true`/`false`, not .NET's `True`), so the same graph produces
   the same text in every port. Floats use the invariant culture — `1.5` never
   `1,5`.
-- **`IsonGraph.Vector.Sqlite` depends on a prerelease.** The only `sqlite-vec`
-  package on NuGet is `0.1.7-alpha`. It works and is tested; the core package
-  is unaffected.
+- **The vec0 natives come from a redistribution.** asg017's own `sqlite-vec`
+  package has never left prerelease on NuGet, and a stable package cannot
+  depend on a prerelease one, so this port takes its natives from
+  `HiraokaHyperTools.sqlite-vec` 0.1.9 - the same upstream C, at the same
+  version the Rust, Node and C++ ports use. The core `IsonGraph.Vector`
+  package has no such dependency.
 
 ## Tests
 
