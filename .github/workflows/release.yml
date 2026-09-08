@@ -329,7 +329,12 @@ jobs:
           import re, sys
           version = sys.argv[1]
           text = open("CHANGELOG.md", encoding="utf-8").read()
-          m = re.search(rf"^## \[{re.escape(version)}\][^\n]*\n(.*?)(?=^## \[|\Z)", text, re.M | re.S)
+          # The section ends at the next heading, at the link-reference block
+          # Keep a Changelog puts at the foot ([1.0.0]: https://...), or at the
+          # end of the file - the second matters for the newest release, which
+          # is the last section and would otherwise carry the footer into its
+          # notes.
+          m = re.search(rf"^## \[{re.escape(version)}\][^\n]*\n(.*?)(?=^## \[|^\[[^\]]+\]:|\Z)", text, re.M | re.S)
           if not m:
               sys.exit(f"no CHANGELOG section for {version}")
           print(m.group(1).strip())
