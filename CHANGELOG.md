@@ -4,7 +4,11 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.0] - 2026-09-01
+## [Unreleased]
+
+Nothing yet.
+
+## [1.0.0] - 2026-09-08
 
 First public release, across six language ports: Python, C#, TypeScript,
 JavaScript, Rust and C++.
@@ -64,6 +68,12 @@ JavaScript, Rust and C++.
   third of each query. Every suite asserts the selection returns what a full
   sort would.
 - Typed errors: `EmbeddingError`, `DimensionMismatchError`, `NoEncoderError`.
+- A tag-driven release workflow. Pushing `v<major>.<minor>.<patch>` checks
+  the tag against all nine version declarations, reruns CI on that ref,
+  builds every artifact once, publishes to PyPI, NuGet, npm and crates.io in
+  parallel through OpenID Connect trusted publishing, and cuts a GitHub
+  release carrying the CHANGELOG section, every artifact, a C++ header
+  tarball and `SHA256SUMS`. `RELEASING.md` documents it.
 - Continuous integration across all six ports, plus a cross-port interchange
   job that has one port write a SQLite database and a JSON payload and another
   read both back, comparing float32 vectors exactly. Python is also run once
@@ -101,6 +111,8 @@ JavaScript, Rust and C++.
 
 ### Notes
 
+- Python 3.10 or later. That is the floor `requires-python` declares and the
+  floor CI tests; nothing below it is claimed.
 - The Python import name is `isongraph_vector`; the other ports are published as
   `IsonGraph.Vector` (NuGet), `isongraph-vector-ts`, `isongraph-vector-js` and
   `isongraph-vector-rs`, with the C++ port consumed as headers.
@@ -123,3 +135,6 @@ JavaScript, Rust and C++.
   widens to float64 first (`0.33590567111968994`). Same number, and importing
   narrows back, so a store built from either payload is identical - but two
   ports' payload files will not diff clean.
+
+[Unreleased]: https://github.com/ISON-format/isongraph-vector/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/ISON-format/isongraph-vector/releases/tag/v1.0.0

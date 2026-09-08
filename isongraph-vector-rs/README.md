@@ -1,5 +1,7 @@
 # isongraph-vector-rs
 
+[![crates.io](https://img.shields.io/crates/v/isongraph-vector-rs.svg)](https://crates.io/crates/isongraph-vector-rs) [![docs.rs](https://img.shields.io/docsrs/isongraph-vector-rs)](https://docs.rs/isongraph-vector-rs) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/ISON-format/isongraph-vector/blob/main/isongraph-vector-rs/LICENSE)
+
 [ISONGraph](https://github.com/ISON-format/isongraph) can walk a graph. It can
 tell you who Alice knows, and who they know in turn. What it cannot tell you is
 which node in the graph is *about* the thing you just asked for.
@@ -215,4 +217,4 @@ cargo fmt --check
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Copyright (c) 2026 ISON - Mahesh Vaikri.
+MIT — see [LICENSE](https://github.com/ISON-format/isongraph-vector/blob/main/isongraph-vector-rs/LICENSE). Copyright (c) 2026 ISON - Mahesh Vaikri.

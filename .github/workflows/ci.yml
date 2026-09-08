@@ -13,10 +13,16 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  # Called by release.yml, so a tag is fully tested before anything is
+  # published. Runs against the caller's ref.
+  workflow_call:
 
-# A new push supersedes a run still in flight for the same ref.
+# A new push supersedes a run still in flight for the same ref. The ci-
+# prefix keeps this group distinct when release.yml calls this workflow: in
+# that case github.workflow is the caller's name, and the group would
+# otherwise differ from the release's own by one capital letter.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:

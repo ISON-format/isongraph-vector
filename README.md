@@ -2,8 +2,12 @@
 
 [![CI](https://github.com/ISON-format/isongraph-vector/actions/workflows/ci.yml/badge.svg)](https://github.com/ISON-format/isongraph-vector/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/isongraph-vector.svg)](https://pypi.org/project/isongraph-vector/)
+[![NuGet](https://img.shields.io/nuget/v/IsonGraph.Vector.svg)](https://www.nuget.org/packages/IsonGraph.Vector/)
+[![npm](https://img.shields.io/npm/v/isongraph-vector-ts.svg?label=npm%20ts)](https://www.npmjs.com/package/isongraph-vector-ts)
+[![npm](https://img.shields.io/npm/v/isongraph-vector-js.svg?label=npm%20js)](https://www.npmjs.com/package/isongraph-vector-js)
+[![crates.io](https://img.shields.io/crates/v/isongraph-vector-rs.svg)](https://crates.io/crates/isongraph-vector-rs)
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/ISON-format/isongraph-vector/blob/main/LICENSE)
 
 **Semantic search over an ISON graph — find the nodes that mean what you asked,
 then walk the graph from there.**
@@ -37,12 +41,12 @@ README. The behaviour is the same in all six; the idioms are native to each.
 
 | Port | Directory | Package | Base library | Tests |
 | --- | --- | --- | --- | ---: |
-| Python | [`isongraph_vector-py/`](isongraph_vector-py/) | `isongraph-vector` | `ison-graph` 1.4.0 | 70 |
-| C++ | [`isongraph-vector-cpp/`](isongraph-vector-cpp/) | headers | vendored `ison-graph-cpp` 1.4.0 | 69 |
-| TypeScript | [`isongraph-vector-ts/`](isongraph-vector-ts/) | `isongraph-vector-ts` | `ison-graph-ts` 1.4.0 | 67 |
-| JavaScript | [`isongraph-vector-js/`](isongraph-vector-js/) | `isongraph-vector-js` | `ison-graph-js` 1.4.0 | 65 |
-| C# | [`isongraph-vector-csharp/`](isongraph-vector-csharp/) | `IsonGraph.Vector` | `IsonGraph` 1.4.0 | 59 |
-| Rust | [`isongraph-vector-rs/`](isongraph-vector-rs/) | `isongraph-vector-rs` | `ison-graph` 1.4 | 48 |
+| Python | [`isongraph_vector-py/`](https://github.com/ISON-format/isongraph-vector/tree/main/isongraph_vector-py/) | [`isongraph-vector`](https://pypi.org/project/isongraph-vector/) | `ison-graph` 1.4.0 | 73 |
+| C++ | [`isongraph-vector-cpp/`](https://github.com/ISON-format/isongraph-vector/tree/main/isongraph-vector-cpp/) | headers, [tarball on each release](https://github.com/ISON-format/isongraph-vector/releases) | vendored `ison-graph-cpp` 1.4.0 | 71 |
+| TypeScript | [`isongraph-vector-ts/`](https://github.com/ISON-format/isongraph-vector/tree/main/isongraph-vector-ts/) | [`isongraph-vector-ts`](https://www.npmjs.com/package/isongraph-vector-ts) | `ison-graph-ts` 1.4.0 | 69 |
+| JavaScript | [`isongraph-vector-js/`](https://github.com/ISON-format/isongraph-vector/tree/main/isongraph-vector-js/) | [`isongraph-vector-js`](https://www.npmjs.com/package/isongraph-vector-js) | `ison-graph-js` 1.4.0 | 67 |
+| C# | [`isongraph-vector-csharp/`](https://github.com/ISON-format/isongraph-vector/tree/main/isongraph-vector-csharp/) | [`IsonGraph.Vector`](https://www.nuget.org/packages/IsonGraph.Vector/) | `IsonGraph` 1.4.0 | 61 |
+| Rust | [`isongraph-vector-rs/`](https://github.com/ISON-format/isongraph-vector/tree/main/isongraph-vector-rs/) | [`isongraph-vector-rs`](https://crates.io/crates/isongraph-vector-rs) | `ison-graph` 1.4 | 50 |
 
 Parity is deliberate but not total:
 
@@ -69,8 +73,8 @@ underlying graph stays reachable through `Graph`, `graph()` and `graph_mut()`.
 
 ```bash
 pip install isongraph-vector             # Python
-pip install isongraph-vector[fast]       # + numpy, ~100x faster search
-pip install isongraph-vector[vec]        # + sqlite-vec
+pip install "isongraph-vector[fast]"     # + numpy, ~100x faster search
+pip install "isongraph-vector[vec]"      # + sqlite-vec
 
 dotnet add package IsonGraph.Vector      # C#
 npm install isongraph-vector-ts          # TypeScript
@@ -405,7 +409,7 @@ cmake -S . -B build -DISONGRAPH_VECTOR_SQLITE=ON && cmake --build build
 ```
 
 391 tests in total. `pytest` works straight from a checkout:
-[`conftest.py`](conftest.py) binds the import name `isongraph_vector` to the
+[`conftest.py`](https://github.com/ISON-format/isongraph-vector/blob/main/conftest.py) binds the import name `isongraph_vector` to the
 `isongraph_vector-py/` directory, which is named to line up with the other
 ports and so cannot be imported directly. An installed copy takes precedence.
 
@@ -415,7 +419,7 @@ sentence-transformers instead of the mock.
 ### Cross-port interchange
 
 A port can pass every one of its own tests and still drift from the format the
-other five write. [`scripts/cross_port/`](scripts/cross_port/) closes that gap:
+other five write. [`scripts/cross_port/`](https://github.com/ISON-format/isongraph-vector/tree/main/scripts/cross_port/) closes that gap:
 one port writes a SQLite database and a JSON payload, another reads both back
 and checks the vectors against what it encodes for the same text itself.
 
@@ -438,7 +442,7 @@ to float32, so a store built from either is identical. Only the text differs.
 
 ### Continuous integration
 
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs all six suites plus
+[`.github/workflows/ci.yml`](https://github.com/ISON-format/isongraph-vector/blob/main/.github/workflows/ci.yml) runs all six suites plus
 the interchange check on every push and pull request. Python is tested on 3.10,
 3.12 and 3.13, and once more with numpy and sqlite-vec uninstalled, because the
 pure-Python cosine loop and the table scan are real fallbacks that nothing else
@@ -457,7 +461,18 @@ sqlite-vec>=0.1.6        # optional, via the "vec" extra
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md).
+See [CHANGELOG.md](https://github.com/ISON-format/isongraph-vector/blob/main/CHANGELOG.md).
+
+## Releasing
+
+One tag publishes all six packages. Pushing `v<major>.<minor>.<patch>` runs
+[`release.yml`](https://github.com/ISON-format/isongraph-vector/blob/main/.github/workflows/release.yml): it checks the tag
+against every manifest, reruns the whole CI suite on that ref, builds every
+artifact once, then publishes to PyPI, NuGet, npm and crates.io in parallel
+through trusted publishing - no long-lived tokens in the repository - and cuts
+a GitHub release with the CHANGELOG section as its notes and the C++ headers
+attached. [RELEASING.md](https://github.com/ISON-format/isongraph-vector/blob/main/RELEASING.md) has the procedure, the one-time
+setup each registry needs, and the recovery for a publish that fails partway.
 
 ## Links
 
@@ -471,5 +486,5 @@ Mahesh Vaikri
 
 ## License
 
-MIT License — see [LICENSE](LICENSE) for details.
+MIT License — see [LICENSE](https://github.com/ISON-format/isongraph-vector/blob/main/LICENSE) for details.
 Copyright (c) 2026 ISON - Mahesh Vaikri.

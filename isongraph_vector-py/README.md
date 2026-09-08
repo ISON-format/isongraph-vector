@@ -1,5 +1,7 @@
 # isongraph-vector
 
+[![PyPI](https://img.shields.io/pypi/v/isongraph-vector.svg)](https://pypi.org/project/isongraph-vector/) [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/ISON-format/isongraph-vector/blob/main/isongraph_vector-py/LICENSE)
+
 [ISONGraph](https://github.com/ISON-format/isongraph) can walk a graph. It can
 tell you who Alice knows, and who they know in turn. What it cannot tell you is
 which node in the graph is *about* the thing you just asked for.
@@ -19,8 +21,8 @@ for the cross-port picture.
 
 ```bash
 pip install isongraph-vector          # core
-pip install isongraph-vector[fast]    # + numpy, ~100x faster search
-pip install isongraph-vector[vec]     # + sqlite-vec, KNN inside SQLite
+pip install "isongraph-vector[fast]"  # + numpy, ~100x faster search
+pip install "isongraph-vector[vec]"   # + sqlite-vec, KNN inside SQLite
 ```
 
 ## The idea, in one example
@@ -227,4 +229,4 @@ line up with the other ports and so cannot be imported directly.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Copyright (c) 2026 ISON - Mahesh Vaikri.
+MIT — see [LICENSE](https://github.com/ISON-format/isongraph-vector/blob/main/isongraph_vector-py/LICENSE). Copyright (c) 2026 ISON - Mahesh Vaikri.

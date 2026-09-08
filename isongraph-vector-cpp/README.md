@@ -1,5 +1,7 @@
 # isongraph-vector-cpp
 
+[![release](https://img.shields.io/github/v/release/ISON-format/isongraph-vector?label=headers)](https://github.com/ISON-format/isongraph-vector/releases/latest) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/ISON-format/isongraph-vector/blob/main/isongraph-vector-cpp/LICENSE)
+
 [ISONGraph](https://github.com/ISON-format/isongraph) can walk a graph. It can
 tell you who Alice knows, and who they know in turn. What it cannot tell you is
 which node in the graph is *about* the thing you just asked for.
@@ -22,11 +24,29 @@ add_subdirectory(isongraph-vector-cpp)
 target_link_libraries(your_target PRIVATE isongraph_vector)
 ```
 
+There is no package registry for C++, so a release is a tag and a tarball.
+Pin the tag with FetchContent and CMake builds only this directory:
+
+```cmake
+include(FetchContent)
+FetchContent_Declare(isongraph_vector
+    GIT_REPOSITORY https://github.com/ISON-format/isongraph-vector.git
+    GIT_TAG        v1.0.0
+    SOURCE_SUBDIR  isongraph-vector-cpp)
+FetchContent_MakeAvailable(isongraph_vector)
+target_link_libraries(your_target PRIVATE isongraph_vector)
+```
+
+Or take `isongraph-vector-cpp-<version>.tar.gz` from the
+[GitHub release](https://github.com/ISON-format/isongraph-vector/releases): the same directory, checksummed in
+`SHA256SUMS` alongside it, for anyone who would rather pin a download than a
+git ref.
+
 `ison_graph.hpp` (ISONGraph 1.4.0, though the header constant itself still
 reads 1.1.0) and `ison_parser.hpp` (ison-cpp 1.2.0) are vendored under
 `vendor/ison-graph-cpp/`. There is no package registry for C++, so unlike the
 other ports these are copies rather than a dependency declaration.
-[`VENDORED.md`](vendor/ison-graph-cpp/VENDORED.md) records where they came
+[`VENDORED.md`](https://github.com/ISON-format/isongraph-vector/blob/main/isongraph-vector-cpp/vendor/ison-graph-cpp/VENDORED.md) records where they came
 from, and a test asserts their versions so a stale copy fails the suite instead
 of passing quietly.
 
@@ -176,7 +196,7 @@ row written by Python byte for byte.
 - **The base library is vendored, not versioned.** There is no upgrade
   notification, so re-copy the headers when ISONGraph moves on. A test asserts
   the vendored versions against
-  [`VENDORED.md`](vendor/ison-graph-cpp/VENDORED.md), so at least a *stale*
+  [`VENDORED.md`](https://github.com/ISON-format/isongraph-vector/blob/main/isongraph-vector-cpp/vendor/ison-graph-cpp/VENDORED.md), so at least a *stale*
   copy fails loudly rather than passing quietly.
 - **Auto-embed renders typed properties.** Nulls and references contribute
   nothing and booleans render as `true`/`false`, so the same graph produces the
@@ -202,4 +222,4 @@ On a multi-config generator such as Visual Studio the binaries land in
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Copyright (c) 2026 ISON - Mahesh Vaikri.
+MIT — see [LICENSE](https://github.com/ISON-format/isongraph-vector/blob/main/isongraph-vector-cpp/LICENSE). Copyright (c) 2026 ISON - Mahesh Vaikri.

@@ -1,5 +1,7 @@
 # isongraph-vector-js
 
+[![npm](https://img.shields.io/npm/v/isongraph-vector-js.svg)](https://www.npmjs.com/package/isongraph-vector-js) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/ISON-format/isongraph-vector/blob/main/isongraph-vector-js/LICENSE)
+
 [ISONGraph](https://github.com/ISON-format/isongraph) can walk a graph. It can
 tell you who Alice knows, and who they know in turn. What it cannot tell you is
 which node in the graph is *about* the thing you just asked for.
@@ -195,4 +197,4 @@ npm run test:core    # 51 tests, main entry only, Node 18 and up
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Copyright (c) 2026 ISON - Mahesh Vaikri.
+MIT — see [LICENSE](https://github.com/ISON-format/isongraph-vector/blob/main/isongraph-vector-js/LICENSE). Copyright (c) 2026 ISON - Mahesh Vaikri.

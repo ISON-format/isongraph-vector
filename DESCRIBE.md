@@ -29,17 +29,18 @@ belongs to a different package:
 
 | Port | Implementation | Tests |
 | --- | ---: | ---: |
-| Rust (`isongraph-vector-rs/`) | 2,368 | 48 |
-| C++ (`isongraph-vector-cpp/`, header-only) | 1,806 | 69 |
-| Python (`isongraph_vector-py/`) | 1,745 | 70 |
-| TypeScript (`isongraph-vector-ts/`) | 1,390 | 67 |
-| C# (`isongraph-vector-csharp/`) | 1,386 | 59 |
-| JavaScript (`isongraph-vector-js/`) | 1,132 | 65 |
+| Rust (`isongraph-vector-rs/`) | 1,850 | 50 |
+| C++ (`isongraph-vector-cpp/`, header-only) | 1,823 | 71 |
+| Python (`isongraph_vector-py/`) | 1,768 | 73 |
+| C# (`isongraph-vector-csharp/`) | 1,447 | 61 |
+| TypeScript (`isongraph-vector-ts/`) | 1,441 | 69 |
+| JavaScript (`isongraph-vector-js/`) | 1,108 | 67 |
 
-Line counts are implementation only, excluding tests. Rust leads because
-its store, its SQLite backend and its tests all live in the crate; C++ is
-close behind because it carries its own MD5 and a hand-written JSON
-reader rather than pulling in dependencies.
+Line counts are implementation only - the inline test module at the foot
+of the Rust crate is excluded, as are every port's test files. Rust and
+C++ lead because each carries its own SQLite backend in the same source;
+C++ also brings its own MD5 and a hand-written JSON reader rather than
+pulling in dependencies.
 
 `LLMContext_Benchmark/` (3,269 lines) measures ISON *serialization* token
 efficiency against NetworkX/igraph/SQLite/JSON. It contains zero

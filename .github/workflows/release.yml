@@ -1,0 +1,364 @@
+# Release for isongraph-vector.
+#
+# One tag publishes six packages to four registries and cuts a GitHub release.
+# The shape of the workflow follows from the one thing a publish cannot do,
+# which is be undone: nothing is uploaded until the tag has been checked
+# against every manifest, the full CI suite has passed on exactly this ref,
+# and every artifact has been built. The four publishes then run in parallel,
+# each behind its own environment so any of them can require a human approval,
+# and each tolerates a rerun - a version that is already on the registry is
+# skipped, not failed.
+#
+# Authentication is OpenID Connect trusted publishing throughout: the registry
+# trusts this repository's workflow, and no long-lived token is stored here.
+# Each publish also accepts a classic token as a fallback, for the two
+# registries whose trusted-publishing setup lives on a package page that does
+# not exist until the first publish. RELEASING.md walks through the one-time
+# setup for each.
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  # Rerun from a tag, for a publish that failed partway. Select the tag as the
+  # ref when dispatching; the branch it points at is not enough. Leave publish
+  # unticked to build every artifact and upload nothing - a full dry run.
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish to the registries (unticked: build only)'
+        type: boolean
+        default: false
+
+# One release at a time per tag, and never cancelled: a publish interrupted
+# halfway is the worst outcome this workflow has.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify tag against manifests
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # for the branch-contains check
+
+      - name: The ref must be a release tag
+        run: |
+          if [ "${{ github.ref_type }}" != "tag" ]; then
+            echo "::error::ref is ${{ github.ref }}; dispatch this workflow from a tag, not a branch"
+            exit 1
+          fi
+          if ! git branch -r --contains "${{ github.ref_name }}" | grep -q 'origin/main$'; then
+            echo "::error::tag ${{ github.ref_name }} is not on main"
+            exit 1
+          fi
+
+      - id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Nine files carry the version. A lagging one is the default outcome of
+      # bumping by hand, and the registries would accept the mismatch.
+      - name: Every manifest declares the tagged version
+        run: python scripts/release/check_versions.py "${{ github.ref_name }}"
+
+  test:
+    name: CI
+    needs: verify
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: Build every artifact
+    needs: verify
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: isongraph-vector-rs
+
+      - name: Python sdist and wheel
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+          python -m twine check dist/*
+          mkdir -p artifacts/python && mv dist/* artifacts/python/
+
+      - name: NuGet packages
+        run: |
+          dotnet pack isongraph-vector-csharp/IsonGraph.Vector.sln -c Release -o artifacts/nuget
+          ls -1 artifacts/nuget
+
+      - name: npm tarballs
+        run: |
+          mkdir -p artifacts/npm
+          for port in ts js; do
+            ( cd "isongraph-vector-$port"
+              npm install --no-audit --no-fund
+              [ "$port" = ts ] && npm run build
+              npm pack --pack-destination "../artifacts/npm" )
+          done
+          ls -1 artifacts/npm
+
+      - name: Crate
+        run: |
+          cargo package --manifest-path isongraph-vector-rs/Cargo.toml --target-dir "$RUNNER_TEMP/pkg"
+          mkdir -p artifacts/crate && cp "$RUNNER_TEMP"/pkg/package/*.crate artifacts/crate/
+
+      # C++ has no registry. The release carries the headers as a tarball -
+      # the port directory minus its build tree - for anyone who would rather
+      # pin a download than a git tag.
+      - name: C++ header tarball
+        run: |
+          mkdir -p artifacts/cpp
+          tar --exclude='isongraph-vector-cpp/build' \
+              -czf "artifacts/cpp/isongraph-vector-cpp-${VERSION}.tar.gz" isongraph-vector-cpp
+
+      - name: Checksums
+        run: |
+          ( cd artifacts && find . -type f ! -name SHA256SUMS -print0 \
+              | sort -z | xargs -0 sha256sum > SHA256SUMS )
+          cat artifacts/SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts
+          path: artifacts/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Publishes. Each needs the verification, the full CI pass and the build;
+  # each sits behind an environment so it can require approval; each skips a
+  # version the registry already has, so a rerun after a partial failure only
+  # fills the gaps.
+  # ---------------------------------------------------------------------------
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [verify, test, build]
+    if: ${{ github.event_name == 'push' || inputs.publish }}
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/isongraph-vector/${{ needs.verify.outputs.version }}/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+          path: artifacts
+      # Trusted publishing only. PyPI's "pending publisher" covers a project
+      # that does not exist yet, so the first release needs no token either.
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: artifacts/python/
+          skip-existing: true
+          print-hash: true
+
+  publish-nuget:
+    name: Publish to NuGet
+    needs: [verify, test, build]
+    if: ${{ github.event_name == 'push' || inputs.publish }}
+    runs-on: ubuntu-latest
+    environment:
+      name: nuget
+      url: https://www.nuget.org/packages/IsonGraph.Vector/${{ needs.verify.outputs.version }}
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+          path: artifacts
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      # NuGet's trusted publishing is configured on the account, not on a
+      # package, so it works for a first publish. The login exchanges the OIDC
+      # token for a short-lived API key. NUGET_USER is a repository variable
+      # holding the nuget.org username the trust policy was created under.
+      - id: login
+        if: ${{ vars.NUGET_USER != '' }}
+        uses: NuGet/login@v1
+        with:
+          user: ${{ vars.NUGET_USER }}
+
+      # Core first: the SQLite package depends on it at the same version.
+      - name: Push
+        env:
+          KEY: ${{ steps.login.outputs.NUGET_API_KEY || secrets.NUGET_API_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "::error::no NuGet credential - set the NUGET_USER variable for trusted publishing, or a NUGET_API_KEY secret"
+            exit 1
+          fi
+          for pkg in artifacts/nuget/IsonGraph.Vector.[0-9]*.nupkg artifacts/nuget/IsonGraph.Vector.Sqlite.*.nupkg; do
+            dotnet nuget push "$pkg" --api-key "$KEY" \
+              --source https://api.nuget.org/v3/index.json --skip-duplicate
+          done
+
+  publish-npm:
+    name: Publish to npm
+    needs: [verify, test, build]
+    if: ${{ github.event_name == 'push' || inputs.publish }}
+    runs-on: ubuntu-latest
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/isongraph-vector-ts/v/${{ needs.verify.outputs.version }}
+    permissions:
+      id-token: write   # provenance attestation, and OIDC publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+          path: artifacts
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      # OIDC trusted publishing needs npm 11.5 or later; Node 24 ships close
+      # to that line, so take the current one rather than depend on it.
+      - run: npm install -g npm@latest
+
+      # With an NPM_TOKEN secret set, publish with it. Without one, npm uses
+      # the workflow's OIDC token against the package's trusted-publisher
+      # settings - which is the steady state, once the packages exist.
+      - name: Publish both tarballs with provenance
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -n "$NPM_TOKEN" ]; then
+            echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
+          fi
+          for tgz in artifacts/npm/*.tgz; do
+            name=$(tar -xOzf "$tgz" package/package.json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["name"]+"@"+d["version"])')
+            if npm view "$name" version >/dev/null 2>&1; then
+              echo "$name is already published - skipping"
+              continue
+            fi
+            npm publish "$tgz" --provenance --access public
+          done
+
+  publish-crates:
+    name: Publish to crates.io
+    needs: [verify, test, build]
+    if: ${{ github.event_name == 'push' || inputs.publish }}
+    runs-on: ubuntu-latest
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/isongraph-vector-rs/${{ needs.verify.outputs.version }}
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # crates.io's trusted-publishing settings live on the crate's page,
+      # which does not exist until the first publish. The exchange fails then,
+      # by design, and a CARGO_REGISTRY_TOKEN secret carries the first
+      # release; remove the secret after configuring trust on the crate.
+      - id: auth
+        continue-on-error: true
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish
+        env:
+          TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN || steps.auth.outputs.token }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::no crates.io credential - configure trusted publishing on the crate, or set a CARGO_REGISTRY_TOKEN secret for the first release"
+            exit 1
+          fi
+          if cargo info "isongraph-vector-rs@${VERSION}" >/dev/null 2>&1; then
+            echo "isongraph-vector-rs ${VERSION} is already published - skipping"
+            exit 0
+          fi
+          cargo publish --manifest-path isongraph-vector-rs/Cargo.toml --token "$TOKEN"
+
+  # ---------------------------------------------------------------------------
+  # The GitHub release: the CHANGELOG section as the notes, every artifact and
+  # the checksums attached. Runs last so it exists only for a release that
+  # actually shipped.
+  # ---------------------------------------------------------------------------
+
+  github-release:
+    name: GitHub release
+    needs: [verify, build, publish-pypi, publish-nuget, publish-npm, publish-crates]
+    if: ${{ always() && needs.build.result == 'success' && (github.event_name == 'push' || inputs.publish) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+          path: artifacts
+
+      - name: Release notes from CHANGELOG.md
+        run: |
+          python3 - "$VERSION" <<'PY' > notes.md
+          import re, sys
+          version = sys.argv[1]
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          m = re.search(rf"^## \[{re.escape(version)}\][^\n]*\n(.*?)(?=^## \[|\Z)", text, re.M | re.S)
+          if not m:
+              sys.exit(f"no CHANGELOG section for {version}")
+          print(m.group(1).strip())
+          PY
+          {
+            echo
+            echo "## Registries"
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| PyPI | \`pip install isongraph-vector==${VERSION}\` |"
+            echo "| NuGet | \`dotnet add package IsonGraph.Vector --version ${VERSION}\` |"
+            echo "| npm | \`npm install isongraph-vector-ts@${VERSION}\` / \`isongraph-vector-js@${VERSION}\` |"
+            echo "| crates.io | \`isongraph-vector-rs = \"${VERSION}\"\` |"
+            echo "| C++ | \`isongraph-vector-cpp-${VERSION}.tar.gz\` below, or FetchContent with \`GIT_TAG v${VERSION}\` |"
+            echo
+            echo "Every publish job's outcome for this run: PyPI **${{ needs.publish-pypi.result }}**, NuGet **${{ needs.publish-nuget.result }}**, npm **${{ needs.publish-npm.result }}**, crates.io **${{ needs.publish-crates.result }}**."
+          } >> notes.md
+          cat notes.md
+
+      - name: Create or update the release
+        run: |
+          files=$(find artifacts -type f | sort)
+          if gh release view "v${VERSION}" >/dev/null 2>&1; then
+            gh release upload "v${VERSION}" $files --clobber
+            gh release edit "v${VERSION}" --notes-file notes.md
+          else
+            gh release create "v${VERSION}" $files \
+              --title "isongraph-vector ${VERSION}" \
+              --notes-file notes.md \
+              --verify-tag
+          fi
