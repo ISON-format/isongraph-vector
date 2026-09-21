@@ -303,13 +303,16 @@ jobs:
   # ---------------------------------------------------------------------------
   # The GitHub release: the CHANGELOG section as the notes, every artifact and
   # the checksums attached. Runs last so it exists only for a release that
-  # actually shipped.
+  # actually shipped. A failed publish still cuts it - the release should
+  # exist for whatever did reach a registry - but a failed CI run does not:
+  # the publishes are skipped then, so the notes would advertise install
+  # commands for versions that are not on any registry.
   # ---------------------------------------------------------------------------
 
   github-release:
     name: GitHub release
-    needs: [verify, build, publish-pypi, publish-nuget, publish-npm, publish-crates]
-    if: ${{ always() && needs.build.result == 'success' && (github.event_name == 'push' || inputs.publish) }}
+    needs: [verify, test, build, publish-pypi, publish-nuget, publish-npm, publish-crates]
+    if: ${{ always() && needs.test.result == 'success' && needs.build.result == 'success' && (github.event_name == 'push' || inputs.publish) }}
     runs-on: ubuntu-latest
     permissions:
       contents: write

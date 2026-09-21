@@ -74,7 +74,7 @@ environment so any of them can require approval, and each tolerates a rerun.
 | `publish-nuget` | all three | `NuGet/login` exchanges the OIDC token for a short-lived key; pushes core then SQLite, `--skip-duplicate`. |
 | `publish-npm` | all three | `npm publish --provenance` for both tarballs, skipping any version already on the registry. |
 | `publish-crates` | all three | `rust-lang/crates-io-auth-action`, then `cargo publish`, skipping if `cargo info` already sees the version. |
-| `github-release` | the publishes | Creates `v<version>` with the CHANGELOG section as notes, every artifact and `SHA256SUMS` attached, and a line recording each publish's outcome. Runs even if a publish failed, so the release exists for whatever did ship. |
+| `github-release` | `test`, `build`, the publishes | Creates `v<version>` with the CHANGELOG section as notes, every artifact and `SHA256SUMS` attached, and a line recording each publish's outcome. Runs even if a publish failed, so the release exists for whatever did ship - but not if CI failed, because then nothing was published and the notes would advertise installs that do not resolve. |
 
 ## One-time setup: trusted publishing
 
