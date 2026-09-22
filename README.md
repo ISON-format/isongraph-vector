@@ -1,5 +1,7 @@
 # isongraph-vector
 
+![isongraph-vector](https://raw.githubusercontent.com/ISON-format/isongraph-vector/main/assets/logo_transparent_250x80.png)
+
 [![CI](https://github.com/ISON-format/isongraph-vector/actions/workflows/ci.yml/badge.svg)](https://github.com/ISON-format/isongraph-vector/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/isongraph-vector.svg)](https://pypi.org/project/isongraph-vector/)
 [![NuGet](https://img.shields.io/nuget/v/IsonGraph.Vector.svg)](https://www.nuget.org/packages/IsonGraph.Vector/)

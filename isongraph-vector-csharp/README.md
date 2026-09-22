@@ -1,5 +1,7 @@
 # IsonGraph.Vector
 
+![isongraph-vector](https://raw.githubusercontent.com/ISON-format/isongraph-vector/main/assets/logo_transparent_250x80.png)
+
 [![NuGet](https://img.shields.io/nuget/v/IsonGraph.Vector.svg?label=IsonGraph.Vector)](https://www.nuget.org/packages/IsonGraph.Vector/) [![NuGet](https://img.shields.io/nuget/v/IsonGraph.Vector.Sqlite.svg?label=IsonGraph.Vector.Sqlite)](https://www.nuget.org/packages/IsonGraph.Vector.Sqlite/) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/ISON-format/isongraph-vector/blob/main/isongraph-vector-csharp/LICENSE)
 
 [ISONGraph](https://github.com/ISON-format/isongraph) can walk a graph. It can

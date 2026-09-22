@@ -1,5 +1,7 @@
 # isongraph-vector-js
 
+![isongraph-vector](https://raw.githubusercontent.com/ISON-format/isongraph-vector/main/assets/logo_transparent_250x80.png)
+
 [![npm](https://img.shields.io/npm/v/isongraph-vector-js.svg)](https://www.npmjs.com/package/isongraph-vector-js) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/ISON-format/isongraph-vector/blob/main/isongraph-vector-js/LICENSE)
 
 [ISONGraph](https://github.com/ISON-format/isongraph) can walk a graph. It can

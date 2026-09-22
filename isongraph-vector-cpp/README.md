@@ -1,5 +1,7 @@
 # isongraph-vector-cpp
 
+![isongraph-vector](https://raw.githubusercontent.com/ISON-format/isongraph-vector/main/assets/logo_transparent_250x80.png)
+
 [![release](https://img.shields.io/github/v/release/ISON-format/isongraph-vector?label=headers)](https://github.com/ISON-format/isongraph-vector/releases/latest) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/ISON-format/isongraph-vector/blob/main/isongraph-vector-cpp/LICENSE)
 
 [ISONGraph](https://github.com/ISON-format/isongraph) can walk a graph. It can

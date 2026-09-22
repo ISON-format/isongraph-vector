@@ -37,11 +37,13 @@
     <PackageTags>ison;graph;embeddings;semantic;vector;knowledge-graph</PackageTags>
     <Description>ISONGraph Vector - semantic graph search for .NET: embedding similarity combined with graph traversal, semantic multi-hop, and on-topic subgraph extraction</Description>
     <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageIcon>favicon.png</PackageIcon>
   </PropertyGroup>
 
   <ItemGroup>
     <None Include="..\..\README.md" Pack="true" PackagePath="\" />
     <None Include="..\..\LICENSE" Pack="true" PackagePath="\" />
+    <None Include="..\..\..\assets\favicon.png" Pack="true" PackagePath="\" />
   </ItemGroup>
 
 </Project>

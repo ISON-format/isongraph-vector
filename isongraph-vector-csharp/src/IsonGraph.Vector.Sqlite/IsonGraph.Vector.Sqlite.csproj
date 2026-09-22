@@ -39,11 +39,13 @@
     <PackageTags>ison;graph;embeddings;semantic;vector;sqlite;sqlite-vec</PackageTags>
     <Description>SQLite-backed storage for IsonGraph.Vector, with sqlite-vec answering top-k searches. The schema matches every other isongraph-vector language port, so a database written by one can be opened by another.</Description>
     <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageIcon>favicon.png</PackageIcon>
   </PropertyGroup>
 
   <ItemGroup>
     <None Include="..\..\README.md" Pack="true" PackagePath="\" />
     <None Include="..\..\LICENSE" Pack="true" PackagePath="\" />
+    <None Include="..\..\..\assets\favicon.png" Pack="true" PackagePath="\" />
   </ItemGroup>
 
 </Project>
