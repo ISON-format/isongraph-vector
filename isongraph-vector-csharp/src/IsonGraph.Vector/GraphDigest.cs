@@ -30,7 +30,7 @@ namespace IsonGraph.Vector;
 ///
 /// An id-kind of <c>i</c> marks an integer id and <c>s</c> a string one. C#
 /// node ids are always strings, so an in-memory graph cannot say which a given
-/// id "meant"; see <see cref="Compute"/>. <see cref="OfText"/> reads the kind
+/// id "meant"; see <see cref="Compute(IReadOnlyGraph, Func{NodeRef, bool})"/>. <see cref="OfText"/> reads the kind
 /// from the file itself, where an integer id is written unquoted.
 /// </summary>
 public static class GraphDigest
@@ -48,20 +48,32 @@ public static class GraphDigest
     /// unquoted id reads back from an ISON file. Pass a predicate when you know
     /// better (for example, from the source data's JSON types).
     /// </param>
-    public static string Compute(ISONGraph graph, Func<NodeRef, bool>? isIntegerId = null)
+    public static string Compute(ISONGraph graph, Func<NodeRef, bool>? isIntegerId = null) =>
+        Compute(graph.Nodes(), graph.Edges(), graph.Directed, isIntegerId);
+
+    /// <summary>
+    /// Digest of a <see cref="SemanticGraph.Graph"/> view; same result as
+    /// the <see cref="ISONGraph"/> overload for the same graph.
+    /// </summary>
+    public static string Compute(IReadOnlyGraph graph, Func<NodeRef, bool>? isIntegerId = null) =>
+        Compute(graph.Nodes(), graph.Edges(), graph.Directed, isIntegerId);
+
+    private static string Compute(
+        IEnumerable<Node> graphNodes, IEnumerable<Edge> graphEdges, bool directed,
+        Func<NodeRef, bool>? isIntegerId)
     {
         isIntegerId ??= r => IsIntegerText(r.Id);
 
         var nodes = new List<string>();
-        foreach (var node in graph.Nodes())
+        foreach (var node in graphNodes)
             nodes.Add(NodeJson(Key(node.Ref, isIntegerId), node.Properties));
 
         var edges = new List<string>();
-        foreach (var edge in graph.Edges())
+        foreach (var edge in graphEdges)
             edges.Add(EdgeJson(edge.RelType, Key(edge.Source, isIntegerId),
                                Key(edge.Target, isIntegerId), edge.Properties));
 
-        return Finish(graph.Directed, nodes, edges);
+        return Finish(directed, nodes, edges);
     }
 
     /// <summary>

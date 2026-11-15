@@ -274,7 +274,7 @@ public class SeedScoringTests
         var graph = new SemanticGraph("seeds", new FixedEncoder(), autoEmbed: false);
         graph.AddNode("person", "1");
         graph.AddNode("person", "2");
-        graph.Graph.AddEdge("KNOWS", new NodeRef("person", "1"), new NodeRef("person", "2"));
+        graph.AddEdge("KNOWS", new NodeRef("person", "1"), new NodeRef("person", "2"));
         // person:1 matches the query perfectly, person:2 slightly less well.
         graph.EmbeddingStore.Add(new NodeRef("person", "1"), "a", new[] { 1.0f, 0f, 0f, 0f });
         graph.EmbeddingStore.Add(new NodeRef("person", "2"), "b",
@@ -311,7 +311,7 @@ public class SeedScoringTests
     {
         var graph = SeededGraph();
         graph.AddNode("person", "3");
-        graph.Graph.AddEdge("KNOWS", new NodeRef("person", "2"), new NodeRef("person", "3"));
+        graph.AddEdge("KNOWS", new NodeRef("person", "2"), new NodeRef("person", "3"));
         graph.EmbeddingStore.Add(new NodeRef("person", "3"), "c", new[] { 0f, 0f, 1.0f, 0f });
 
         var results = graph.SemanticMultiHop("query", new MultiHopOptions
@@ -330,7 +330,7 @@ public class SeedScoringTests
         var graph = new SemanticGraph("neg", new FixedEncoder(), autoEmbed: false);
         graph.AddNode("person", "1");
         graph.AddNode("person", "2");
-        graph.Graph.AddEdge("KNOWS", new NodeRef("person", "1"), new NodeRef("person", "2"));
+        graph.AddEdge("KNOWS", new NodeRef("person", "1"), new NodeRef("person", "2"));
         graph.EmbeddingStore.Add(new NodeRef("person", "1"), "a", new[] { -1.0f, 0f, 0f, 0f });
         graph.EmbeddingStore.Add(new NodeRef("person", "2"), "b", new[] { 0f, 0f, 1.0f, 0f });
 
@@ -349,8 +349,8 @@ public class SeedScoringTests
     {
         var graph = new SemanticGraph("blend", new FixedEncoder(), autoEmbed: false);
         foreach (var id in new[] { "1", "2", "3" }) graph.AddNode("person", id);
-        graph.Graph.AddEdge("KNOWS", new NodeRef("person", "1"), new NodeRef("person", "2"));
-        graph.Graph.AddEdge("KNOWS", new NodeRef("person", "1"), new NodeRef("person", "3"));
+        graph.AddEdge("KNOWS", new NodeRef("person", "1"), new NodeRef("person", "2"));
+        graph.AddEdge("KNOWS", new NodeRef("person", "1"), new NodeRef("person", "3"));
         graph.EmbeddingStore.Add(new NodeRef("person", "1"), "seed", new[] { 1.0f, 0f, 0f, 0f });
         graph.EmbeddingStore.Add(new NodeRef("person", "2"), "off", new[] { 0f, 1.0f, 0f, 0f });
         graph.EmbeddingStore.Add(new NodeRef("person", "3"), "on", new[] { 0.8f, 0.6f, 0f, 0f });
@@ -439,7 +439,7 @@ public class SemanticGraphTests
         var graph = new SemanticGraph("traverse", new MockEncoder(16));
         graph.AddNode("person", "1", new Dictionary<string, object?> { ["name"] = "Alice" });
         graph.AddNode("person", "2", new Dictionary<string, object?> { ["name"] = "Bob" });
-        graph.Graph.AddEdge("KNOWS", new NodeRef("person", "1"), new NodeRef("person", "2"));
+        graph.AddEdge("KNOWS", new NodeRef("person", "1"), new NodeRef("person", "2"));
 
         var neighbors = graph.Graph.Neighbors(new NodeRef("person", "1"), "KNOWS");
         Assert.Single(neighbors);
@@ -471,8 +471,8 @@ public class SemanticGraphTests
     {
         var graph = new SemanticGraph("paths", new FixedEncoder(), autoEmbed: false);
         foreach (var id in new[] { "1", "2", "3" }) graph.AddNode("person", id);
-        graph.Graph.AddEdge("KNOWS", new NodeRef("person", "1"), new NodeRef("person", "2"));
-        graph.Graph.AddEdge("KNOWS", new NodeRef("person", "2"), new NodeRef("person", "3"));
+        graph.AddEdge("KNOWS", new NodeRef("person", "1"), new NodeRef("person", "2"));
+        graph.AddEdge("KNOWS", new NodeRef("person", "2"), new NodeRef("person", "3"));
         // Distinct vectors and a threshold that admits only person:1, so the
         // seed is deterministic; otherwise a run seeded on the target would
         // find the zero-hop path from the target to itself.
@@ -499,7 +499,7 @@ public class SemanticGraphTests
     private static void Chain(SemanticGraph graph, params string[] ids)
     {
         for (int i = 0; i + 1 < ids.Length; i++)
-            graph.Graph.AddEdge("R", new NodeRef("n", ids[i]), new NodeRef("n", ids[i + 1]));
+            graph.AddEdge("R", new NodeRef("n", ids[i]), new NodeRef("n", ids[i + 1]));
     }
 
     [Fact]
@@ -574,8 +574,8 @@ public class SemanticGraphTests
         var graph = new SemanticGraph("full", new MockEncoder(16));
         foreach (var (id, name) in new[] { ("1", "Alice"), ("2", "Bob"), ("3", "Carol") })
             graph.AddNode("person", id, new Dictionary<string, object?> { ["name"] = name });
-        graph.Graph.AddEdge("KNOWS", new NodeRef("person", "1"), new NodeRef("person", "2"));
-        graph.Graph.AddEdge("KNOWS", new NodeRef("person", "2"), new NodeRef("person", "3"));
+        graph.AddEdge("KNOWS", new NodeRef("person", "1"), new NodeRef("person", "2"));
+        graph.AddEdge("KNOWS", new NodeRef("person", "2"), new NodeRef("person", "3"));
 
         var sub = graph.SemanticSubgraph("Alice", new MultiHopOptions
         {
@@ -816,8 +816,8 @@ public class GraphPersistenceTests : IDisposable
         graph.AddNode("person", "1", Props("name", "Alice"));
         graph.AddNode("person", "007", Props("name", "Bond"));
         graph.AddNode("doc", "d", new() { ["name"] = "Doc", ["pages"] = 12L });
-        graph.Graph.AddEdge("KNOWS", new NodeRef("person", "1"), new NodeRef("person", "007"));
-        graph.Graph.AddEdge("WROTE", new NodeRef("person", "1"), new NodeRef("doc", "d"));
+        graph.AddEdge("KNOWS", new NodeRef("person", "1"), new NodeRef("person", "007"));
+        graph.AddEdge("WROTE", new NodeRef("person", "1"), new NodeRef("doc", "d"));
         return graph;
     }
 
@@ -933,8 +933,8 @@ public class IntegrationTests
         graph.AddNode("project", "1", new Dictionary<string, object?> { ["name"] = "ML Platform" },
             "Machine learning infrastructure");
 
-        graph.Graph.AddEdge("KNOWS", new NodeRef("user", "1"), new NodeRef("user", "2"));
-        graph.Graph.AddEdge("WORKS_ON", new NodeRef("user", "2"), new NodeRef("project", "1"));
+        graph.AddEdge("KNOWS", new NodeRef("user", "1"), new NodeRef("user", "2"));
+        graph.AddEdge("WORKS_ON", new NodeRef("user", "2"), new NodeRef("project", "1"));
 
         Assert.Equal(3, graph.Graph.NodeCount());
         Assert.Equal(2, graph.Graph.EdgeCount());

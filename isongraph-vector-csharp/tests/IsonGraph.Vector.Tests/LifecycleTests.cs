@@ -34,7 +34,7 @@ internal static class Fixtures
         for (int i = 0; i < names.Length; i++)
             graph.AddNode("person", (i + 1).ToString(), new() { ["name"] = names[i] });
         if (names.Length >= 2)
-            graph.Graph.AddEdge("KNOWS", Ref("person", "1"), Ref("person", "2"));
+            graph.AddEdge("KNOWS", Ref("person", "1"), Ref("person", "2"));
         return graph;
     }
 
@@ -53,8 +53,8 @@ internal static class Fixtures
         graph.AddNode("person", "2", new() { ["name"] = "P2", ["active"] = false });
         graph.AddNode("person", "3", new() { ["name"] = "P3", ["active"] = true });
         graph.AddNode("company", "100", new() { ["name"] = "C" });
-        graph.Graph.AddEdge("KNOWS", Ref("person", "1"), Ref("company", "100"));
-        graph.Graph.AddEdge("KNOWS", Ref("company", "100"), Ref("person", "3"));
+        graph.AddEdge("KNOWS", Ref("person", "1"), Ref("company", "100"));
+        graph.AddEdge("KNOWS", Ref("company", "100"), Ref("person", "3"));
         var store = graph.EmbeddingStore;
         store.Add(Ref("company", "100"), "c", new[] { 1f, 0f, 0f, 0f });
         store.Add(Ref("person", "1"), "p1", new[] { 0.9f, 0.1f, 0f, 0f });
@@ -230,8 +230,8 @@ public class EdgeWeightingTests
     {
         var graph = new SemanticGraph("fan", new UnitEncoder(), autoEmbed: false);
         foreach (var id in new[] { "S", "P", "Q" }) graph.AddNode("n", id);
-        graph.Graph.AddEdge("R", Fixtures.Ref("n", "S"), Fixtures.Ref("n", "P"), new Dictionary<string, object?> { ["w"] = pWeight });
-        graph.Graph.AddEdge("R", Fixtures.Ref("n", "S"), Fixtures.Ref("n", "Q"),
+        graph.AddEdge("R", Fixtures.Ref("n", "S"), Fixtures.Ref("n", "P"), new Dictionary<string, object?> { ["w"] = pWeight });
+        graph.AddEdge("R", Fixtures.Ref("n", "S"), Fixtures.Ref("n", "Q"),
             qHasWeight ? new Dictionary<string, object?> { ["w"] = qWeight } : null);
         graph.EmbeddingStore.Add(Fixtures.Ref("n", "S"), "s", new[] { 1f, 0f, 0f, 0f });
         return graph;
@@ -289,9 +289,9 @@ public class EdgeWeightingTests
     {
         var graph = new SemanticGraph("d", new UnitEncoder(), autoEmbed: false);
         foreach (var id in new[] { "S", "M", "T" }) graph.AddNode("n", id);
-        graph.Graph.AddEdge("R", Fixtures.Ref("n", "S"), Fixtures.Ref("n", "T"), new Dictionary<string, object?> { ["w"] = 0.1 });   // direct but weak
-        graph.Graph.AddEdge("R", Fixtures.Ref("n", "S"), Fixtures.Ref("n", "M"), new Dictionary<string, object?> { ["w"] = 1.0 });
-        graph.Graph.AddEdge("R", Fixtures.Ref("n", "M"), Fixtures.Ref("n", "T"), new Dictionary<string, object?> { ["w"] = 1.0 }); // 2 hops, strong
+        graph.AddEdge("R", Fixtures.Ref("n", "S"), Fixtures.Ref("n", "T"), new Dictionary<string, object?> { ["w"] = 0.1 });   // direct but weak
+        graph.AddEdge("R", Fixtures.Ref("n", "S"), Fixtures.Ref("n", "M"), new Dictionary<string, object?> { ["w"] = 1.0 });
+        graph.AddEdge("R", Fixtures.Ref("n", "M"), Fixtures.Ref("n", "T"), new Dictionary<string, object?> { ["w"] = 1.0 }); // 2 hops, strong
         graph.EmbeddingStore.Add(Fixtures.Ref("n", "S"), "s", new[] { 1f, 0f, 0f, 0f });
         return graph;
     }
@@ -349,10 +349,10 @@ public class SubgraphConnectivityTests
         foreach (var id in new[] { "A", "B", "X" })
             graph.AddNode("n", id, new() { ["kind"] = id == "X" ? "hub" : "leaf" });
         // a -> x -> b (or reversed, per the flags)
-        if (aToX) graph.Graph.AddEdge(relAB, Fixtures.Ref("n", "A"), Fixtures.Ref("n", "X"));
-        else graph.Graph.AddEdge(relAB, Fixtures.Ref("n", "X"), Fixtures.Ref("n", "A"));
-        if (bToX) graph.Graph.AddEdge(relXB, Fixtures.Ref("n", "B"), Fixtures.Ref("n", "X"));
-        else graph.Graph.AddEdge(relXB, Fixtures.Ref("n", "X"), Fixtures.Ref("n", "B"));
+        if (aToX) graph.AddEdge(relAB, Fixtures.Ref("n", "A"), Fixtures.Ref("n", "X"));
+        else graph.AddEdge(relAB, Fixtures.Ref("n", "X"), Fixtures.Ref("n", "A"));
+        if (bToX) graph.AddEdge(relXB, Fixtures.Ref("n", "B"), Fixtures.Ref("n", "X"));
+        else graph.AddEdge(relXB, Fixtures.Ref("n", "X"), Fixtures.Ref("n", "B"));
         graph.EmbeddingStore.Add(Fixtures.Ref("n", "A"), "a", new[] { 1f, 0f, 0f, 0f });
         graph.EmbeddingStore.Add(Fixtures.Ref("n", "B"), "b", new[] { 0.9f, 0.1f, 0f, 0f });
         return graph;
@@ -406,9 +406,9 @@ public class SubgraphConnectivityTests
     {
         var graph = new SemanticGraph("chain", new UnitEncoder(), autoEmbed: false);
         foreach (var id in new[] { "A", "M1", "M2", "B" }) graph.AddNode("n", id);
-        graph.Graph.AddEdge("R", Fixtures.Ref("n", "A"), Fixtures.Ref("n", "M1"));
-        graph.Graph.AddEdge("R", Fixtures.Ref("n", "M1"), Fixtures.Ref("n", "M2"));
-        graph.Graph.AddEdge("R", Fixtures.Ref("n", "M2"), Fixtures.Ref("n", "B"));
+        graph.AddEdge("R", Fixtures.Ref("n", "A"), Fixtures.Ref("n", "M1"));
+        graph.AddEdge("R", Fixtures.Ref("n", "M1"), Fixtures.Ref("n", "M2"));
+        graph.AddEdge("R", Fixtures.Ref("n", "M2"), Fixtures.Ref("n", "B"));
         graph.EmbeddingStore.Add(Fixtures.Ref("n", "A"), "a", new[] { 1f, 0f, 0f, 0f });
         graph.EmbeddingStore.Add(Fixtures.Ref("n", "B"), "b", new[] { 0.9f, 0.1f, 0f, 0f });
         Assert.Equal(2, Sub(graph, connect: true, connectMaxHops: 2).Graph.NodeCount());
@@ -446,7 +446,7 @@ public class SubgraphConnectivityTests
         foreach (var (id, vector) in vectors)
         {
             graph.AddNode("n", id);
-            graph.Graph.AddEdge("R", Fixtures.Ref("n", id), Fixtures.Ref("n", "HUB"));
+            graph.AddEdge("R", Fixtures.Ref("n", id), Fixtures.Ref("n", "HUB"));
             graph.EmbeddingStore.Add(Fixtures.Ref("n", id), id, vector);
         }
         var sub = graph.SemanticSubgraph("q", new MultiHopOptions
@@ -736,7 +736,7 @@ public class SaveLoadConsistencyTests : IDisposable
             ["tiny"] = 1.5e-7, ["huge"] = 1.0e20, ["third"] = 1.0 / 3.0, ["accent"] = "résumé 日本語 é \"q\" \\ \U0001F600",
         });
         graph.AddNode("account", "007", new() { ["name"] = "Bond" });
-        graph.Graph.AddEdge("KNOWS", Fixtures.Ref("person", "1"), Fixtures.Ref("account", "007"),
+        graph.AddEdge("KNOWS", Fixtures.Ref("person", "1"), Fixtures.Ref("account", "007"),
             new Dictionary<string, object?> { ["w"] = 0.5, ["n"] = 2L });
         graph.EmbedNode(Fixtures.Ref("person", "1"), "a");
         var path = P("t.isong");
@@ -764,7 +764,7 @@ public class SaveLoadConsistencyTests : IDisposable
         var graph = new SemanticGraph("u", encoder, directed: false);
         graph.AddNode("n", "1", new() { ["name"] = "one" });
         graph.AddNode("n", "2", new() { ["name"] = "two" });
-        graph.Graph.AddEdge("E", Fixtures.Ref("n", "1"), Fixtures.Ref("n", "2"), new Dictionary<string, object?> { ["w"] = 0.25 });
+        graph.AddEdge("E", Fixtures.Ref("n", "1"), Fixtures.Ref("n", "2"), new Dictionary<string, object?> { ["w"] = 0.25 });
         var path = P("u.isong");
         graph.Save(path);
         Assert.Equal(2, SemanticGraph.Load(path, encoder).EmbeddingStore.Count);
@@ -934,12 +934,12 @@ public class SaveLoadConsistencyTests : IDisposable
         var b = new SemanticGraph(autoEmbed: false);
         a.AddNode("t", "1", new() { ["x"] = 1L });
         a.AddNode("t", "2", new() { ["x"] = 2L });
-        a.Graph.AddEdge("R", Fixtures.Ref("t", "1"), Fixtures.Ref("t", "2"));
+        a.AddEdge("R", Fixtures.Ref("t", "1"), Fixtures.Ref("t", "2"));
         b.AddNode("t", "2", new() { ["x"] = 2L });
         b.AddNode("t", "1", new() { ["x"] = 1L });
-        b.Graph.AddEdge("R", Fixtures.Ref("t", "1"), Fixtures.Ref("t", "2"));
+        b.AddEdge("R", Fixtures.Ref("t", "1"), Fixtures.Ref("t", "2"));
         Assert.Equal(GraphDigest.Compute(a.Graph), GraphDigest.Compute(b.Graph));
-        b.Graph.UpdateNode("t", "1", new Dictionary<string, object?> { ["x"] = 99L });
+        b.UpdateNode("t", "1", new Dictionary<string, object?> { ["x"] = 99L });
         Assert.NotEqual(GraphDigest.Compute(a.Graph), GraphDigest.Compute(b.Graph));
 
         // an int id and a str id that print alike are different nodes

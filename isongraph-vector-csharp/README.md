@@ -38,8 +38,8 @@ var graph = new SemanticGraph("social", new MockEncoder(384));
 graph.AddNode("person", "1", new() { ["name"] = "Alice", ["description"] = "software engineer" });
 graph.AddNode("person", "2", new() { ["name"] = "Bob", ["description"] = "data scientist" });
 graph.AddNode("person", "3", new() { ["name"] = "Carol", ["description"] = "product manager" });
-graph.Graph.AddEdge("KNOWS", new NodeRef("person", "1"), new NodeRef("person", "2"));
-graph.Graph.AddEdge("KNOWS", new NodeRef("person", "2"), new NodeRef("person", "3"));
+graph.AddEdge("KNOWS", new NodeRef("person", "1"), new NodeRef("person", "2"));
+graph.AddEdge("KNOWS", new NodeRef("person", "2"), new NodeRef("person", "3"));
 
 var results = graph.SemanticMultiHop("Alice software engineer", new MultiHopOptions
 {
@@ -68,11 +68,15 @@ That example passes `Threshold = -1.0f`, which deserves an explanation.
 meaning — they are hash-derived noise for testing plumbing. Because they are
 near-orthogonal and cosine similarity is signed, mock scores straddle zero, and
 the default threshold of 0.3 would reject every seed. Supply your own
-`IEmbeddingEncoder` over a real model and the default is sensible again.
+`IEmbeddingEncoder` over a real model - for instance `HttpEmbeddingEncoder`
+below - and the default is sensible again.
 
 `ISONGraph` is `sealed`, so `SemanticGraph` wraps it by composition rather than
-inheriting from it. The underlying graph stays fully available through
-`.Graph`, which is why the edges above are added there.
+inheriting from it. The wrapped graph is private: `.Graph` is a read-only view
+(`IReadOnlyGraph`) for lookups, counts, neighbors, traversals, paths and ISON
+serialization, and every mutation - `AddNode`, `UpdateNode`, `RemoveNode`,
+`AddEdge`, `RemoveEdge` - goes through the `SemanticGraph` itself, which is why
+the edges above are added there.
 
 ## Beyond a single search
 
@@ -144,6 +148,53 @@ between two components until one remains or nothing fits. The result can hold
 more than `TopKResults` nodes, connectors are not marked, and without
 `StrictFilter` a connector may fail the filter. `connectMaxHops` below 1 throws.
 
+## A real model over HTTP
+
+`HttpEmbeddingEncoder` implements `IEmbeddingEncoder` against any HTTP
+embeddings endpoint, using only `System.Net.Http` and `System.Text.Json` (no new
+package). It POSTs `{"model": ..., "input": [texts]}` and reads either the
+OpenAI shape (`data[i].embedding`, ordered by `index`) or Ollama's `/api/embed`
+shape (`embeddings`), which covers OpenAI, Azure OpenAI, Ollama, vLLM, LiteLLM,
+LM Studio, text-embeddings-inference and the like.
+
+```csharp
+using var encoder = new HttpEmbeddingEncoder(new HttpEmbeddingOptions
+{
+    Url = "https://api.openai.com/v1/embeddings",
+    Model = "text-embedding-3-small",
+    Dimension = 1536,                       // optional; learned from the first reply if omitted
+    ApiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY"),
+});
+var graph = new SemanticGraph("kb", encoder);
+
+// Ollama, no key:
+//   Url = "http://localhost:11434/api/embed", Model = "nomic-embed-text"
+```
+
+**Every text you embed is sent to that URL** - node text on `AddNode`,
+`EmbedAllNodes` and `ReembedStale`, and each search query. Use an endpoint you
+trust with that text. The encoder's `ModelName` is `Model`, so switching models
+makes the stored vectors stale and `ReembedStale` / `Load` handle it as usual.
+
+Options: `ApiKey` (sent as `Authorization: Bearer`, or raw in `ApiKeyHeader`,
+e.g. `api-key` for Azure), `Headers`, `ExtraBody` (e.g. `dimensions`),
+`BatchSize` (default 64; larger inputs are split into sequential requests),
+`Timeout` (per attempt, default 60 s), `MaxRetries` (default 2) with
+`RetryDelay` backoff on 429, 5xx, timeouts and network errors (a `Retry-After`
+header is honoured, capped by `MaxRetryDelay`), and `Version`. Pass an
+`HttpClient` or an `HttpMessageHandler` to the constructor to supply your own
+(proxy, test double). Failures throw `HttpEmbeddingException` (with
+`StatusCode`); its message names the URL without the query string and never
+contains the API key or header values. An API key is refused over plain `http://`
+to a non-loopback host unless `AllowInsecureHttp` is set.
+
+`IEmbeddingEncoder` is synchronous, so `Encode`/`EncodeBatch` block on the
+request (without capturing a synchronization context); where you can await, use
+`EncodeAsync` / `EncodeBatchAsync(texts, cancellationToken)`. Reading
+`Dimension` when it was not configured and nothing has been encoded yet makes
+one probe request with the text `dimension probe`, so set `Dimension` if you
+want construction to stay offline.
+
 ## Models and consistency
 
 Every stored vector records the model that made it (`IEmbeddingEncoder.ModelName`,
@@ -185,7 +236,7 @@ other; `GraphDigest.Compute(graph)` and `GraphDigest.OfText(isonText)` expose it
 
 ## Keeping embeddings in step
 
-Change a node through `SemanticGraph.UpdateNode`, not `graph.Graph.UpdateNode`:
+Change a node through `SemanticGraph.UpdateNode`:
 
 ```csharp
 graph.UpdateNode("person", "1", new() { ["name"] = "Alicia" });
@@ -194,9 +245,19 @@ graph.UpdateNode("person", "1", new() { ["name"] = "Alicia" });
 With auto-embed on, touching any embed field re-embeds the node from its new
 properties; if nothing is left to embed the stale vector is dropped. Updates to
 other fields, and graphs created with `autoEmbed: false`, leave the embedding
-alone. `ISONGraph` is sealed, so the wrapped `Graph.UpdateNode` cannot be
-overridden and still works — but it bypasses the re-embedding and leaves the
-vector stale.
+alone.
+
+There is no way around it: `graph.Graph` is a read-only view
+(`IReadOnlyGraph`) with no `AddNode`, `UpdateNode`, `RemoveNode`, `AddEdge`
+or `RemoveEdge`, so a node cannot be changed behind the embedding store's back.
+The nodes, edges and paths it (and `AddNode`/`UpdateNode`/`AddEdge`) return are
+detached copies, because `ISONGraph` hands out live objects whose `Properties`
+dictionary is mutable; editing a returned `Node.Properties` changes nothing.
+The same goes for the `Node` handed to your `nodeFilter`, `EmbedAllNodes` text
+function and `Traverse` filter. The view is live - it reflects later changes
+made through the `SemanticGraph`. Edges carry no embedding, so `AddEdge` and
+`RemoveEdge` are plain pass-throughs; they live on `SemanticGraph` so that every
+mutation has one entry point.
 
 ## Saving and loading a graph
 
@@ -285,8 +346,9 @@ store.FromJson(json);
 - **One embedding per node**, from one text field or a concatenation. No
   multi-vector nodes, no edge embeddings.
 - **`MockEncoder` has no semantic structure.** Use it to test plumbing, never
-  to judge relevance quality. This port ships no real encoder — implement
-  `IEmbeddingEncoder` over the model of your choice.
+  to judge relevance quality. For real vectors use `HttpEmbeddingEncoder`
+  (which sends your text to the endpoint you configure) or implement
+  `IEmbeddingEncoder` over a model of your own.
 - **Auto-embed renders typed properties.** Since ISONGraph 1.4.0 a property can
   be a number, a bool or null. Nulls are skipped and booleans render as ISON
   spells them (`true`/`false`, not .NET's `True`), so the same graph produces
@@ -294,7 +356,7 @@ store.FromJson(json);
   `1,5`.
 - **Digests and ids.** C# node ids are strings. `Save`/`Load` take the digest
   from the file's text, where an integer id is unquoted, so a pair written by
-  the Python port verifies here. `GraphDigest.Compute(graph)` of an in-memory
+  the Python port verifies here. `GraphDigest.Compute(graph.Graph)` of an in-memory
   graph cannot know which ids "meant" integers: it treats plain decimal text
   (`-?[0-9]+`) as one, or takes a predicate. Integers beyond 64 bits read as
   strings here but as integers in Python, so a graph holding one verifies with a
@@ -314,7 +376,7 @@ store.FromJson(json);
 ## Tests
 
 ```bash
-dotnet test        # 160 tests
+dotnet test        # 222 tests
 ```
 
 ## Links

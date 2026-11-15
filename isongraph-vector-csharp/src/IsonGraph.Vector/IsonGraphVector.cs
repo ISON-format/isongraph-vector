@@ -952,15 +952,20 @@ public sealed class MultiHopOptions
 /// <summary>
 /// ISONGraph extended with embedding-based semantic search.
 ///
-/// ISONGraph is sealed, so this wraps it by composition; the underlying graph
-/// stays reachable through <see cref="Graph"/> and every ISONGraph method keeps
-/// working unchanged.
+/// ISONGraph is sealed, so this wraps it by composition. The wrapped graph is
+/// private: <see cref="Graph"/> is a read-only view (queries, traversal,
+/// serialization), and every mutation - AddNode, UpdateNode, RemoveNode,
+/// AddEdge, RemoveEdge - goes through this class, so a node's embedding can
+/// never be left stale by a change made behind its back. Nodes and edges that
+/// come back are detached copies, for the same reason: changing a returned
+/// <c>Node.Properties</c> does not change the graph.
 /// </summary>
 public sealed class SemanticGraph
 {
     private static readonly string[] DefaultEmbedFields = { "name", "description", "content", "text" };
 
     private readonly ISONGraph _graph;
+    private readonly ReadOnlyGraphView _view;
     private readonly EmbeddingStore _store;
     private readonly bool _autoEmbed;
     private readonly List<string> _embedFields;
@@ -982,12 +987,18 @@ public sealed class SemanticGraph
         ModelMismatchMode onModelMismatch = ModelMismatchMode.Warn)
     {
         _graph = new ISONGraph(name, directed);
+        _view = new ReadOnlyGraphView(_graph);
         _store = new EmbeddingStore(encoder, version, onModelMismatch);
         _autoEmbed = autoEmbed;
         _embedFields = (embedFields ?? DefaultEmbedFields).ToList();
     }
 
-    public ISONGraph Graph => _graph;
+    /// <summary>
+    /// Read-only view of the graph: lookups, counts, neighbors, traversals,
+    /// paths and ISON serialization. It has no mutating members; change the
+    /// graph through this SemanticGraph so embeddings stay in step.
+    /// </summary>
+    public IReadOnlyGraph Graph => _view;
     public EmbeddingStore EmbeddingStore => _store;
     public IEmbeddingEncoder? Encoder => _store.Encoder;
     public string Name => _graph.Name;
@@ -1059,8 +1070,27 @@ public sealed class SemanticGraph
         if (!string.IsNullOrEmpty(text))
             EmbedNode(new NodeRef(nodeType, nodeId), text);
 
-        return node;
+        return ReadOnlyGraphView.Copy(node);
     }
+
+    /// <summary>
+    /// Add an edge. Edges carry no embedding, so this is a plain pass-through
+    /// to the graph; it exists so every mutation goes through the
+    /// SemanticGraph. Returns a copy of the new edge. Throws
+    /// <see cref="NodeNotFoundError"/> for a missing endpoint and
+    /// <see cref="DuplicateEdgeError"/> for an existing edge.
+    /// </summary>
+    public Edge AddEdge(
+        string relType, NodeRef source, NodeRef target,
+        IDictionary<string, object?>? properties = null) =>
+        ReadOnlyGraphView.Copy(_graph.AddEdge(relType, source, target, properties));
+
+    /// <summary>
+    /// Remove an edge. Throws <see cref="EdgeNotFoundError"/> if it does not
+    /// exist. (An undirected graph's mirror edge goes with it.)
+    /// </summary>
+    public void RemoveEdge(string relType, NodeRef source, NodeRef target) =>
+        _graph.RemoveEdge(relType, source, target);
 
     public string EmbedNode(NodeRef nodeRef, string text) => _store.Add(nodeRef, text);
 
@@ -1089,9 +1119,9 @@ public sealed class SemanticGraph
     /// autoEmbed off (whose vectors the caller manages), leave the embedding
     /// alone.
     ///
-    /// ISONGraph is sealed, so <c>Graph.UpdateNode</c> cannot be overridden
-    /// and remains reachable: call this method, not the underlying graph's,
-    /// or the embedding will go stale.
+    /// <see cref="Graph"/> is read-only, so this is the only way to change a
+    /// node's properties and the embedding cannot go stale behind your back.
+    /// Returns a copy of the updated node.
     /// </summary>
     public Node UpdateNode(
         string nodeType, string nodeId, Dictionary<string, object?> properties)
@@ -1108,14 +1138,14 @@ public sealed class SemanticGraph
                 _store.Remove(nodeRef);
         }
 
-        return node;
+        return ReadOnlyGraphView.Copy(node);
     }
 
     // -- node filtering ----------------------------------------------------------
 
     private Node? ResolveNode(NodeRef nodeRef)
     {
-        try { return _graph.GetNode(nodeRef); }
+        try { return ReadOnlyGraphView.Copy(_graph.GetNode(nodeRef)); }
         catch (GraphError) { return null; }
     }
 
@@ -1671,7 +1701,7 @@ public sealed class SemanticGraph
         {
             var nodeRef = new NodeRef(node.Type, node.Id);
             if (skipExisting && _store.Get(nodeRef) is not null) continue;
-            var text = textFn(node);
+            var text = textFn(ReadOnlyGraphView.Copy(node));
             if (!string.IsNullOrEmpty(text)) batch.Add((nodeRef, text));
         }
 
