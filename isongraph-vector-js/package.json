@@ -18,7 +18,7 @@
   ],
   "scripts": {
     "test": "vitest run",
-    "test:core": "vitest run src/index.test.js"
+    "test:core": "vitest run src/index.test.js src/http-encoder.test.js"
   },
   "keywords": [
     "ison",

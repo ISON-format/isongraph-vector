@@ -148,6 +148,21 @@ A *text* query against vectors from a different model warns once per pair
 (`'error'`) or stays quiet (`'ignore'`); vector queries are never checked.
 `store.clear(true)` also forgets the pinned dimension.
 
+`SqliteEmbeddingStore` has the same model lifecycle as the in-memory store:
+`models()`, `stale(model?, dimension?, includeUnknown?)` (or an options
+object), `clear(resetDimension?)`, `onModelMismatch` and `version` (as
+constructor options `new SqliteEmbeddingStore(path, encoder, sqliteVec,
+{ version, onModelMismatch })` or properties), `exportEmbeddings(graphDigest?)`
+with the same `encoder_model` / `encoder_version` / `graph_digest` fields,
+`lastImportMeta`, and the per-vector `model` on export and import. The model is
+kept in the `model` column the shared SQLite schema already has; a database
+whose table lacks it gets `ALTER TABLE ... ADD COLUMN model TEXT DEFAULT
+'unknown'`, and databases written by the other ports open unchanged. There is
+no `reembedStale` on the bare store - re-`add` the refs `stale()` returns.
+`saveEmbeddings` / `loadEmbeddings` from the `/node` entry accept this store
+too. Unlike before, `clear()` no longer forgets the pinned dimension unless you
+pass `true`.
+
 ## Storing the vectors
 
 The default store is in memory. For persistence, import the SQLite store from
@@ -195,6 +210,56 @@ Top-k results come out of a bounded insertion rather than sorting all of them,
 which is where a third of the query time used to go. Filtering by node type
 stays exact too: the type is a `vec0` metadata column, so it narrows the
 search rather than filtering its results.
+
+## Embeddings from an HTTP endpoint
+
+`HttpEncoder` is an `EmbeddingEncoder` that calls an OpenAI-compatible
+`/v1/embeddings` endpoint or Ollama's `/api/embed`. It uses the platform
+`fetch` - no dependency, no `node:` import, so it lives in the main entry and
+runs on Node 18+ and in a browser.
+
+**Every text you embed is sent to the endpoint you configure** - node texts and
+search queries alike. Point it at a service you are willing to send that data
+to (a local Ollama keeps it on your machine).
+
+```typescript
+import { HttpEncoder, EmbeddingStore } from 'isongraph-vector-ts';
+
+const encoder = new HttpEncoder({
+  url: 'https://api.openai.com/v1/embeddings',   // or http://localhost:11434/api/embed
+  model: 'text-embedding-3-small',
+  api: 'openai',                                  // or 'ollama'
+  apiKey: process.env.OPENAI_API_KEY,             // sent as a Bearer token
+});
+
+const texts = ['Alice is an engineer', 'Bob plans roadmaps'];
+await encoder.prefetch([...texts, 'engineering']);   // the network calls happen here
+
+const store = new EmbeddingStore(encoder);
+store.addBatch([[['person', 1], texts[0]], [['person', 2], texts[1]]]);
+store.similaritySearch('engineering', 1);            // served from the prefetched vectors
+```
+
+Options: `url`, `model` (also the `modelName` recorded on every vector),
+`api` (`'openai'` default, or `'ollama'`), `apiKey`, `dimension` (otherwise
+learned from the first response; `NaN` until then), `batchSize` (64),
+`timeoutMs` (30000), `headers`, `version`, `maxRetries` (2), `retryDelayMs`
+(500), `maxCacheEntries` (100000) and `fetch` (a replacement for the global).
+429 and 5xx answers, timeouts and network errors are retried a bounded number
+of times with backoff (a `Retry-After` header is honoured, up to 30 s); other
+errors throw an `HttpEncoderError` carrying the HTTP `status`. Errors name the
+endpoint's origin and path, never the API key or the query string.
+
+**It is not synchronous, and `EmbeddingEncoder` is.** The stores call
+`encode` / `encodeBatch` and expect a vector back, so `HttpEncoder` serves those
+from a cache and throws an `HttpEncoderError` for a text it has not fetched.
+Fetch first with `await encoder.prefetch(texts)` (or `encodeAsync` /
+`encodeBatchAsync`, which also return the vectors). In practice that means
+`SemanticGraph` auto-embedding does not work with it - the graph builds the
+text itself and asks for the vector at once - so use it with the stores and
+`autoEmbed: false`, prefetching the texts you pass, or embed with
+`encodeBatchAsync` and hand the vectors in. A bounded cache (`maxCacheEntries`)
+evicts the oldest vectors, so prefetch no more than you are about to use.
 
 ## One format, six languages
 
@@ -272,8 +337,12 @@ and `importEmbeddings(payload)` for the vectors, and
 - **One embedding per node**, from one text field or a concatenation. No
   multi-vector nodes, no edge embeddings.
 - **`MockEncoder` has no semantic structure.** Use it to test plumbing, never
-  to judge relevance quality. This port ships no real encoder — implement
-  `EmbeddingEncoder` over the model of your choice.
+  to judge relevance quality. For real vectors use `HttpEncoder` (below,
+  prefetch-then-search) or implement `EmbeddingEncoder` over the model of your
+  choice.
+- **`HttpEncoder` sends your texts to the endpoint you configure**, and its
+  `encode` only serves texts fetched beforehand - see *Embeddings from an HTTP
+  endpoint*.
 - **Auto-embed renders typed properties.** Since ISONGraph 1.4.0 a property can
   be a number, a bool or null. Nulls are skipped and booleans render as `true`
   and `false`, so the same graph produces the same text in every port.
@@ -284,8 +353,8 @@ and `importEmbeddings(payload)` for the vectors, and
 ## Tests
 
 ```bash
-npm test             # 159 tests, needs Node 24 for the SQLite half
-npm run test:core    # 143 tests, main and /node entries, Node 18 and up
+npm test             # 194 tests, needs Node 24 for the SQLite half
+npm run test:core    # 160 tests, main and /node entries, Node 18 and up
 npm run typecheck    # tsc --noEmit, tests included
 npm run build        # emits dist/, library only
 ```

@@ -75,9 +75,13 @@ export function writeFileAtomic(path, text) {
 /**
  * Write every embedding of `graph` to a JSON sidecar, atomically. Returns the
  * count. `digest` (see graphDigest) ties the sidecar to one particular graph.
+ *
+ * Also accepts a bare store (an EmbeddingStore, or the SqliteEmbeddingStore
+ * from `isongraph-vector-js/sqlite`) in place of the graph.
  */
 export function saveEmbeddings(graph, path, digest) {
-    const payload = graph.embeddingStore.exportEmbeddings(digest);
+    const store = graph.embeddingStore ?? graph;
+    const payload = store.exportEmbeddings(digest);
     writeFileAtomic(path, JSON.stringify(payload));
     return payload.count;
 }
@@ -88,7 +92,7 @@ export function saveEmbeddings(graph, path, digest) {
  */
 export function loadEmbeddings(graph, path, replace = false) {
     const payload = JSON.parse(readFileSync(path, 'utf8'));
-    return graph.embeddingStore.importEmbeddings(payload, replace);
+    return (graph.embeddingStore ?? graph).importEmbeddings(payload, replace);
 }
 
 /**

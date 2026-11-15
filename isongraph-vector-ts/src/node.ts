@@ -99,11 +99,17 @@ export function writeFileAtomic(path: string, text: string): void {
 }
 
 /**
+ * Anything that exports and imports the portable payload: the in-memory
+ * EmbeddingStore, or the SQLite-backed one from `isongraph-vector-ts/sqlite`.
+ */
+export type EmbeddingPayloadStore = Pick<EmbeddingStore, 'exportEmbeddings' | 'importEmbeddings'>;
+
+/**
  * Write every embedding in a store to a JSON sidecar, atomically. Returns the
  * count. `graphDigest` ties the sidecar to one particular graph.
  */
 export function saveEmbeddings(
-  store: EmbeddingStore,
+  store: EmbeddingPayloadStore,
   path: string,
   graphDigest?: string | null
 ): number {
@@ -114,7 +120,7 @@ export function saveEmbeddings(
 
 /** Read a JSON sidecar written by saveEmbeddings (in any language port). */
 export function loadEmbeddings(
-  store: EmbeddingStore,
+  store: EmbeddingPayloadStore,
   path: string,
   replace: boolean = false
 ): number {

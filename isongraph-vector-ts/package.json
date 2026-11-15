@@ -13,7 +13,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "test": "vitest run",
-    "test:core": "vitest run src/index.test.ts src/node.test.ts src/features.test.ts",
+    "test:core": "vitest run src/index.test.ts src/node.test.ts src/features.test.ts src/http-encoder.test.ts",
     "prepublishOnly": "npm run build",
     "typecheck": "tsc --noEmit"
   },

@@ -180,6 +180,285 @@ export class MockEncoder {
 }
 MockEncoder.FNV_OFFSET_BASIS = 0x811c9dc5;
 MockEncoder.FNV_PRIME = 0x01000193;
+// =============================================================================
+// HTTP Encoder
+// =============================================================================
+/** A request to an embeddings endpoint failed, or its answer was unusable. */
+export class HttpEncoderError extends EmbeddingError {
+    constructor(message, status) {
+        super(message);
+        this.name = 'HttpEncoderError';
+        if (status !== undefined)
+            this.status = status;
+    }
+}
+const MAX_RETRY_WAIT_MS = 30000;
+const ERROR_SNIPPET_CHARS = 200;
+/**
+ * Embeddings from an HTTP endpoint (OpenAI-compatible or Ollama), using the
+ * platform `fetch` - no dependency, and no `node:` import, so it works in
+ * Node 18+ and in browsers.
+ *
+ * **Every text you embed is sent to the configured endpoint**, including the
+ * text of every node a graph embeds and every search query.
+ *
+ * `EmbeddingEncoder` is synchronous and a network call is not, so the encoder
+ * works in two steps: fetch the vectors with `await encoder.prefetch(texts)`
+ * (or `encodeAsync` / `encodeBatchAsync`, which fetch and return them), then
+ * use the synchronous `encode` / `encodeBatch` the stores call. Those serve
+ * from a cache and throw an HttpEncoderError for a text that was not fetched
+ * first. That makes `SemanticGraph` auto-embedding unusable with this encoder
+ * unless the node texts are prefetched; the plain stores (`addBatch`,
+ * `similaritySearch` with a prefetched query) are the intended fit.
+ *
+ * @example
+ * ```typescript
+ * const encoder = new HttpEncoder({
+ *   url: 'http://localhost:11434/api/embed', model: 'nomic-embed-text', api: 'ollama',
+ * });
+ * const texts = ['Alice is an engineer', 'Bob plans roadmaps'];
+ * await encoder.prefetch([...texts, 'engineering']);
+ * const store = new EmbeddingStore(encoder);
+ * store.addBatch([[['person', 1], texts[0]], [['person', 2], texts[1]]]);
+ * store.similaritySearch('engineering', 1);
+ * ```
+ */
+export class HttpEncoder {
+    constructor(options) {
+        this._cache = new Map();
+        if (!options || typeof options.url !== 'string' || typeof options.model !== 'string' || !options.model) {
+            throw new EmbeddingError('HttpEncoder needs a url and a model');
+        }
+        let parsed;
+        try {
+            parsed = new URL(options.url);
+        }
+        catch {
+            throw new EmbeddingError('HttpEncoder url is not a valid URL');
+        }
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+            throw new EmbeddingError(`HttpEncoder url must be http or https, got ${parsed.protocol}`);
+        }
+        if (parsed.username || parsed.password) {
+            throw new EmbeddingError('HttpEncoder url must not carry credentials: pass apiKey or headers instead');
+        }
+        const api = options.api ?? 'openai';
+        if (api !== 'openai' && api !== 'ollama') {
+            throw new EmbeddingError(`HttpEncoder api must be 'openai' or 'ollama', got ${JSON.stringify(api)}`);
+        }
+        const positive = (value, fallback, name, integer) => {
+            if (value === undefined)
+                return fallback;
+            if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0 || (integer && !Number.isInteger(value))) {
+                throw new EmbeddingError(`HttpEncoder ${name} must be a positive${integer ? ' integer' : ' number'}, got ${value}`);
+            }
+            return value;
+        };
+        const nonNegative = (value, fallback, name) => {
+            if (value === undefined)
+                return fallback;
+            if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+                throw new EmbeddingError(`HttpEncoder ${name} must be a non-negative number, got ${value}`);
+            }
+            return value;
+        };
+        this.modelName = options.model;
+        if (options.version !== undefined)
+            this.version = options.version;
+        this._api = api;
+        this._url = options.url;
+        // Origin and path only: a URL may carry credentials or a key in its query.
+        this._safeUrl = `${parsed.protocol}//${parsed.host}${parsed.pathname}`;
+        this._dimension = options.dimension === undefined ? null : positive(options.dimension, 0, 'dimension', true);
+        this._batchSize = positive(options.batchSize, 64, 'batchSize', true);
+        this._timeoutMs = positive(options.timeoutMs, 30000, 'timeoutMs', false);
+        this._maxRetries = Math.floor(nonNegative(options.maxRetries, 2, 'maxRetries'));
+        this._retryDelayMs = nonNegative(options.retryDelayMs, 500, 'retryDelayMs');
+        this._maxCache = Math.floor(positive(options.maxCacheEntries, 100000, 'maxCacheEntries', false));
+        const fetchFn = options.fetch ?? globalThis.fetch;
+        if (typeof fetchFn !== 'function') {
+            throw new EmbeddingError('HttpEncoder needs a global fetch (Node 18+) or a fetch option');
+        }
+        this._fetch = fetchFn;
+        const apiKey = options.apiKey;
+        const extra = options.headers ?? {};
+        this._buildHeaders = () => ({
+            'Content-Type': 'application/json',
+            ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+            ...extra,
+        });
+        const secrets = [apiKey, ...Object.entries(extra)
+                .filter(([name]) => /key|auth|token|secret|cookie/i.test(name))
+                .map(([, value]) => value)]
+            .filter((s) => typeof s === 'string' && s.length > 0);
+        this._redact = (text) => secrets.reduce((acc, s) => acc.split(s).join('***'), text);
+    }
+    /** Vector length; `NaN` until it is given or learned from a first response. */
+    get dimension() {
+        return this._dimension ?? NaN;
+    }
+    /** Number of texts whose vectors are cached for the synchronous `encode`. */
+    get cacheSize() {
+        return this._cache.size;
+    }
+    /** Forget every cached vector. */
+    clearCache() {
+        this._cache.clear();
+    }
+    /**
+     * Fetch (and cache) the vectors for `texts`, so the synchronous `encode` /
+     * `encodeBatch` can serve them. Texts already cached are not requested again.
+     * More distinct texts than `maxCacheEntries` evicts the oldest.
+     */
+    async prefetch(texts) {
+        await this.encodeBatchAsync(texts);
+    }
+    /** Fetch one vector (served from the cache when present). */
+    async encodeAsync(text) {
+        return (await this.encodeBatchAsync([text]))[0];
+    }
+    /** Fetch vectors for many texts, in order; only uncached texts hit the network. */
+    async encodeBatchAsync(texts) {
+        const found = new Map();
+        const missing = new Set();
+        for (const text of texts) {
+            if (found.has(text) || missing.has(text))
+                continue;
+            const hit = this._cache.get(text);
+            if (hit)
+                found.set(text, hit);
+            else
+                missing.add(text);
+        }
+        const pending = [...missing];
+        for (let start = 0; start < pending.length; start += this._batchSize) {
+            const chunk = pending.slice(start, start + this._batchSize);
+            const vectors = await this._request(chunk);
+            chunk.forEach((text, i) => {
+                found.set(text, vectors[i]);
+                this._remember(text, vectors[i]);
+            });
+        }
+        return texts.map(text => found.get(text).slice());
+    }
+    /** Synchronous: serves a prefetched text, otherwise throws HttpEncoderError. */
+    encode(text) {
+        const hit = this._cache.get(text);
+        if (!hit) {
+            throw new HttpEncoderError('HttpEncoder.encode is synchronous and this text was not fetched yet: ' +
+                'await encoder.prefetch([...texts]) (or encodeAsync) first');
+        }
+        return hit.slice();
+    }
+    /** Synchronous: serves prefetched texts, otherwise throws HttpEncoderError. */
+    encodeBatch(texts) {
+        return texts.map(text => this.encode(text));
+    }
+    _remember(text, vector) {
+        this._cache.delete(text);
+        this._cache.set(text, vector);
+        while (this._cache.size > this._maxCache) {
+            const oldest = this._cache.keys().next().value;
+            this._cache.delete(oldest);
+        }
+    }
+    _fail(message, status) {
+        return new HttpEncoderError(this._redact(message), status);
+    }
+    /** One POST (with bounded retries) for at most `batchSize` texts. */
+    async _request(texts) {
+        const body = JSON.stringify({ model: this.modelName, input: texts });
+        for (let attempt = 0;; attempt++) {
+            const retriable = attempt < this._maxRetries;
+            let status = 0;
+            let retryAfter = null;
+            let text = '';
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), this._timeoutMs);
+            try {
+                const res = await this._fetch(this._url, {
+                    method: 'POST',
+                    headers: this._buildHeaders(),
+                    body,
+                    signal: controller.signal,
+                });
+                status = res.status;
+                retryAfter = res.headers.get('retry-after');
+                text = await res.text();
+            }
+            catch (err) {
+                const timedOut = controller.signal.aborted;
+                if (retriable) {
+                    await this._sleep(this._backoff(attempt, null));
+                    continue;
+                }
+                throw this._fail(timedOut
+                    ? `request to ${this._safeUrl} timed out after ${this._timeoutMs} ms`
+                    : `request to ${this._safeUrl} failed: ${err?.message ?? String(err)}`);
+            }
+            finally {
+                clearTimeout(timer);
+            }
+            if (status >= 200 && status < 300)
+                return this._parse(text, texts.length);
+            if ((status === 429 || status >= 500) && retriable) {
+                await this._sleep(this._backoff(attempt, retryAfter));
+                continue;
+            }
+            const snippet = text.trim().slice(0, ERROR_SNIPPET_CHARS);
+            throw this._fail(`embedding request to ${this._safeUrl} failed with HTTP ${status}` + (snippet ? `: ${snippet}` : ''), status);
+        }
+    }
+    _backoff(attempt, retryAfter) {
+        const seconds = retryAfter === null ? NaN : Number(retryAfter);
+        if (Number.isFinite(seconds) && seconds >= 0)
+            return Math.min(seconds * 1000, MAX_RETRY_WAIT_MS);
+        return Math.min(this._retryDelayMs * 2 ** attempt, MAX_RETRY_WAIT_MS);
+    }
+    _sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+    _parse(text, expected) {
+        let json;
+        try {
+            json = JSON.parse(text);
+        }
+        catch {
+            throw this._fail(`${this._safeUrl} did not return JSON`);
+        }
+        let vectors;
+        if (this._api === 'ollama') {
+            if (!json || !Array.isArray(json.embeddings)) {
+                throw this._fail(`${this._safeUrl} answer has no 'embeddings' array (is api: 'ollama' right?)`);
+            }
+            vectors = json.embeddings;
+        }
+        else {
+            if (!json || !Array.isArray(json.data)) {
+                throw this._fail(`${this._safeUrl} answer has no 'data' array (is api: 'openai' right?)`);
+            }
+            const items = json.data;
+            const ordered = items.every(item => item && typeof item.index === 'number')
+                ? [...items].sort((a, b) => a.index - b.index)
+                : items;
+            vectors = ordered.map(item => item && item.embedding);
+        }
+        if (vectors.length !== expected) {
+            throw this._fail(`${this._safeUrl} returned ${vectors.length} embeddings for ${expected} texts`);
+        }
+        return vectors.map((vector, i) => {
+            if (!Array.isArray(vector) || vector.length === 0 || !vector.every(v => typeof v === 'number' && Number.isFinite(v))) {
+                throw this._fail(`${this._safeUrl} embedding ${i} is not a non-empty array of numbers`);
+            }
+            if (this._dimension === null)
+                this._dimension = vector.length;
+            else if (vector.length !== this._dimension) {
+                throw new DimensionMismatchError(`${this.modelName} returned ${vector.length} dimensions, expected ${this._dimension}`);
+            }
+            return vector;
+        });
+    }
+}
 /**
  * Keep the best `k` results without ordering all of them.
  *
