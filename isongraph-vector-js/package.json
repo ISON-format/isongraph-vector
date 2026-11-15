@@ -5,12 +5,14 @@
   "main": "src/index.js",
   "exports": {
     ".": "./src/index.js",
-    "./sqlite": "./src/sqlite-store.js"
+    "./sqlite": "./src/sqlite-store.js",
+    "./node": "./src/node.js"
   },
   "type": "module",
   "files": [
     "src/index.js",
     "src/sqlite-store.js",
+    "src/node.js",
     "README.md",
     "LICENSE"
   ],

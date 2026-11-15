@@ -17,7 +17,7 @@
  * @version 1.0.0
  */
 
-import { ISONGraph, Node, NodeRef, Direction } from 'ison-graph-ts';
+import { ISONGraph, Node, NodeRef, Edge, Direction } from 'ison-graph-ts';
 
 export const VERSION = "1.0.0";
 
@@ -27,6 +27,23 @@ export const VERSION = "1.0.0";
  */
 export const EMBEDDING_FORMAT = "ison-embeddings";
 export const EMBEDDING_FORMAT_VERSION = 1;
+
+/** Suffix appended to a graph path to locate its embeddings (see `./node`). */
+export const EMBEDDING_SIDECAR_SUFFIX = ".embeddings.json";
+
+/**
+ * Name of the serialization {@link graphDigest} hashes. Written next to the
+ * digest so a reader that computes a different digest (or none) can tell it is
+ * not comparable and skip the check instead of reporting a false mismatch.
+ */
+export const GRAPH_DIGEST_BASIS = "nodes-edges-json-v1";
+
+/**
+ * Model names that carry no information about which encoder made a vector:
+ * "provided" (vector handed in, store has no encoder) and "unknown" (sidecars
+ * from ports that do not record a model).
+ */
+export const UNKNOWN_MODELS: ReadonlySet<string> = new Set(["unknown", "provided"]);
 
 // =============================================================================
 // Errors
@@ -62,12 +79,51 @@ export class NoEncoderError extends EmbeddingError {
   }
 }
 
+/**
+ * A text query was encoded by a different model than the stored vectors.
+ *
+ * Two models of the same dimension give a plausible-looking cosine score
+ * between vectors that live in unrelated spaces, so the ranking is noise
+ * rather than an error. Thrown only with `onModelMismatch: 'error'`; the
+ * default is a warning.
+ */
+export class ModelMismatchError extends EmbeddingError {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ModelMismatchError';
+  }
+}
+
+/**
+ * A graph file and its embeddings sidecar are not from the same save.
+ *
+ * Thrown by `loadGraph` (from `./node`) when the sidecar's recorded
+ * `graph_digest` does not match the graph that was read - the sidecar came from
+ * a different save, or the graph file was edited afterwards.
+ */
+export class GraphEmbeddingMismatchError extends EmbeddingError {
+  constructor(message: string) {
+    super(message);
+    this.name = 'GraphEmbeddingMismatchError';
+  }
+}
+
 // =============================================================================
 // Embedding Encoder Interface
 // =============================================================================
 
+/**
+ * Anything that turns text into vectors.
+ *
+ * Two optional pieces of metadata are recorded by the store: `modelName`
+ * (stamped on every vector the encoder writes; decides whether stored vectors
+ * are *stale* for this encoder) and `version` (a free-form string, e.g. a model
+ * revision or weights hash, written to the sidecar).
+ */
 export interface EmbeddingEncoder {
   readonly dimension: number;
+  modelName?: string;
+  version?: string;
   encode(text: string): number[];
   encodeBatch(texts: string[]): number[][];
 }
@@ -97,11 +153,19 @@ export class MockEncoder implements EmbeddingEncoder {
 
   private _dimension: number;
 
-  constructor(dimension: number = 384) {
+  /** `mock-<dimension>`; vectors it writes are stamped with this model. */
+  modelName: string;
+
+  /** Optional free-form version, recorded in the sidecar. */
+  version?: string;
+
+  constructor(dimension: number = 384, version?: string) {
     if (!Number.isInteger(dimension) || dimension <= 0) {
       throw new EmbeddingError(`dimension must be a positive integer, got ${dimension}`);
     }
     this._dimension = dimension;
+    this.modelName = `mock-${dimension}`;
+    if (version !== undefined) this.version = version;
   }
 
   get dimension(): number {
@@ -175,6 +239,8 @@ export interface EmbeddingRecord {
   nodeRef: NodeRef;
   vector: number[];
   text: string;
+  /** Name of the model that produced the vector ("provided"/"unknown" if not known). */
+  model: string;
 }
 
 export interface SimilarityResult {
@@ -189,16 +255,70 @@ export interface ExportedEmbedding {
   id: number | string;
   id_type: 'int' | 'str';
   text: string;
+  /** Model that made the vector; readers default a missing value to "unknown". */
+  model?: string;
   vector: number[];
 }
 
-/** Payload written by exportEmbeddings, readable by every language port. */
+/**
+ * Payload written by exportEmbeddings, readable by every language port.
+ *
+ * Version 1 of the payload is unchanged; the optional metadata after
+ * `embeddings` is appended as flat top-level fields, which readers that do not
+ * know them ignore.
+ */
 export interface ExportedEmbeddings {
   format: string;
   version: number;
   dimension: number | null;
   count: number;
   embeddings: ExportedEmbedding[];
+  /** The encoder's `modelName`, when it has one. */
+  encoder_model?: string;
+  /** The store/encoder `version`, when known. */
+  encoder_version?: string;
+  /** Digest of the graph this sidecar was saved with (see graphDigest). */
+  graph_digest?: string;
+  /** Serialization the digest was taken over (GRAPH_DIGEST_BASIS). */
+  graph_digest_basis?: string;
+}
+
+/** Metadata fields of an imported sidecar that the store remembers. */
+export interface ImportMeta {
+  encoder_model?: string;
+  encoder_version?: string;
+  graph_digest?: string;
+  graph_digest_basis?: string;
+}
+
+/** What a text query does when the encoder's model is not the stored vectors' model. */
+export type ModelMismatchMode = 'warn' | 'error' | 'ignore';
+
+/** Options for EmbeddingStore beyond its encoder. */
+export interface EmbeddingStoreOptions {
+  /**
+   * Free-form version of the encoder/model that made these vectors, recorded
+   * in the sidecar. Falls back to the encoder's own `version`.
+   */
+  version?: string;
+  /**
+   * What a *text* query does when the encoder's `modelName` differs from the
+   * model that produced the stored vectors: 'warn' (default; once per distinct
+   * pair per store), 'error' (throw ModelMismatchError) or 'ignore'. Vectors
+   * whose model is "unknown"/"provided" never trigger it, and vector queries
+   * are never checked.
+   */
+  onModelMismatch?: ModelMismatchMode;
+}
+
+/** Options for EmbeddingStore.stale, all optional. */
+export interface StaleOptions {
+  /** Model to compare against (default: the encoder's modelName). */
+  model?: string | null;
+  /** Dimension to compare against (default: the encoder's dimension). */
+  dimension?: number | null;
+  /** Also count vectors recorded as "unknown"/"provided". */
+  includeUnknown?: boolean;
 }
 
 /**
@@ -234,9 +354,17 @@ export class EmbeddingStore {
   private _embeddings: Map<string, EmbeddingRecord> = new Map();
   private _encoder: EmbeddingEncoder | null;
   private _dimension: number | null = null;
+  private _version: string | null;
+  private _onModelMismatch: ModelMismatchMode = 'warn';
+  private _warnedMismatch: Set<string> = new Set();
 
-  constructor(encoder?: EmbeddingEncoder) {
+  /** Metadata of the most recent imported sidecar (empty before any). */
+  lastImportMeta: ImportMeta = {};
+
+  constructor(encoder?: EmbeddingEncoder, options: EmbeddingStoreOptions = {}) {
     this._encoder = encoder || null;
+    this._version = options.version ?? null;
+    this.onModelMismatch = options.onModelMismatch ?? 'warn';
   }
 
   get encoder(): EmbeddingEncoder | null {
@@ -250,6 +378,31 @@ export class EmbeddingStore {
   /** Vector length this store holds, or null while it is still empty. */
   get dimension(): number | null {
     return this._dimension;
+  }
+
+  /** Encoder/model version recorded in the sidecar, or null if unknown. */
+  get version(): string | null {
+    if (this._version !== null) return this._version;
+    const fromEncoder = this._encoder?.version;
+    return fromEncoder === undefined || fromEncoder === null ? null : fromEncoder;
+  }
+
+  set version(value: string | null) {
+    this._version = value;
+  }
+
+  /** How a text query reacts to vectors from another model (see EmbeddingStoreOptions). */
+  get onModelMismatch(): ModelMismatchMode {
+    return this._onModelMismatch;
+  }
+
+  set onModelMismatch(mode: ModelMismatchMode) {
+    if (mode !== 'warn' && mode !== 'error' && mode !== 'ignore') {
+      throw new EmbeddingError(
+        `onModelMismatch must be 'warn', 'error' or 'ignore', got ${JSON.stringify(mode)}`
+      );
+    }
+    this._onModelMismatch = mode;
   }
 
   private _nodeRefToKey(ref: NodeRef): string {
@@ -293,6 +446,7 @@ export class EmbeddingStore {
       if (!this._encoder) {
         throw new NoEncoderError("No encoder provided for text query");
       }
+      this._checkModelCompat();
       vector = this._encoder.encode(query);
     } else {
       vector = query;
@@ -308,6 +462,98 @@ export class EmbeddingStore {
     return vector;
   }
 
+  /** Model recorded on vectors written now: the encoder's, or "provided"/"unknown". */
+  private _modelName(): string {
+    if (!this._encoder) return 'provided';
+    return this._encoder.modelName || 'unknown';
+  }
+
+  /** The encoder's model, or null when it has none (or an uninformative one). */
+  private _currentModel(): string | null {
+    const name = this._encoder?.modelName;
+    return name && !UNKNOWN_MODELS.has(name) ? name : null;
+  }
+
+  /**
+   * Which models produced the stored vectors: `{ modelName: count }`.
+   *
+   * "unknown" / "provided" appear as-is (vectors imported from a port that
+   * records no model, or handed in with no encoder attached).
+   */
+  models(): Record<string, number> {
+    const counts = new Map<string, number>();
+    for (const record of this._embeddings.values()) {
+      counts.set(record.model, (counts.get(record.model) ?? 0) + 1);
+    }
+    return Object.fromEntries(counts);
+  }
+
+  /** Complain when a text query's encoder is not the stored vectors' model. */
+  private _checkModelCompat(): void {
+    if (this._onModelMismatch === 'ignore') return;
+    const current = this._currentModel();
+    if (current === null) return;
+    const foreign = Object.keys(this.models())
+      .filter(m => !UNKNOWN_MODELS.has(m) && m !== current)
+      .sort();
+    if (foreign.length === 0) return;
+
+    const message =
+      `encoder model '${current}' differs from the model that produced the ` +
+      `stored vectors (${foreign.map(m => `'${m}'`).join(', ')}); ` +
+      `scores compare vectors from different spaces. Re-embed with ` +
+      `reembedStale() or search with the original encoder.`;
+    if (this._onModelMismatch === 'error') throw new ModelMismatchError(message);
+
+    const key = JSON.stringify([current, foreign]);
+    if (!this._warnedMismatch.has(key)) {
+      this._warnedMismatch.add(key);
+      if (typeof console !== 'undefined') console.warn(message);
+    }
+  }
+
+  /**
+   * Node refs whose stored vector does not belong to the current encoder.
+   *
+   * A vector is stale when its recorded model differs from `model` (default:
+   * the encoder's `modelName`) or its length differs from `dimension`
+   * (default: the encoder's `dimension`). Vectors whose model is
+   * "unknown"/"provided" cannot be judged by model and are skipped unless
+   * `includeUnknown` is true (a dimension mismatch still counts). With no
+   * encoder and no arguments nothing can be judged and the result is empty.
+   *
+   * Takes either the positional form or an options object.
+   */
+  stale(
+    modelOrOptions?: string | null | StaleOptions,
+    dimensionArg?: number | null,
+    includeUnknownArg: boolean = false
+  ): NodeRef[] {
+    const options: StaleOptions =
+      modelOrOptions !== null && typeof modelOrOptions === 'object'
+        ? modelOrOptions
+        : { model: modelOrOptions, dimension: dimensionArg, includeUnknown: includeUnknownArg };
+
+    const model = options.model ?? this._currentModel();
+    let dimension = options.dimension ?? null;
+    if (dimension === null && this._encoder) {
+      const d = Number(this._encoder.dimension);
+      dimension = Number.isFinite(d) ? Math.trunc(d) : null;
+    }
+    const includeUnknown = options.includeUnknown ?? false;
+
+    const out: NodeRef[] = [];
+    for (const record of this._embeddings.values()) {
+      const byModel =
+        model !== null &&
+        record.model !== model &&
+        (includeUnknown || !UNKNOWN_MODELS.has(record.model));
+      const byDim = dimension !== null && record.vector.length !== dimension;
+      if (byModel || byDim) out.push(record.nodeRef);
+    }
+    return out;
+  }
+
   add(nodeRef: NodeRef, text: string, vector?: number[]): string {
     if (vector === undefined) {
       if (!this._encoder) {
@@ -318,7 +564,7 @@ export class EmbeddingStore {
     this._checkDimension(vector, "vector");
 
     const key = this._nodeRefToKey(nodeRef);
-    this._embeddings.set(key, { id: key, nodeRef, vector, text });
+    this._embeddings.set(key, { id: key, nodeRef, vector, text, model: this._modelName() });
     return key;
   }
 
@@ -405,13 +651,28 @@ export class EmbeddingStore {
     return this._embeddings.size;
   }
 
-  clear(): void {
+  /**
+   * Clear all embeddings.
+   *
+   * @param resetDimension Also forget the pinned vector length, so the next
+   *   vector may have a different one (switching to an encoder of a different
+   *   dimension). Off by default: a store normally refuses vectors of the
+   *   wrong length even when empty.
+   */
+  clear(resetDimension: boolean = false): void {
     this._embeddings.clear();
-    this._dimension = null;
+    if (resetDimension) this._dimension = null;
   }
 
-  /** Serialize every embedding into the portable cross-language payload. */
-  exportEmbeddings(): ExportedEmbeddings {
+  /**
+   * Serialize every embedding into the portable cross-language payload.
+   *
+   * Beyond the version-1 fields it appends, when known: `encoder_model` (the
+   * encoder's modelName), `encoder_version` (this store's `version`) and, when
+   * `graphDigest` is given, `graph_digest` plus `graph_digest_basis`. Absent
+   * values are omitted, not written as null.
+   */
+  exportEmbeddings(graphDigest?: string | null): ExportedEmbeddings {
     const embeddings: ExportedEmbedding[] = [];
     for (const record of this._embeddings.values()) {
       embeddings.push({
@@ -419,16 +680,26 @@ export class EmbeddingStore {
         id: record.nodeRef[1],
         id_type: typeof record.nodeRef[1] === 'number' ? 'int' : 'str',
         text: record.text,
+        model: record.model,
         vector: record.vector,
       });
     }
-    return {
+    const payload: ExportedEmbeddings = {
       format: EMBEDDING_FORMAT,
       version: EMBEDDING_FORMAT_VERSION,
       dimension: this._dimension,
       count: embeddings.length,
       embeddings,
     };
+    const encoderModel = this._currentModel();
+    if (encoderModel !== null) payload.encoder_model = encoderModel;
+    const version = this.version;
+    if (version !== null) payload.encoder_version = String(version);
+    if (graphDigest !== undefined && graphDigest !== null) {
+      payload.graph_digest = graphDigest;
+      payload.graph_digest_basis = GRAPH_DIGEST_BASIS;
+    }
+    return payload;
   }
 
   /** Load a payload produced by exportEmbeddings (in any language port). */
@@ -444,16 +715,217 @@ export class EmbeddingStore {
         `(this build reads version ${EMBEDDING_FORMAT_VERSION})`
       );
     }
-    if (replace) this.clear();
+
+    const meta: ImportMeta = {};
+    for (const key of ['encoder_model', 'encoder_version', 'graph_digest', 'graph_digest_basis'] as const) {
+      if (payload[key] !== undefined && payload[key] !== null) meta[key] = payload[key];
+    }
+    this.lastImportMeta = meta;
+
+    if (replace) {
+      this.clear();
+      this._dimension = payload.dimension ?? null;
+    }
 
     let written = 0;
     for (const item of payload.embeddings || []) {
       const id = item.id_type === 'int' ? Number(item.id) : item.id;
-      this.add([item.type, id] as NodeRef, item.text ?? '', item.vector);
+      const ref = [item.type, id] as NodeRef;
+      this._checkDimension(item.vector, `embedding for :${item.type}:${id}`);
+      const key = this._nodeRefToKey(ref);
+      this._embeddings.set(key, {
+        id: key,
+        nodeRef: ref,
+        vector: item.vector,
+        text: item.text ?? '',
+        model: item.model ?? 'unknown',
+      });
       written++;
     }
     return written;
   }
+}
+
+// =============================================================================
+// Graph digest
+// =============================================================================
+
+/** SHA-256 of an ASCII string, as lowercase hex. Pure JS so the core stays browser-safe. */
+function sha256Hex(ascii: string): string {
+  const primes: number[] = [];
+  for (let n = 2; primes.length < 64; n++) {
+    if (primes.every(p => n % p !== 0)) primes.push(n);
+  }
+  const frac32 = (x: number): number => Math.floor((x - Math.floor(x)) * 4294967296) >>> 0;
+  const K = primes.map(p => frac32(Math.cbrt(p)));
+  const H = primes.slice(0, 8).map(p => frac32(Math.sqrt(p)));
+
+  const bytes: number[] = [];
+  for (let i = 0; i < ascii.length; i++) bytes.push(ascii.charCodeAt(i) & 0xff);
+  const bitLength = bytes.length * 8;
+  bytes.push(0x80);
+  while (bytes.length % 64 !== 56) bytes.push(0);
+  const high = Math.floor(bitLength / 4294967296);
+  const low = bitLength >>> 0;
+  for (const word of [high, low]) {
+    bytes.push((word >>> 24) & 0xff, (word >>> 16) & 0xff, (word >>> 8) & 0xff, word & 0xff);
+  }
+
+  const rotr = (x: number, n: number): number => (x >>> n) | (x << (32 - n));
+  const w = new Array<number>(64);
+  for (let offset = 0; offset < bytes.length; offset += 64) {
+    for (let i = 0; i < 16; i++) {
+      const j = offset + i * 4;
+      w[i] = ((bytes[j] << 24) | (bytes[j + 1] << 16) | (bytes[j + 2] << 8) | bytes[j + 3]) | 0;
+    }
+    for (let i = 16; i < 64; i++) {
+      const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+      const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0;
+    }
+    let [a, b, c, d, e, f, g, h] = H;
+    for (let i = 0; i < 64; i++) {
+      const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+      const ch = (e & f) ^ (~e & g);
+      const t1 = (h + S1 + ch + K[i] + w[i]) | 0;
+      const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+      const maj = (a & b) ^ (a & c) ^ (b & c);
+      const t2 = (S0 + maj) | 0;
+      h = g; g = f; f = e; e = (d + t1) | 0;
+      d = c; c = b; b = a; a = (t1 + t2) | 0;
+    }
+    const sums = [a, b, c, d, e, f, g, h];
+    for (let i = 0; i < 8; i++) H[i] = (H[i] + sums[i]) | 0;
+  }
+  return H.map(x => (x >>> 0).toString(16).padStart(8, '0')).join('');
+}
+
+/** Compare strings by code point, as Python does (JS `<` compares UTF-16 code units). */
+function compareCodePoints(a: string, b: string): number {
+  if (a === b) return 0;
+  const A = Array.from(a);
+  const B = Array.from(b);
+  const n = Math.min(A.length, B.length);
+  for (let i = 0; i < n; i++) {
+    const x = A[i].codePointAt(0)!;
+    const y = B[i].codePointAt(0)!;
+    if (x !== y) return x < y ? -1 : 1;
+  }
+  return A.length - B.length;
+}
+
+/** Python `repr(float)` for a non-integral (or non-finite) JS number. */
+function pythonFloatRepr(x: number): string {
+  if (Number.isNaN(x)) return 'NaN';
+  if (x === Infinity) return 'Infinity';
+  if (x === -Infinity) return '-Infinity';
+  if (x === 0) return Object.is(x, -0) ? '-0.0' : '0.0';
+  // toExponential() with no argument yields the shortest digits that round-trip,
+  // the same digits Python's repr picks; only the layout differs.
+  const m = /^(-?)(\d)(?:\.(\d+))?e([+-]\d+)$/.exec(x.toExponential())!;
+  const sign = m[1];
+  const digits = m[2] + (m[3] ?? '');
+  const e = parseInt(m[4], 10);
+  if (e < -4 || e >= 16) {
+    const mantissa = digits.length > 1 ? `${digits[0]}.${digits.slice(1)}` : digits;
+    const abs = Math.abs(e);
+    return `${sign}${mantissa}e${e < 0 ? '-' : '+'}${abs < 10 ? '0' + abs : abs}`;
+  }
+  if (e >= 0) {
+    if (digits.length <= e + 1) return `${sign}${digits}${'0'.repeat(e + 1 - digits.length)}.0`;
+    return `${sign}${digits.slice(0, e + 1)}.${digits.slice(e + 1)}`;
+  }
+  return `${sign}0.${'0'.repeat(-e - 1)}${digits}`;
+}
+
+/** Python `json.dumps(str, ensure_ascii=True)`. */
+function pythonJsonString(s: string): string {
+  let out = '"';
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 0x22) out += '\\"';
+    else if (c === 0x5c) out += '\\\\';
+    else if (c === 0x0a) out += '\\n';
+    else if (c === 0x0d) out += '\\r';
+    else if (c === 0x09) out += '\\t';
+    else if (c === 0x08) out += '\\b';
+    else if (c === 0x0c) out += '\\f';
+    else if (c < 0x20 || c > 0x7e) out += '\\u' + c.toString(16).padStart(4, '0');
+    else out += s[i];
+  }
+  return out + '"';
+}
+
+/**
+ * Python `json.dumps(obj, sort_keys=True, separators=(',', ':'), ensure_ascii=True,
+ * default=str)` for the value shapes a graph holds.
+ *
+ * A JS number with an integral value is written as a Python int (a graph read
+ * back from ISON text cannot tell `1` from `1.0`, and Python reads an integral
+ * literal without a decimal point as an int); anything else as Python's float
+ * repr.
+ */
+function canonicalJson(value: unknown): string {
+  if (value === null || value === undefined) return 'null';
+  switch (typeof value) {
+    case 'boolean':
+      return value ? 'true' : 'false';
+    case 'number':
+      return Number.isInteger(value) && !Object.is(value, -0)
+        ? BigInt(value).toString()
+        : pythonFloatRepr(value);
+    case 'bigint':
+      return value.toString();
+    case 'string':
+      return pythonJsonString(value);
+    case 'object': {
+      if (Array.isArray(value)) return '[' + value.map(canonicalJson).join(',') + ']';
+      const record = value as Record<string, unknown>;
+      const keys = Object.keys(record).sort(compareCodePoints);
+      return '{' + keys.map(k => pythonJsonString(k) + ':' + canonicalJson(record[k])).join(',') + '}';
+    }
+    default:
+      return pythonJsonString(String(value));
+  }
+}
+
+/**
+ * Content digest of a graph's nodes and edges: `"sha256:<hex>"`.
+ *
+ * Hashes a canonical JSON rendering ({@link GRAPH_DIGEST_BASIS}): the
+ * `directed` flag, every node as `[type, id-kind, id, properties]` and every
+ * edge as `[relType, source, target, properties]`, each list sorted and every
+ * object key-sorted. The same graph therefore hashes the same regardless of
+ * insertion order. The graph *name* is excluded (it is derived from the file
+ * name on load), and so are embeddings. Reproduces the Python port's
+ * `graph_digest` exactly - see the golden fixture in `tests/fixtures`.
+ *
+ * Limit: a JS number cannot tell `1` from `1.0`, so an integral float written
+ * by another port (`1.0`) digests as the int `1`; and an integer beyond 2^53
+ * digests as the double it parsed to. `loadGraph` treats a mismatch on a file
+ * containing such a literal as unverifiable rather than as an error.
+ */
+export function graphDigest(graph: ISONGraph): string {
+  const refKey = (ref: NodeRef): unknown[] => {
+    const id = ref[1];
+    const isInt = typeof id === 'number' && Number.isInteger(id);
+    return [ref[0], isInt ? 'i' : 's', isInt ? BigInt(id).toString() : String(id)];
+  };
+
+  const nodes: string[] = [];
+  for (const node of graph.nodes()) {
+    nodes.push(canonicalJson([refKey(node.ref), node.properties]));
+  }
+  const edges: string[] = [];
+  for (const edge of graph.edges()) {
+    edges.push(canonicalJson([edge.relType, refKey(edge.source), refKey(edge.target), edge.properties]));
+  }
+  nodes.sort();
+  edges.sort();
+  const body =
+    `{"directed":${graph.directed ? 'true' : 'false'},"edges":[${edges.join(',')}],` +
+    `"nodes":[${nodes.join(',')}]}`;
+  return 'sha256:' + sha256Hex(body);
 }
 
 // =============================================================================
@@ -478,10 +950,39 @@ export interface SemanticGraphOptions {
   encoder?: EmbeddingEncoder;
   autoEmbed?: boolean;
   embedFields?: string[];
+  /**
+   * Encoder/model version recorded in the sidecar (default: the encoder's own
+   * `version`, if any).
+   */
+  version?: string;
+  /**
+   * What a text search does when the encoder's model differs from the stored
+   * vectors' model: 'warn' (default), 'error' or 'ignore'. See
+   * EmbeddingStoreOptions.
+   */
+  onModelMismatch?: ModelMismatchMode;
+}
+
+/** Node filtering shared by the search methods. */
+export interface NodeFilterOptions {
+  /** Predicate on a node; only nodes for which it returns truthy pass. */
+  nodeFilter?: (node: Node) => boolean;
+  /**
+   * Node types allowed (a type name, or an array). An empty array passes
+   * nothing. Combines with `nodeFilter` by AND.
+   */
+  nodeTypes?: string | string[];
+  /**
+   * Make the filter a hard wall for traversal too: a failing node is never
+   * entered, so every node on every returned path passes. Without it a failing
+   * node can still be walked *through* (it costs a hop and its decay but is
+   * never returned).
+   */
+  strictFilter?: boolean;
 }
 
 /** Options for semanticMultiHop, all optional. */
-export interface MultiHopOptions {
+export interface MultiHopOptions extends NodeFilterOptions {
   relType?: string;
   maxHops?: number;
   topKSeeds?: number;
@@ -497,6 +998,51 @@ export interface MultiHopOptions {
    * score the same either way.
    */
   blend?: number;
+  /**
+   * Name of an edge property whose numeric value multiplies the decay of every
+   * hop that crosses that edge (clamped to [0, 1]; a missing, non-numeric,
+   * boolean or NaN value counts as 1, so partly-weighted graphs work). A node
+   * is scored by its *best* route, which with weights can be a longer one than
+   * the fewest-hops route. Undefined (the default) ignores edge properties
+   * entirely.
+   */
+  weightField?: string;
+}
+
+/** Options for semanticPath, all optional. */
+export interface SemanticPathOptions extends NodeFilterOptions {
+  relType?: string;
+  maxHops?: number;
+  topKSeeds?: number;
+  /** Minimum seed similarity. Cosine similarity is signed; lower this to search from any start. */
+  threshold?: number;
+  decay?: number;
+  direction?: Direction;
+}
+
+/** Options for semanticSubgraph: everything semanticMultiHop takes, plus these. */
+export interface SubgraphOptions extends MultiHopOptions {
+  /** Name for the returned graph (default `<name>_subgraph`). */
+  name?: string;
+  /**
+   * Also add connector nodes so the selected nodes fall into as few connected
+   * components as possible (see semanticSubgraph). Default false.
+   */
+  connect?: boolean;
+  /** Longest route, in edges, that may join two components (default 2, minimum 1). */
+  connectMaxHops?: number;
+}
+
+/**
+ * An edge's numeric `weightField` property clamped to [0, 1].
+ *
+ * A missing, non-numeric (including boolean) or NaN value counts as 1, so an
+ * unweighted edge never penalises a hop.
+ */
+function edgeWeight(edge: Edge, weightField: string): number {
+  const value = edge.properties ? edge.properties[weightField] : undefined;
+  if (typeof value !== 'number' || Number.isNaN(value)) return 1.0;
+  return Math.min(1.0, Math.max(0.0, value));
 }
 
 /**
@@ -512,7 +1058,10 @@ export class SemanticGraph extends ISONGraph {
     super(options.name || "semantic_graph", options.directed ?? true);
 
     this._encoder = options.encoder || null;
-    this._embeddingStore = new EmbeddingStore(this._encoder || undefined);
+    this._embeddingStore = new EmbeddingStore(this._encoder || undefined, {
+      version: options.version,
+      onModelMismatch: options.onModelMismatch,
+    });
     this._autoEmbed = options.autoEmbed ?? true;
     this._embedFields = options.embedFields || ['name', 'description', 'content', 'text'];
   }
@@ -613,6 +1162,33 @@ export class SemanticGraph extends ISONGraph {
   }
 
   /**
+   * Update node properties, keeping the embedding in step with them.
+   *
+   * With autoEmbed on, a change to any of the embedFields re-embeds the node
+   * from its new properties, so searches never rank it by text it no longer
+   * carries. If the new properties leave nothing to embed, the stale vector
+   * is dropped. Updates that touch no embed field, and graphs with autoEmbed
+   * off (whose vectors the caller manages), leave the embedding alone. As in
+   * addNode, nothing is re-embedded while no encoder is set.
+   */
+  override updateNode(
+    nodeType: string,
+    nodeId: number | string,
+    properties: Record<string, any>
+  ): Node {
+    const node = super.updateNode(nodeType, nodeId, properties);
+    if (this._autoEmbed && this._embedFields.some(f => f in properties)) {
+      const text = this.embedTextFor(node.properties);
+      if (!text) {
+        this._embeddingStore.remove(node.ref);
+      } else if (this._encoder) {
+        this.embedNode(node.ref, text);
+      }
+    }
+    return node;
+  }
+
+  /**
    * Remove node and its embedding.
    */
   override removeNode(nodeType: string, nodeId: number | string): void {
@@ -622,15 +1198,85 @@ export class SemanticGraph extends ISONGraph {
   }
 
   /**
+   * Build the `ref => boolean` predicate behind `nodeFilter` / `nodeTypes`.
+   *
+   * Returns null when neither is set, so unfiltered calls take exactly the
+   * pre-existing code path. A node passes when its type is in `nodeTypes` (a
+   * bare string means one type; an empty array passes nothing) *and*
+   * `nodeFilter(node)` is truthy. A ref with no node in the graph cannot be
+   * shown to `nodeFilter`, so it fails whenever a `nodeFilter` is set.
+   * Answers are memoized for the one call.
+   */
+  private _nodeGate(
+    nodeFilter?: ((node: Node) => boolean) | null,
+    nodeTypes?: string | string[] | null
+  ): ((ref: NodeRef) => boolean) | null {
+    const hasFilter = nodeFilter !== undefined && nodeFilter !== null;
+    const hasTypes = nodeTypes !== undefined && nodeTypes !== null;
+    if (!hasFilter && !hasTypes) return null;
+
+    const types = hasTypes
+      ? new Set<string>(typeof nodeTypes === 'string' ? [nodeTypes] : nodeTypes)
+      : null;
+    const memo = new Map<string, boolean>();
+
+    return (ref: NodeRef): boolean => {
+      const key = `${ref[0]}:${ref[1]}`;
+      const cached = memo.get(key);
+      if (cached !== undefined) return cached;
+      let ok = types === null || types.has(ref[0]);
+      if (ok && hasFilter) {
+        const node = this._resolveNode(ref);
+        ok = node !== null && Boolean(nodeFilter!(node));
+      }
+      memo.set(key, ok);
+      return ok;
+    };
+  }
+
+  /**
+   * Top-k similarity search among the nodes that pass `gate`.
+   *
+   * With a gate the store cannot truncate first: the best k *unfiltered*
+   * matches may all be filtered out, so every match is scored, filtered, and
+   * only then cut to k.
+   */
+  private _seedSearch(
+    query: string | number[],
+    topK: number | null,
+    nodeType: string | undefined,
+    threshold: number,
+    gate: ((ref: NodeRef) => boolean) | null
+  ): SimilarityResult[] {
+    if (gate === null) {
+      return this._embeddingStore.similaritySearch(query, topK, nodeType, threshold);
+    }
+    const results = this._embeddingStore
+      .similaritySearch(query, null, nodeType, threshold)
+      .filter(r => gate(r.nodeRef));
+    return topK === null ? results : results.slice(0, Math.max(topK, 0));
+  }
+
+  /**
    * Find similar nodes by embedding.
+   *
+   * @param nodeFilter Keep only nodes for which `nodeFilter(node)` is truthy.
+   *   Applied *before* `topK` is taken, so you still get `topK` matching nodes
+   *   when that many exist. An embedding whose node is not in the graph fails
+   *   the filter.
+   * @param nodeTypes Keep only nodes whose type is in this list (a bare string
+   *   means one type). Combines with `nodeType` and `nodeFilter` by AND.
    */
   similaritySearch(
     query: string | number[],
     topK: number | null = 10,
     nodeType?: string,
-    threshold: number = 0.0
+    threshold: number = 0.0,
+    nodeFilter?: (node: Node) => boolean,
+    nodeTypes?: string | string[]
   ): SimilarityResult[] {
-    return this._embeddingStore.similaritySearch(query, topK, nodeType, threshold);
+    const gate = this._nodeGate(nodeFilter, nodeTypes);
+    return this._seedSearch(query, topK, nodeType, threshold, gate);
   }
 
   /**
@@ -662,13 +1308,42 @@ export class SemanticGraph extends ISONGraph {
     }
   }
 
+  /** (neighbor, connecting edge) pairs, in the order `neighbors()` yields. */
+  private _adjacent(
+    nodeRef: NodeRef,
+    relType: string | undefined,
+    direction: Direction
+  ): Array<[NodeRef, Edge]> {
+    const pairs: Array<[NodeRef, Edge]> = [];
+    if (direction === Direction.OUT || direction === Direction.BOTH) {
+      for (const edge of this.edges(relType, nodeRef)) pairs.push([edge.target, edge]);
+    }
+    if (direction === Direction.IN || direction === Direction.BOTH) {
+      for (const edge of this.edges(relType, undefined, nodeRef)) pairs.push([edge.source, edge]);
+    }
+    return pairs;
+  }
+
   /**
    * Semantic multi-hop search.
    *
    * 1. Find top-k similar nodes as seeds (hop 0)
    * 2. Traverse the graph following relationships
-   * 3. Score by max(seedSimilarity, 0) * decay^hopCount, optionally blended
+   * 3. Score by max(seedSimilarity, 0) * product(decay * weight) over the
+   *    hops - `weight` is 1 unless `weightField` is set - optionally blended
    *    with the relevance of each node itself
+   *
+   * Filtering (`nodeFilter` and `nodeTypes` combine with AND):
+   *  - Seeds must pass. The top `topKSeeds` are chosen *among* passing nodes,
+   *    so a filtered-out best match never occupies a seed slot.
+   *  - Only passing nodes are returned.
+   *  - By default a node that fails the filter can still be walked *through*:
+   *    it is not returned, but it still costs a hop and its decay, and a
+   *    returned node's `path` may list it. With `strictFilter` a failing node
+   *    is never entered, so every node on every returned path passes.
+   *
+   * Takes either an options object or the original positional form (new
+   * parameters were appended at the end, so existing callers are unaffected).
    */
   semanticMultiHop(
     query: string | number[],
@@ -679,7 +1354,11 @@ export class SemanticGraph extends ISONGraph {
     directionArg: Direction = Direction.OUT,
     decayArg: number = 0.8,
     thresholdArg: number = 0.3,
-    blendArg: number = 0.0
+    blendArg: number = 0.0,
+    weightFieldArg?: string,
+    nodeFilterArg?: (node: Node) => boolean,
+    nodeTypesArg?: string | string[],
+    strictFilterArg: boolean = false
   ): SemanticSearchResult[] {
     // Accepts either an options object or the original positional form, so
     // existing callers keep working while new ones can name what they mean.
@@ -695,6 +1374,10 @@ export class SemanticGraph extends ISONGraph {
             decay: decayArg,
             threshold: thresholdArg,
             blend: blendArg,
+            weightField: weightFieldArg,
+            nodeFilter: nodeFilterArg,
+            nodeTypes: nodeTypesArg,
+            strictFilter: strictFilterArg,
           };
 
     const {
@@ -706,6 +1389,10 @@ export class SemanticGraph extends ISONGraph {
       decay = 0.8,
       threshold = 0.3,
       blend = 0.0,
+      weightField,
+      nodeFilter,
+      nodeTypes,
+      strictFilter = false,
     } = options;
 
     if (blend < 0 || blend > 1) {
@@ -713,16 +1400,17 @@ export class SemanticGraph extends ISONGraph {
     }
 
     const nodeRefToKey = (ref: NodeRef) => `${ref[0]}:${ref[1]}`;
+    const weighted = weightField !== undefined && weightField !== null;
+    const gate = this._nodeGate(nodeFilter, nodeTypes);
 
-    // One scan serves both seed selection and per-node relevance.
-    const scores = this._embeddingStore.scoreMap(query);
-    if (scores.size === 0) return [];
-
-    const seeds = [...this._embeddingStore.similaritySearch(query, topKSeeds, undefined, threshold)];
+    const seeds = [...this._seedSearch(query, topKSeeds, undefined, threshold, gate)];
     if (seeds.length === 0) return [];
 
+    // Blending needs a score for every node: one scan serves the per-node
+    // relevance that is mixed into each traversal score.
+    const scores = blend > 0 ? this._embeddingStore.scoreMap(query) : null;
     const combined = (base: number, key: string): number =>
-      blend <= 0 ? base : (1 - blend) * base + blend * (scores.get(key) ?? 0);
+      scores === null ? base : (1 - blend) * base + blend * (scores.get(key) ?? 0);
 
     const results = new Map<string, SemanticSearchResult>();
 
@@ -752,41 +1440,70 @@ export class SemanticGraph extends ISONGraph {
         });
       }
 
-      // BFS traversal
-      const queue: Array<{ nodeRef: NodeRef; path: NodeRef[]; hop: number }> = [
-        { nodeRef: seed.nodeRef, path: [seed.nodeRef], hop: 0 },
-      ];
-      const visited = new Set<string>([seedKey]);
+      // Breadth-first traversal. Each node keeps its best decay factor and its
+      // fewest hops *separately*: with edge weights the route with the best
+      // factor is not always the shortest one, and a shorter route must still
+      // be expanded because it has hops left. Without weights the first
+      // (shortest) arrival is both, so this reduces to a visited-set BFS.
+      const bestFactor = new Map<string, number>([[seedKey, 1.0]]);
+      const bestHops = new Map<string, number>([[seedKey, 0]]);
+      const queue: Array<{
+        nodeRef: NodeRef;
+        path: NodeRef[];
+        keys: string[];
+        factor: number;
+        hop: number;
+      }> = [{ nodeRef: seed.nodeRef, path: [seed.nodeRef], keys: [seedKey], factor: 1.0, hop: 0 }];
       let head = 0;
 
       while (head < queue.length) {
-        const { nodeRef, path, hop } = queue[head++];
+        const { nodeRef, path, keys, factor, hop } = queue[head++];
 
         if (hop >= maxHops) continue;
 
-        const neighbors = this.neighbors(nodeRef, relType, direction);
-
-        for (const neighbor of neighbors) {
+        for (const [neighbor, edge] of this._adjacent(nodeRef, relType, direction)) {
           const neighborKey = nodeRefToKey(neighbor);
-          if (visited.has(neighborKey)) continue;
+          if (keys.includes(neighborKey)) continue;
+          if (strictFilter && gate !== null && !gate(neighbor)) continue;
 
-          visited.add(neighborKey);
-          const newPath = [...path, neighbor];
           const newHop = hop + 1;
-          const newScore = combined(traversalBase * Math.pow(decay, newHop), neighborKey);
+          let newFactor: number;
+          if (!weighted) {
+            if (bestHops.has(neighborKey)) continue;
+            // decay ** hops exactly, not a running product, so unweighted
+            // scores are bit-identical to the pre-weight releases.
+            newFactor = Math.pow(decay, newHop);
+          } else {
+            newFactor = factor * decay * edgeWeight(edge, weightField!);
+            const knownFactor = bestFactor.get(neighborKey) ?? -1.0;
+            const knownHops = bestHops.get(neighborKey);
+            if (newFactor <= knownFactor && newHop >= (knownHops ?? newHop + 1)) continue;
+          }
+          bestFactor.set(neighborKey, Math.max(newFactor, bestFactor.get(neighborKey) ?? -1.0));
+          bestHops.set(neighborKey, Math.min(newHop, bestHops.get(neighborKey) ?? newHop));
 
-          const existing = results.get(neighborKey);
-          if (!existing || existing.score < newScore) {
-            results.set(neighborKey, {
-              nodeRef: neighbor,
-              node: this._resolveNode(neighbor),
-              score: newScore,
-              hopCount: newHop,
-              path: newPath,
-            });
+          const newPath = [...path, neighbor];
+          if (gate === null || gate(neighbor)) {
+            const newScore = combined(traversalBase * newFactor, neighborKey);
+            const existing = results.get(neighborKey);
+            if (!existing || existing.score < newScore) {
+              results.set(neighborKey, {
+                nodeRef: neighbor,
+                node: this._resolveNode(neighbor),
+                score: newScore,
+                hopCount: newHop,
+                path: newPath,
+              });
+            }
           }
 
-          queue.push({ nodeRef: neighbor, path: newPath, hop: newHop });
+          queue.push({
+            nodeRef: neighbor,
+            path: newPath,
+            keys: [...keys, neighborKey],
+            factor: newFactor,
+            hop: newHop,
+          });
         }
       }
     }
@@ -796,33 +1513,226 @@ export class SemanticGraph extends ISONGraph {
       .slice(0, topKResults);
   }
 
+  /** Fewest-hops path from `start` to `end` whose every node passes `gate`. */
+  private _gatedShortestPath(
+    start: NodeRef,
+    end: NodeRef,
+    relType: string | undefined,
+    maxHops: number,
+    direction: Direction,
+    gate: (ref: NodeRef) => boolean
+  ): NodeRef[] | null {
+    if (!gate(start) || !gate(end)) return null;
+    const keyOf = (ref: NodeRef) => `${ref[0]}:${ref[1]}`;
+    const endKey = keyOf(end);
+    if (keyOf(start) === endKey) return [start];
+
+    const visited = new Set<string>([keyOf(start)]);
+    const queue: NodeRef[][] = [[start]];
+    let head = 0;
+    while (head < queue.length) {
+      const path = queue[head++];
+      if (path.length - 1 >= maxHops) continue;
+      for (const [neighbor] of this._adjacent(path[path.length - 1], relType, direction)) {
+        const neighborKey = keyOf(neighbor);
+        if (visited.has(neighborKey) || !gate(neighbor)) continue;
+        if (neighborKey === endKey) return [...path, neighbor];
+        visited.add(neighborKey);
+        queue.push([...path, neighbor]);
+      }
+    }
+    return null;
+  }
+
   /**
    * Find semantically-rooted path to a target node.
+   *
+   * Starts from semantically similar nodes and finds the best path to the
+   * target. Takes either an options object in place of `relType` or the
+   * positional form (`direction` and the filter parameters come last).
+   *
+   * Filtering: seeds are chosen among passing nodes, and the *target must
+   * pass* or the result is null. By default the path may run through failing
+   * nodes (it is the fewest-hops path, as without a filter); with
+   * `strictFilter` the path is the fewest-hops path that uses passing nodes
+   * only, which can be longer or not exist.
    */
   semanticPath(
     query: string | number[],
     targetRef: NodeRef,
-    relType?: string,
-    maxHops: number = 5,
-    topKSeeds: number = 3,
-    threshold: number = 0.0,
-    decay: number = 0.9
+    relTypeOrOptions?: string | SemanticPathOptions,
+    maxHopsArg: number = 5,
+    topKSeedsArg: number = 3,
+    thresholdArg: number = 0.0,
+    decayArg: number = 0.9,
+    directionArg: Direction = Direction.OUT,
+    nodeFilterArg?: (node: Node) => boolean,
+    nodeTypesArg?: string | string[],
+    strictFilterArg: boolean = false
   ): SemanticSearchResult | null {
-    const seeds = this.similaritySearch(query, topKSeeds, undefined, threshold);
+    const options: SemanticPathOptions =
+      relTypeOrOptions !== null && typeof relTypeOrOptions === 'object'
+        ? relTypeOrOptions
+        : {
+            relType: relTypeOrOptions,
+            maxHops: maxHopsArg,
+            topKSeeds: topKSeedsArg,
+            threshold: thresholdArg,
+            decay: decayArg,
+            direction: directionArg,
+            nodeFilter: nodeFilterArg,
+            nodeTypes: nodeTypesArg,
+            strictFilter: strictFilterArg,
+          };
+    const {
+      relType,
+      maxHops = 5,
+      topKSeeds = 3,
+      threshold = 0.0,
+      decay = 0.9,
+      direction = Direction.OUT,
+      nodeFilter,
+      nodeTypes,
+      strictFilter = false,
+    } = options;
 
+    const gate = this._nodeGate(nodeFilter, nodeTypes);
+    if (gate !== null && !gate(targetRef)) return null;
+
+    const seeds = this._seedSearch(query, topKSeeds, undefined, threshold, gate);
+
+    // Every seed that reaches the target is a candidate, and the best score
+    // wins: a slightly less similar seed one hop from the target beats a
+    // better seed five hops away. Seeds arrive best-first, so a tie (strict
+    // > below) goes to the more similar one. As in semanticMultiHop, a
+    // negative seed passes no relevance along rather than "decaying" toward
+    // zero and outscoring itself.
+    let best: SemanticSearchResult | null = null;
     for (const seed of seeds) {
-      const path = this.shortestPath(seed.nodeRef, targetRef, relType, maxHops);
-      if (path) {
-        return {
+      let nodes: NodeRef[];
+      if (strictFilter && gate !== null) {
+        const gated = this._gatedShortestPath(
+          seed.nodeRef, targetRef, relType, maxHops, direction, gate);
+        if (gated === null) continue;
+        nodes = gated;
+      } else {
+        const path = this.shortestPath(seed.nodeRef, targetRef, relType, maxHops, direction);
+        if (!path) continue;
+        nodes = path.nodes;
+      }
+      const length = nodes.length - 1;
+      const score = Math.max(seed.score, 0) * Math.pow(decay, length);
+      if (best === null || score > best.score) {
+        best = {
           nodeRef: targetRef,
           node: this._resolveNode(targetRef),
-          score: seed.score * Math.pow(decay, path.length),
-          hopCount: path.length,
-          path: path.nodes,
+          score,
+          hopCount: length,
+          path: nodes,
         };
       }
     }
 
+    return best;
+  }
+
+  /**
+   * Grow `keep` with connector nodes until it is as connected as the hop
+   * budget allows. Returns the connectors added, in order.
+   *
+   * Greedy: each round finds, over all pairs of components, the shortest route
+   * (at most `maxHops` edges, honouring `relType`/`direction`) whose interior
+   * nodes lie outside `keep`, adds its interior, and recomputes components.
+   * Each round merges at least two, so it terminates; it stops when one
+   * component remains or no route fits the budget. `gate` (set for
+   * `strictFilter`) bars failing nodes from serving as connectors.
+   */
+  private _connectComponents(
+    keep: Map<string, NodeRef>,
+    relType: string | undefined,
+    direction: Direction,
+    maxHops: number,
+    gate: ((ref: NodeRef) => boolean) | null
+  ): NodeRef[] {
+    const added: NodeRef[] = [];
+    const keyOf = (ref: NodeRef) => `${ref[0]}:${ref[1]}`;
+    // Same ordering as Python's (type, type(id).__name__, str(id)) tuple.
+    const compareRefs = (a: NodeRef, b: NodeRef): number =>
+      compareCodePoints(String(a[0]), String(b[0])) ||
+      compareCodePoints(typeof a[1] === 'number' ? 'int' : 'str', typeof b[1] === 'number' ? 'int' : 'str') ||
+      compareCodePoints(String(a[1]), String(b[1]));
+
+    while (keep.size > 1) {
+      // Weakly connected components of the induced subgraph.
+      const parent = new Map<string, string>();
+      for (const key of keep.keys()) parent.set(key, key);
+      const find = (key: string): string => {
+        while (parent.get(key) !== key) {
+          const grand = parent.get(parent.get(key)!)!;
+          parent.set(key, grand);
+          key = grand;
+        }
+        return key;
+      };
+      for (const edge of this.edges(relType)) {
+        const s = keyOf(edge.source);
+        const t = keyOf(edge.target);
+        if (keep.has(s) && keep.has(t)) parent.set(find(s), find(t));
+      }
+      const groups = new Map<string, NodeRef[]>();
+      for (const [key, ref] of keep) {
+        const root = find(key);
+        const members = groups.get(root);
+        if (members) members.push(ref);
+        else groups.set(root, [ref]);
+      }
+      if (groups.size <= 1) break;
+
+      const ordered = [...groups.values()]
+        .map(g => g.sort(compareRefs))
+        .sort((a, b) => compareRefs(a[0], b[0]));
+      let bestRoute: NodeRef[] | null = null;
+      for (const members of ordered) {
+        const route = this._shortestLink(members, keep, relType, direction, maxHops, gate);
+        if (route !== null && (bestRoute === null || route.length < bestRoute.length)) {
+          bestRoute = route;
+        }
+      }
+      if (bestRoute === null) break;
+      for (const ref of bestRoute.slice(1, -1)) {
+        keep.set(keyOf(ref), ref);
+        added.push(ref);
+      }
+    }
+    return added;
+  }
+
+  /** Shortest route from any of `members` to a kept node outside them. */
+  private _shortestLink(
+    members: NodeRef[],
+    keep: Map<string, NodeRef>,
+    relType: string | undefined,
+    direction: Direction,
+    maxHops: number,
+    gate: ((ref: NodeRef) => boolean) | null
+  ): NodeRef[] | null {
+    const keyOf = (ref: NodeRef) => `${ref[0]}:${ref[1]}`;
+    const visited = new Set<string>(members.map(keyOf));
+    const queue: NodeRef[][] = members.map(m => [m]);
+    let head = 0;
+    while (head < queue.length) {
+      const path = queue[head++];
+      if (path.length - 1 >= maxHops) continue;
+      for (const [neighbor] of this._adjacent(path[path.length - 1], relType, direction)) {
+        const neighborKey = keyOf(neighbor);
+        if (visited.has(neighborKey)) continue;
+        if (keep.has(neighborKey)) return [...path, neighbor];
+        if (gate !== null && !gate(neighbor)) continue;
+        if (this._resolveNode(neighbor) === null) continue;
+        visited.add(neighborKey);
+        queue.push([...path, neighbor]);
+      }
+    }
     return null;
   }
 
@@ -834,13 +1744,47 @@ export class SemanticGraph extends ISONGraph {
    * the result can be traversed, searched or serialized on its own. This is
    * what makes an ISON graph useful as LLM context: a small, on-topic graph to
    * inject rather than the whole store.
+   *
+   * Takes every semanticMultiHop option (including `weightField`,
+   * `nodeFilter`, `nodeTypes` and `strictFilter`), plus:
+   *  - `name`: name for the returned graph (default `<name>_subgraph`)
+   *  - `connect`: also add *connector* nodes so the selected nodes fall into as
+   *    few connected components as possible. Components are weak (edge
+   *    direction ignored when judging the result), but connector routes honour
+   *    `relType` and `direction`. Each round adds the interior of the shortest
+   *    route between two components (greedy; not a minimum Steiner tree),
+   *    until one component remains or no route fits `connectMaxHops`. Nothing
+   *    but those interior nodes is added, and they are not marked in any way.
+   *  - `connectMaxHops`: longest route, counted in edges, that may join two
+   *    components (default 2: one connector node per join; 3 allows two). A
+   *    direct edge needs no connector (it is already an induced edge). Must be
+   *    at least 1.
+   *
+   * With `connect` the result can hold **more than** `topKResults` nodes:
+   * `topKResults` caps the *selected* nodes, and connectors are extra. Without
+   * `strictFilter` a connector may be a node that fails `nodeFilter` /
+   * `nodeTypes` (it is only a bridge); with it, connectors must pass too.
    */
   semanticSubgraph(
     query: string | number[],
-    options: MultiHopOptions & { name?: string } = {}
+    options: SubgraphOptions = {}
   ): SemanticGraph {
+    const { connect = false, connectMaxHops = 2 } = options;
+    if (connectMaxHops < 1) {
+      throw new EmbeddingError(`connectMaxHops must be >= 1, got ${connectMaxHops}`);
+    }
+
     const results = this.semanticMultiHop(query, options);
-    const keep = new Set(results.map(r => `${r.nodeRef[0]}:${r.nodeRef[1]}`));
+    const keyOf = (ref: NodeRef) => `${ref[0]}:${ref[1]}`;
+    const keep = new Map<string, NodeRef>(results.map(r => [keyOf(r.nodeRef), r.nodeRef]));
+
+    if (connect && keep.size > 0) {
+      const gate = options.strictFilter
+        ? this._nodeGate(options.nodeFilter, options.nodeTypes)
+        : null;
+      this._connectComponents(keep, options.relType, options.direction ?? Direction.OUT,
+        connectMaxHops, gate);
+    }
 
     const sub = new SemanticGraph({
       name: options.name || `${this.name}_subgraph`,
@@ -850,18 +1794,16 @@ export class SemanticGraph extends ISONGraph {
       embedFields: [...this._embedFields],
     });
 
-    for (const result of results) {
-      const node = result.node ?? this._resolveNode(result.nodeRef);
+    for (const ref of keep.values()) {
+      const node = this._resolveNode(ref);
       if (!node) continue;
       sub.addNode(node.type, node.id, node.properties);
-      const record = this._embeddingStore.get(result.nodeRef);
-      if (record) sub.embeddingStore.add(result.nodeRef, record.text, record.vector);
+      const record = this._embeddingStore.get(ref);
+      if (record) sub.embeddingStore.add(ref, record.text, record.vector);
     }
 
     for (const edge of this.edges(options.relType)) {
-      const sourceKey = `${edge.source[0]}:${edge.source[1]}`;
-      const targetKey = `${edge.target[0]}:${edge.target[1]}`;
-      if (keep.has(sourceKey) && keep.has(targetKey)) {
+      if (keep.has(keyOf(edge.source)) && keep.has(keyOf(edge.target))) {
         sub.addEdge(edge.relType, edge.source, edge.target, edge.properties);
       }
     }
@@ -886,6 +1828,91 @@ export class SemanticGraph extends ISONGraph {
     }
 
     return this.embedNodes(batch);
+  }
+
+  /**
+   * Nodes whose stored vector was not made by the current encoder.
+   *
+   * Stale means the vector's recorded model differs from the encoder's
+   * `modelName`, or its length differs from the encoder's `dimension`. Vectors
+   * recorded as "unknown"/"provided" (from ports that store no model, or
+   * supplied without an encoder) cannot be judged by model and are left out
+   * unless `includeUnknown` is true; a dimension mismatch always counts. With
+   * no encoder nothing can be judged and the result is empty.
+   */
+  staleEmbeddings(includeUnknown: boolean = false): NodeRef[] {
+    return this._embeddingStore.stale({ includeUnknown });
+  }
+
+  /**
+   * Re-encode every stale embedding with the current encoder.
+   *
+   * Each vector is rebuilt from the text it was originally embedded from (so
+   * a custom embed text survives); a vector stored with no text falls back to
+   * the node's embed fields. If the encoder's dimension differs from the
+   * store's, every stored vector is stale, so the store is emptied, its pinned
+   * dimension reset, and everything re-embedded.
+   *
+   * @param includeUnknown Also re-embed vectors of unknown provenance
+   * @param batchSize Texts per encoder call
+   * @returns Number of embeddings rewritten
+   */
+  reembedStale(includeUnknown: boolean = false, batchSize: number = 256): number {
+    const stale = this.staleEmbeddings(includeUnknown);
+    if (stale.length === 0) return 0;
+
+    const store = this._embeddingStore;
+    const pairs: Array<[NodeRef, string]> = [];
+    for (const ref of stale) {
+      const record = store.get(ref);
+      if (!record) continue;
+      let text = record.text;
+      if (!text) {
+        const node = this._resolveNode(ref);
+        text = (node ? this.embedTextFor(node.properties) : '') || `${ref[0]}:${ref[1]}`;
+      }
+      pairs.push([ref, text]);
+    }
+
+    const encoder = this._encoder;
+    if (!encoder) throw new NoEncoderError("No encoder provided to re-embed with");
+    if (store.dimension !== null && store.dimension !== encoder.dimension) {
+      store.clear(true);
+    }
+
+    const step = Math.max(1, Math.floor(batchSize));
+    let count = 0;
+    for (let start = 0; start < pairs.length; start += step) {
+      count += this.embedNodes(pairs.slice(start, start + step));
+    }
+    return count;
+  }
+
+  /**
+   * Build a SemanticGraph from a plain ISONGraph (for example one parsed with
+   * ISONGraph.fromIson), copying its nodes and edges.
+   *
+   * Nodes are copied through the base addNode so that nothing is embedded on
+   * the way in: embeddings come from a saved payload, already computed, and
+   * re-deriving them would need an encoder and overwrite what was saved.
+   * This is pure (no I/O), so it is safe in a browser; see
+   * `isongraph-vector-ts/node` for saving and loading files.
+   */
+  static fromISONGraph(base: ISONGraph, options: SemanticGraphOptions = {}): SemanticGraph {
+    const graph = new SemanticGraph({
+      name: base.name,
+      directed: base.directed,
+      ...options,
+    });
+    for (const node of base.nodes()) {
+      ISONGraph.prototype.addNode.call(graph, node.type, node.id, { ...node.properties });
+    }
+    for (const relType of base.edgeTypes()) {
+      for (const edge of base.edges(relType)) {
+        graph.addEdge(edge.relType, edge.source, edge.target, { ...edge.properties });
+      }
+    }
+    return graph;
   }
 
   toString(): string {

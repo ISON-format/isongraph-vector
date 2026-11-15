@@ -298,11 +298,11 @@ export class SqliteEmbeddingStore {
   get(nodeRef: NodeRef): EmbeddingRecord | null {
     const row = this._db
       .prepare(
-        'SELECT id, node_type, node_id, vector, text FROM embeddings ' +
+        'SELECT id, node_type, node_id, vector, text, model FROM embeddings ' +
         'WHERE node_type = ? AND node_id = ?'
       )
       .get(String(nodeRef[0]), String(nodeRef[1])) as
-      | { id: string; node_type: string; node_id: string; vector: Uint8Array; text: string }
+      | { id: string; node_type: string; node_id: string; vector: Uint8Array; text: string; model: string }
       | undefined;
 
     if (!row) return null;
@@ -311,6 +311,7 @@ export class SqliteEmbeddingStore {
       nodeRef: [row.node_type, row.node_id] as NodeRef,
       vector: SqliteEmbeddingStore._unpack(row.vector),
       text: row.text,
+      model: row.model ?? 'unknown',
     };
   }
 
