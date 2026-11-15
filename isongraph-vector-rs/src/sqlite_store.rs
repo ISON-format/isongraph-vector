@@ -422,7 +422,7 @@ impl SqliteEmbeddingStore {
     pub fn get(&self, node_id: &NodeId) -> Result<Option<EmbeddingRecord>, EmbeddingError> {
         self.conn
             .query_row(
-                "SELECT id, node_type, node_id, vector, text FROM embeddings
+                "SELECT id, node_type, node_id, vector, text, model FROM embeddings
                  WHERE node_type = ? AND node_id = ?",
                 params![node_id.node_type, node_id.id],
                 |r| {
@@ -432,6 +432,7 @@ impl SqliteEmbeddingStore {
                         node_id: NodeId::new(&r.get::<_, String>(1)?, &r.get::<_, String>(2)?),
                         vector: Self::unpack(&blob),
                         text: r.get(4)?,
+                        model: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
                     })
                 },
             )
@@ -661,7 +662,7 @@ impl SqliteEmbeddingStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT node_type, node_id, node_id_type, vector, text
+                "SELECT node_type, node_id, node_id_type, vector, text, model
                  FROM embeddings ORDER BY node_type, node_id",
             )
             .map_err(sql_err)?;
@@ -673,6 +674,7 @@ impl SqliteEmbeddingStore {
                     id: EmbeddingId::Str(r.get(1)?),
                     id_type: r.get(2)?,
                     text: r.get(4)?,
+                    model: r.get(5)?,
                     vector: Self::unpack(&blob),
                 })
             })
@@ -685,6 +687,10 @@ impl SqliteEmbeddingStore {
             dimension: self.dimension,
             count: embeddings.len(),
             embeddings,
+            encoder_model: None,
+            encoder_version: None,
+            graph_digest: None,
+            graph_digest_basis: None,
         })
     }
 
@@ -710,12 +716,12 @@ impl SqliteEmbeddingStore {
             self.clear()?;
         }
 
-        let model = "unknown".to_string();
         let mut written = 0;
         for item in &payload.embeddings {
             let node_id = NodeId::new(&item.node_type, item.id.as_string());
             self.check_dimension(&item.vector, "vector")?;
-            self.write_row(&node_id, &item.vector, &item.text, &model, &item.id_type)?;
+            let model = item.model.as_deref().unwrap_or("unknown");
+            self.write_row(&node_id, &item.vector, &item.text, model, &item.id_type)?;
             written += 1;
         }
         Ok(written)

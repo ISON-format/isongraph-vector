@@ -22,6 +22,12 @@ keywords = ["ison", "graph", "embeddings", "semantic", "vector"]
 # before it moved here - this package hadn't been built in a long time.
 ison-graph-rs = { package = "ison-graph", version = "1.4" }
 thiserror = "1.0"
+# The ISON parser ison-graph is built on, named directly so a graph file's id
+# column can be read with its types: the graph digest tells the integer id 1
+# from the string id "1", which ISONGraph itself (string-typed ids) cannot.
+ison-rs = "1.2"
+# SHA-256 for the graph digest recorded in the embeddings sidecar.
+sha2 = "0.10"
 # The portable embedding payload every language port reads and writes, so a
 # store built by one can be searched by another.
 serde = { version = "1.0", features = ["derive"] }

@@ -101,7 +101,18 @@ naming one should not cost you a second dependency.
 
 `ISONGraph` is wrapped by composition rather than inherited from, so the
 underlying graph stays available through `graph()` and `graph_mut()` — which is
-where the edges above are added.
+where the edges above are added. `graph_mut()` sits below the semantic layer
+and does not touch the embeddings, so use `SemanticGraph::update_node` and
+`remove_node` for node changes rather than the same methods on `graph_mut()`.
+
+**Updating a node keeps its embedding honest.** With `auto_embed` on,
+`update_node` re-embeds the node from its merged properties when any embed
+field changed, and drops the vector if no text is left. Updates that touch no
+embed field, and graphs with `auto_embed` off, leave the embedding alone:
+
+```rust
+graph.update_node("person", "1", vec![("name", PropertyValue::String("Alice, now a manager".into()))])?;
+```
 
 ## Beyond a single search
 
@@ -131,9 +142,66 @@ prompt, you serialize the part the question is actually about.
 — no query text, no encoder call — and drops the node itself from the results.
 
 Alongside those: `semantic_path` to reach a specific target from a
-semantically-relevant start, and `embed_all_nodes` to backfill an existing
+semantically-relevant start (every seed that reaches the target is scored as
+`max(seed, 0) * decay^hops` and the best path wins, ties going to the more
+similar seed), and `embed_all_nodes` to backfill an existing
 graph in one batched encoder call. `semantic_multi_hop` keeps the original
 positional form for callers who prefer it over the options struct.
+
+## Filtering, weighting and connecting
+
+These are new methods and option structs; the original signatures are untouched.
+Queries are text or a vector (`impl Into<Query>`: `"text"` or `&vector`).
+
+```rust
+use isongraph_vector_rs::*;
+
+let active = |n: &Node| matches!(n.properties.get("active"), Some(PropertyValue::Bool(true)));
+let found = graph.semantic_multi_hop_search(
+    "who runs the platform team?",
+    &SearchOptions {
+        weight_field: Some("strength"),                     // edge property in [0, 1]
+        filter: NodeFilter::new().types(["person"]).predicate(&active).strict(),
+        ..Default::default()
+    },
+)?;
+```
+
+- **Node filters** (`NodeFilter`: `types`, `predicate`, `strict`; AND semantics)
+  work on `similarity_search_with`, `semantic_multi_hop_search`,
+  `semantic_path_with` and `semantic_subgraph_with`. Seeds must pass and only
+  passing nodes are returned; the filter runs *before* `top_k`, so a
+  filtered-out best match costs no slot. By default a failing node may still be
+  walked *through* (it costs a hop and its decay and may appear in a `path`);
+  `strict()` never enters one. `semantic_path_with` returns `None` for a
+  failing target. A reference with no node in the graph fails any predicate.
+- **Edge weights**: `weight_field` multiplies each hop's decay by the edge's
+  value, clamped to `[0, 1]` (missing, non-numeric, bool or NaN counts as 1.0;
+  0 scores 0 but stays reachable). A node is scored by its best route, which
+  can be longer than the shortest. `None` gives bit-identical unweighted scores.
+- **Connected subgraphs**: `SubgraphOptions { connect: true, connect_max_hops: 2 }`
+  adds connector nodes so the selection falls into as few components as the hop
+  budget allows (greedy, shortest route first; the result may exceed
+  `top_k_results`, and without `strict` a connector may fail the filter).
+  `connect_max_hops < 1` is an `InvalidOption` error.
+
+## Models and stale vectors
+
+Every vector records the model that made it (`EmbeddingEncoder::model_name`,
+`version`; `MockEncoder::with_model_name` / `with_version`). `store.models()`
+counts vectors per model, and `graph.stale_embeddings(include_unknown)` lists
+nodes whose vector came from a different model or width than the current
+encoder; `graph.reembed_stale(include_unknown, batch_size)` rebuilds them from
+their original text (resetting the store if the dimension changed). Vectors
+recorded as `"unknown"` / `"provided"` are never stale by model unless you pass
+`include_unknown`.
+
+A *text* query encoded by a different model than the stored vectors compares
+unrelated spaces, so it is checked: `ModelMismatch::Warn` (default; once per
+model pair per store, readable from `store.warnings()`), `Error`
+(`EmbeddingError::ModelMismatch`) or `Ignore`. Vector queries are never checked.
+`clear_with(reset_dimension)` empties a store without (or with) forgetting its
+pinned width; the original `clear()` still resets it.
 
 ## Storing the vectors
 
@@ -169,6 +237,41 @@ them, which is where a third of the query time used to go. Filtering by node
 type stays exact too: the type is a `vec0` metadata column, so it narrows the
 search rather than filtering its results.
 
+## Saving and loading a graph
+
+The ISON graph format carries nodes and edges only, so `save` writes the
+embeddings to a sidecar next to it, `<path>.embeddings.json`, in the portable
+`ison-embeddings` payload. `load` restores it when present:
+
+```rust
+use isongraph_vector_rs::{MockEncoder, SemanticGraph};
+
+graph.save("kb.ison", None, true)?;   // kb.ison + kb.ison.embeddings.json
+let graph = SemanticGraph::load("kb.ison", Box::new(MockEncoder::new(384)))?;
+```
+
+Pass the encoder you saved with, so text searches share a vector space with the
+restored vectors. `save(.., false)` writes the graph alone, and `load_with` takes
+`LoadOptions` (`format`, `embeddings`, `auto_embed`, `embed_fields`,
+`on_mismatch`, `version`, `on_model_mismatch`). Loading never re-embeds on its
+own. The sidecar is the same file the Python port writes, so a graph saved by
+either can be loaded by the other. `EmbeddingStore` has the underlying
+`save_embeddings` / `load_embeddings` for the sidecar alone.
+
+**The pair stays matched.** `save` writes the graph and then the sidecar, each
+atomically (temp file, sync, rename), and records in the sidecar a
+`graph_digest` of the graph *as it reads back from the text just written*,
+plus `encoder_model`, `encoder_version` and `graph_digest_basis`
+(`"nodes-edges-json-v1"`), all after the `embeddings` array so version-1 readers
+ignore them. `load` recomputes the digest and, on a mismatch (a sidecar from
+another save, a graph edited since, a crash between the two writes), follows
+`LoadOptions::on_mismatch`: `GraphMismatch::Error` (default), `Warn` (use the
+vectors anyway) or `Reembed` (discard them and re-embed every node). A sidecar
+with no digest, or one recorded on a basis this build does not compute, is
+loaded unchecked. `graph_digest(&graph)` computes the digest and is
+byte-identical to the Python port's (checked against the shared golden
+fixture). `store.last_import_meta()` exposes what the last import recorded.
+
 ## One format, six languages
 
 The SQLite schema and the portable JSON payload are shared by every port —
@@ -199,6 +302,13 @@ store.from_json(&json, false)?;
 - **Seed order among equal scores is not deterministic.** The store is a
   `HashMap`, so ties can be broken differently between runs. It only shows up
   with hand-crafted identical vectors; distinct texts give distinct scores.
+- **The graph digest sees integer ids only through the file text.** `NodeId`
+  is a string here, so `graph_digest(&graph)` hashes every id as a string (right
+  for anything built in Rust); `save` and `load` read the id column's types from
+  the ISON text instead, so integer ids written by another port still verify.
+  Python writes floats in exponent form (`1e-05`) and reads them back as
+  strings, so for those this port also accepts Python's reading; if a graph
+  holding such floats matches neither reading, `load` warns rather than fails.
 - **Auto-embed renders typed properties.** Nulls are skipped and booleans
   render as `true`/`false`, so the same graph produces the same text in every
   port.
@@ -206,7 +316,7 @@ store.from_json(&json, false)?;
 ## Tests
 
 ```bash
-cargo test                      # 35 unit tests + 1 doctest
+cargo test                      # 121 unit tests + 2 doctests
 cargo test --features sqlite    # + 14 SQLite tests
 cargo clippy --all-targets --features sqlite -- -D warnings
 cargo fmt --check
