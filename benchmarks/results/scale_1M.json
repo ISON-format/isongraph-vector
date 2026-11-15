@@ -1,0 +1,846 @@
+{
+  "config": {
+    "sizes": "10000,100000,1000000",
+    "max_n": 1000000,
+    "runs": 9,
+    "avg_degree": 3.0,
+    "backends": "numpy,sqlite_vec",
+    "threshold_ms": "50,100",
+    "concurrency_n": 20000,
+    "duration": 4.0,
+    "skip_concurrency": true,
+    "quick": false,
+    "out_prefix": "benchmarks/results/scale_1M"
+  },
+  "environment": {
+    "python": "3.12.7",
+    "platform": "Windows-11-10.0.26300-SP0",
+    "processor": "Intel64 Family 6 Model 183 Stepping 1, GenuineIntel",
+    "numpy": "2.4.2",
+    "psutil": "7.0.0",
+    "cpu_count": 32,
+    "ram_gb": 47.7,
+    "sqlite_vec": "0.1.9",
+    "ison_graph": "1.4.0"
+  },
+  "results": [
+    {
+      "backend": "numpy",
+      "n": 10000,
+      "dim": 384,
+      "graph_build_s": 0.11673820001306012,
+      "rss_after_graph_mb": 20.65625,
+      "ingest_s": 0.0897732000448741,
+      "ingest_vectors_per_s": 111391.81843803487,
+      "rss_after_ingest_mb": 49.6953125,
+      "first_query_ms": 36.03250003652647,
+      "rss_after_first_query_mb": 65.34765625,
+      "similarity_search": {
+        "median_ms": 3.2768999808467925,
+        "p95_ms": 9.373600012622774,
+        "min_ms": 3.1023999908939004,
+        "max_ms": 9.373600012622774,
+        "runs": 9
+      },
+      "semantic_multi_hop": {
+        "median_ms": 5.401600035838783,
+        "p95_ms": 5.78870001481846,
+        "min_ms": 4.928399983327836,
+        "max_ms": 5.78870001481846,
+        "runs": 3
+      },
+      "semantic_multi_hop_blend0.3": {
+        "median_ms": 5.156799976248294,
+        "p95_ms": 5.4296000162139535,
+        "min_ms": 5.131299956701696,
+        "max_ms": 5.4296000162139535,
+        "runs": 3
+      },
+      "semantic_subgraph": {
+        "median_ms": 8.664799970574677,
+        "p95_ms": 17.82219996675849,
+        "min_ms": 8.327000017743558,
+        "max_ms": 17.82219996675849,
+        "runs": 3
+      },
+      "similarity_search_gc_off": {
+        "median_ms": 2.9997999663464725,
+        "p95_ms": 3.2799000036902726,
+        "min_ms": 2.8777000261470675,
+        "max_ms": 3.2799000036902726,
+        "runs": 9
+      },
+      "semantic_multi_hop_gc_off": {
+        "median_ms": 4.5841000392101705,
+        "p95_ms": 6.3257000292651355,
+        "min_ms": 4.1179999825544655,
+        "max_ms": 6.3257000292651355,
+        "runs": 3
+      },
+      "write_one": {
+        "median_ms": 0.8649000083096325,
+        "p95_ms": 0.9363999706692994,
+        "min_ms": 0.8003999828360975,
+        "max_ms": 0.9363999706692994,
+        "runs": 5
+      },
+      "search_after_write": {
+        "median_ms": 38.80599996773526,
+        "p95_ms": 46.83619999559596,
+        "min_ms": 37.67450002487749,
+        "max_ms": 46.83619999559596,
+        "runs": 5
+      },
+      "write_after_read_penalty_ms": 35.52909998688847,
+      "add_batch_100_ms": 2.3146000457927585,
+      "search_after_batch_ms": 38.89640001580119,
+      "memory_mode": "rss",
+      "peak_memory_mb": 179.85546875,
+      "raw_vector_bytes_mb": 14.6484375,
+      "wall_s": 0.83420729637146
+    },
+    {
+      "backend": "numpy",
+      "n": 100000,
+      "dim": 384,
+      "graph_build_s": 1.6731803999864496,
+      "rss_after_graph_mb": 192.68359375,
+      "ingest_s": 0.9827578000258654,
+      "ingest_vectors_per_s": 101754.47093614325,
+      "rss_after_ingest_mb": 442.34375,
+      "first_query_ms": 529.1406000033021,
+      "rss_after_first_query_mb": 589.06640625,
+      "similarity_search": {
+        "median_ms": 55.66950002685189,
+        "p95_ms": 200.89919999008998,
+        "min_ms": 52.407999988645315,
+        "max_ms": 200.89919999008998,
+        "runs": 9
+      },
+      "semantic_multi_hop": {
+        "median_ms": 190.304699994158,
+        "p95_ms": 198.7255000276491,
+        "min_ms": 71.68100000126287,
+        "max_ms": 198.7255000276491,
+        "runs": 3
+      },
+      "semantic_multi_hop_blend0.3": {
+        "median_ms": 83.40100001078099,
+        "p95_ms": 84.44419997977093,
+        "min_ms": 79.92219994775951,
+        "max_ms": 84.44419997977093,
+        "runs": 3
+      },
+      "semantic_subgraph": {
+        "median_ms": 219.2584999720566,
+        "p95_ms": 229.16370001621544,
+        "min_ms": 100.9040999924764,
+        "max_ms": 229.16370001621544,
+        "runs": 3
+      },
+      "similarity_search_gc_off": {
+        "median_ms": 46.28130001947284,
+        "p95_ms": 49.38879999099299,
+        "min_ms": 44.56360003678128,
+        "max_ms": 49.38879999099299,
+        "runs": 9
+      },
+      "semantic_multi_hop_gc_off": {
+        "median_ms": 70.65330003388226,
+        "p95_ms": 70.84190001478419,
+        "min_ms": 62.95089999912307,
+        "max_ms": 70.84190001478419,
+        "runs": 3
+      },
+      "write_one": {
+        "median_ms": 8.790799998678267,
+        "p95_ms": 9.235600009560585,
+        "min_ms": 8.186599996406585,
+        "max_ms": 9.235600009560585,
+        "runs": 5
+      },
+      "search_after_write": {
+        "median_ms": 494.59349998505786,
+        "p95_ms": 524.7094000224024,
+        "min_ms": 366.6403999668546,
+        "max_ms": 524.7094000224024,
+        "runs": 5
+      },
+      "write_after_read_penalty_ms": 438.92399995820597,
+      "add_batch_100_ms": 10.28079999377951,
+      "search_after_batch_ms": 478.68040000321344,
+      "memory_mode": "rss",
+      "peak_memory_mb": 909.203125,
+      "raw_vector_bytes_mb": 146.484375,
+      "wall_s": 10.819270372390747
+    },
+    {
+      "backend": "numpy",
+      "n": 1000000,
+      "dim": 384,
+      "graph_build_s": 20.040345199988224,
+      "rss_after_graph_mb": 1990.51171875,
+      "ingest_s": 11.659838600084186,
+      "ingest_vectors_per_s": 85764.4804785531,
+      "rss_after_ingest_mb": 4346.1015625,
+      "first_query_ms": 5825.527399952989,
+      "rss_after_first_query_mb": 6557.28515625,
+      "similarity_search": {
+        "median_ms": 664.3688000040129,
+        "p95_ms": 2142.847300041467,
+        "min_ms": 555.1135999849066,
+        "max_ms": 2142.847300041467,
+        "runs": 9
+      },
+      "semantic_multi_hop": {
+        "median_ms": 2128.111199999694,
+        "p95_ms": 2161.350800015498,
+        "min_ms": 757.9522000160068,
+        "max_ms": 2161.350800015498,
+        "runs": 3
+      },
+      "semantic_multi_hop_blend0.3": {
+        "median_ms": 994.3949999869801,
+        "p95_ms": 1004.1844999650493,
+        "min_ms": 963.7168000335805,
+        "max_ms": 1004.1844999650493,
+        "runs": 3
+      },
+      "semantic_subgraph": {
+        "median_ms": 2319.5308999856934,
+        "p95_ms": 2444.2235000315122,
+        "min_ms": 1027.4549000314437,
+        "max_ms": 2444.2235000315122,
+        "runs": 3
+      },
+      "similarity_search_gc_off": {
+        "median_ms": 499.62240003515035,
+        "p95_ms": 530.121500021778,
+        "min_ms": 485.6014999677427,
+        "max_ms": 530.121500021778,
+        "runs": 9
+      },
+      "semantic_multi_hop_gc_off": {
+        "median_ms": 678.5123000154272,
+        "p95_ms": 689.8002999951132,
+        "min_ms": 639.5312999957241,
+        "max_ms": 689.8002999951132,
+        "runs": 3
+      },
+      "write_one": {
+        "median_ms": 81.98729995638132,
+        "p95_ms": 136.8283000192605,
+        "min_ms": 75.37490001413971,
+        "max_ms": 136.8283000192605,
+        "runs": 5
+      },
+      "search_after_write": {
+        "median_ms": 5251.319399976637,
+        "p95_ms": 5857.685199996922,
+        "min_ms": 4075.3226000233553,
+        "max_ms": 5857.685199996922,
+        "runs": 5
+      },
+      "write_after_read_penalty_ms": 4586.950599972624,
+      "add_batch_100_ms": 167.80320001998916,
+      "search_after_batch_ms": 5866.773999994621,
+      "memory_mode": "rss",
+      "peak_memory_mb": 9074.79296875,
+      "raw_vector_bytes_mb": 1464.84375,
+      "wall_s": 122.05430316925049
+    },
+    {
+      "backend": "sqlite_vec",
+      "n": 10000,
+      "dim": 384,
+      "graph_build_s": 0.10854079999262467,
+      "rss_after_graph_mb": 6.68359375,
+      "ingest_s": 0.2291077999980189,
+      "ingest_vectors_per_s": 43647.575508500675,
+      "rss_after_ingest_mb": 64.23046875,
+      "first_query_ms": 4.634200013242662,
+      "rss_after_first_query_mb": 64.25,
+      "similarity_search": {
+        "median_ms": 3.309599997010082,
+        "p95_ms": 3.4046999644488096,
+        "min_ms": 3.2457999768666923,
+        "max_ms": 3.4046999644488096,
+        "runs": 9
+      },
+      "semantic_multi_hop": {
+        "median_ms": 3.6638000165112317,
+        "p95_ms": 3.7641999660991132,
+        "min_ms": 3.6284999805502594,
+        "max_ms": 3.7641999660991132,
+        "runs": 3
+      },
+      "semantic_multi_hop_blend0.3": {
+        "median_ms": 15.055199968628585,
+        "p95_ms": 32.31949999462813,
+        "min_ms": 5.32190001104027,
+        "max_ms": 32.31949999462813,
+        "runs": 3
+      },
+      "semantic_subgraph": {
+        "median_ms": 6.285900017246604,
+        "p95_ms": 7.200899999588728,
+        "min_ms": 6.2262999708764255,
+        "max_ms": 7.200899999588728,
+        "runs": 3
+      },
+      "similarity_search_gc_off": {
+        "median_ms": 3.410800010897219,
+        "p95_ms": 3.8706999621354043,
+        "min_ms": 3.3085999893955886,
+        "max_ms": 3.8706999621354043,
+        "runs": 9
+      },
+      "semantic_multi_hop_gc_off": {
+        "median_ms": 3.5366000374779105,
+        "p95_ms": 3.7991999997757375,
+        "min_ms": 3.493299998808652,
+        "max_ms": 3.7991999997757375,
+        "runs": 3
+      },
+      "write_one": {
+        "median_ms": 0.15459995483979583,
+        "p95_ms": 1.0313999955542386,
+        "min_ms": 0.12500002048909664,
+        "max_ms": 1.0313999955542386,
+        "runs": 5
+      },
+      "search_after_write": {
+        "median_ms": 3.40919999871403,
+        "p95_ms": 3.5463999956846237,
+        "min_ms": 3.3340000081807375,
+        "max_ms": 3.5463999956846237,
+        "runs": 5
+      },
+      "write_after_read_penalty_ms": 0.09960000170394778,
+      "add_batch_100_ms": 3.0343999969772995,
+      "search_after_batch_ms": 3.6515999818220735,
+      "memory_mode": "rss",
+      "peak_memory_mb": 122.140625,
+      "raw_vector_bytes_mb": 14.6484375,
+      "wall_s": 0.6868200302124023
+    },
+    {
+      "backend": "sqlite_vec",
+      "n": 100000,
+      "dim": 384,
+      "graph_build_s": 1.5675205999868922,
+      "rss_after_graph_mb": 146.48046875,
+      "ingest_s": 2.4482209000270814,
+      "ingest_vectors_per_s": 40845.987385735425,
+      "rss_after_ingest_mb": 565.37109375,
+      "first_query_ms": 34.132300002966076,
+      "rss_after_first_query_mb": 565.38671875,
+      "similarity_search": {
+        "median_ms": 32.76809997623786,
+        "p95_ms": 35.785800020676106,
+        "min_ms": 31.8962000310421,
+        "max_ms": 35.785800020676106,
+        "runs": 9
+      },
+      "semantic_multi_hop": {
+        "median_ms": 32.831699994858354,
+        "p95_ms": 35.23560002213344,
+        "min_ms": 32.59959997376427,
+        "max_ms": 35.23560002213344,
+        "runs": 3
+      },
+      "semantic_multi_hop_blend0.3": {
+        "median_ms": 77.23860000260174,
+        "p95_ms": 505.8693999890238,
+        "min_ms": 74.2958000046201,
+        "max_ms": 505.8693999890238,
+        "runs": 3
+      },
+      "semantic_subgraph": {
+        "median_ms": 60.623299970757216,
+        "p95_ms": 68.08830000227317,
+        "min_ms": 58.06820001453161,
+        "max_ms": 68.08830000227317,
+        "runs": 3
+      },
+      "similarity_search_gc_off": {
+        "median_ms": 32.74300001794472,
+        "p95_ms": 34.45460001239553,
+        "min_ms": 31.95539995795116,
+        "max_ms": 34.45460001239553,
+        "runs": 9
+      },
+      "semantic_multi_hop_gc_off": {
+        "median_ms": 32.35069999936968,
+        "p95_ms": 32.38759998930618,
+        "min_ms": 31.814199988730252,
+        "max_ms": 32.38759998930618,
+        "runs": 3
+      },
+      "write_one": {
+        "median_ms": 0.2182999742217362,
+        "p95_ms": 7.8575999941676855,
+        "min_ms": 0.20489998860284686,
+        "max_ms": 7.8575999941676855,
+        "runs": 5
+      },
+      "search_after_write": {
+        "median_ms": 33.851000014692545,
+        "p95_ms": 36.41000000061467,
+        "min_ms": 32.2918999590911,
+        "max_ms": 36.41000000061467,
+        "runs": 5
+      },
+      "write_after_read_penalty_ms": 1.0829000384546816,
+      "add_batch_100_ms": 4.059700004290789,
+      "search_after_batch_ms": 32.84240001812577,
+      "memory_mode": "rss",
+      "peak_memory_mb": 715.53125,
+      "raw_vector_bytes_mb": 146.484375,
+      "wall_s": 7.789799690246582
+    },
+    {
+      "backend": "sqlite_vec",
+      "n": 1000000,
+      "dim": 384,
+      "graph_build_s": 18.738467099959962,
+      "rss_after_graph_mb": 1949.7265625,
+      "ingest_s": 43.56545550026931,
+      "ingest_vectors_per_s": 22953.966359741567,
+      "rss_after_ingest_mb": 6020.15625,
+      "first_query_ms": 842.7310999832116,
+      "rss_after_first_query_mb": 6020.171875,
+      "similarity_search": {
+        "median_ms": 892.9120000102557,
+        "p95_ms": 934.8516000318341,
+        "min_ms": 788.5212000110187,
+        "max_ms": 934.8516000318341,
+        "runs": 9
+      },
+      "semantic_multi_hop": {
+        "median_ms": 882.4838000000454,
+        "p95_ms": 922.2615999751724,
+        "min_ms": 807.0005999761634,
+        "max_ms": 922.2615999751724,
+        "runs": 3
+      },
+      "semantic_multi_hop_blend0.3": {
+        "median_ms": 2490.491300006397,
+        "p95_ms": 13896.294500038493,
+        "min_ms": 2366.5281000430696,
+        "max_ms": 13896.294500038493,
+        "runs": 3
+      },
+      "semantic_subgraph": {
+        "median_ms": 1622.8530000080355,
+        "p95_ms": 1709.0360000147484,
+        "min_ms": 1611.8269000435248,
+        "max_ms": 1709.0360000147484,
+        "runs": 3
+      },
+      "similarity_search_gc_off": {
+        "median_ms": 887.7367000095546,
+        "p95_ms": 941.9633999932557,
+        "min_ms": 784.8379000206478,
+        "max_ms": 941.9633999932557,
+        "runs": 9
+      },
+      "semantic_multi_hop_gc_off": {
+        "median_ms": 883.1398999900557,
+        "p95_ms": 987.1304999687709,
+        "min_ms": 839.4886000314727,
+        "max_ms": 987.1304999687709,
+        "runs": 3
+      },
+      "write_one": {
+        "median_ms": 0.28229999588802457,
+        "p95_ms": 364.31920004542917,
+        "min_ms": 0.2544000162743032,
+        "max_ms": 364.31920004542917,
+        "runs": 5
+      },
+      "search_after_write": {
+        "median_ms": 777.0409999648109,
+        "p95_ms": 847.0928000169806,
+        "min_ms": 774.0834999713115,
+        "max_ms": 847.0928000169806,
+        "runs": 5
+      },
+      "write_after_read_penalty_ms": 0.0,
+      "add_batch_100_ms": 10.059099993668497,
+      "search_after_batch_ms": 839.4868000177667,
+      "memory_mode": "rss",
+      "peak_memory_mb": 7498.7265625,
+      "raw_vector_bytes_mb": 1464.84375,
+      "wall_s": 140.69632768630981
+    }
+  ],
+  "skipped": [],
+  "concurrency": [],
+  "floor": {
+    "10000": {
+      "median_ms": 0.7206000154837966,
+      "p95_ms": 1.1830999865196645,
+      "min_ms": 0.5294999573379755,
+      "max_ms": 1.1830999865196645,
+      "runs": 9
+    },
+    "100000": {
+      "median_ms": 5.290500004775822,
+      "p95_ms": 6.250699982047081,
+      "min_ms": 4.762500000651926,
+      "max_ms": 6.250699982047081,
+      "runs": 9
+    },
+    "1000000": {
+      "median_ms": 48.62180002965033,
+      "p95_ms": 57.78560001635924,
+      "min_ms": 44.93710002861917,
+      "max_ms": 57.78560001635924,
+      "runs": 9
+    }
+  },
+  "analysis": {
+    "numpy/similarity_search": {
+      "points": [
+        [
+          10000,
+          3.2768999808467925
+        ],
+        [
+          100000,
+          55.66950002685189
+        ],
+        [
+          1000000,
+          664.3688000040129
+        ]
+      ],
+      "fit": {
+        "intercept_ms": -7.254127775215563,
+        "ms_per_1k_vectors": 0.6712410660696919,
+        "r2": 0.9998801496324022
+      },
+      "crossings": {
+        "50": {
+          "n": 90260,
+          "kind": "interpolated between measured sizes"
+        },
+        "100": {
+          "n": 165545,
+          "kind": "interpolated between measured sizes"
+        }
+      }
+    },
+    "numpy/semantic_multi_hop": {
+      "points": [
+        [
+          10000,
+          5.401600035838783
+        ],
+        [
+          100000,
+          190.304699994158
+        ],
+        [
+          1000000,
+          2128.111199999694
+        ]
+      ],
+      "fit": {
+        "intercept_ms": -20.07516109410518,
+        "ms_per_1k_vectors": 2.1477864714522563,
+        "r2": 0.9999871610719762
+      },
+      "crossings": {
+        "50": {
+          "n": 31707,
+          "kind": "interpolated between measured sizes"
+        },
+        "100": {
+          "n": 56044,
+          "kind": "interpolated between measured sizes"
+        }
+      }
+    },
+    "numpy/semantic_multi_hop_blend0.3": {
+      "points": [
+        [
+          10000,
+          5.156799976248294
+        ],
+        [
+          100000,
+          83.40100001078099
+        ],
+        [
+          1000000,
+          994.3949999869801
+        ]
+      ],
+      "fit": {
+        "intercept_ms": -10.678777784859534,
+        "ms_per_1k_vectors": 1.0044947147104388,
+        "r2": 0.9998769336847102
+      },
+      "crossings": {
+        "50": {
+          "n": 61580,
+          "kind": "interpolated between measured sizes"
+        },
+        "100": {
+          "n": 116398,
+          "kind": "interpolated between measured sizes"
+        }
+      }
+    },
+    "numpy/semantic_subgraph": {
+      "points": [
+        [
+          10000,
+          8.664799970574677
+        ],
+        [
+          100000,
+          219.2584999720566
+        ],
+        [
+          1000000,
+          2319.5308999856934
+        ]
+      ],
+      "fit": {
+        "intercept_ms": -14.419800029524676,
+        "ms_per_1k_vectors": 2.333976216231439,
+        "r2": 0.9999999557334259
+      },
+      "crossings": {
+        "50": {
+          "n": 27665,
+          "kind": "interpolated between measured sizes"
+        },
+        "100": {
+          "n": 49033,
+          "kind": "interpolated between measured sizes"
+        }
+      }
+    },
+    "numpy/similarity_search_gc_off": {
+      "points": [
+        [
+          10000,
+          2.9997999663464725
+        ],
+        [
+          100000,
+          46.28130001947284
+        ],
+        [
+          1000000,
+          499.62240003515035
+        ]
+      ],
+      "fit": {
+        "intercept_ms": -2.949594455357275,
+        "ms_per_1k_vectors": 0.5024795345829202,
+        "r2": 0.9999874599016243
+      },
+      "crossings": {
+        "50": {
+          "n": 107382,
+          "kind": "interpolated between measured sizes"
+        },
+        "100": {
+          "n": 206645,
+          "kind": "interpolated between measured sizes"
+        }
+      }
+    },
+    "sqlite_vec/similarity_search": {
+      "points": [
+        [
+          10000,
+          3.309599997010082
+        ],
+        [
+          100000,
+          32.76809997623786
+        ],
+        [
+          1000000,
+          892.9120000102557
+        ]
+      ],
+      "fit": {
+        "intercept_ms": -31.383505569667534,
+        "ms_per_1k_vectors": 0.9217479429662216,
+        "r2": 0.9971787949664894
+      },
+      "crossings": {
+        "50": {
+          "n": 118030,
+          "kind": "interpolated between measured sizes"
+        },
+        "100": {
+          "n": 170347,
+          "kind": "interpolated between measured sizes"
+        }
+      }
+    },
+    "sqlite_vec/semantic_multi_hop": {
+      "points": [
+        [
+          10000,
+          3.6638000165112317
+        ],
+        [
+          100000,
+          32.831699994858354
+        ],
+        [
+          1000000,
+          882.4838000000454
+        ]
+      ],
+      "fit": {
+        "intercept_ms": -30.575583326733927,
+        "ms_per_1k_vectors": 0.910545990983438,
+        "r2": 0.9971859669332866
+      },
+      "crossings": {
+        "50": {
+          "n": 118185,
+          "kind": "interpolated between measured sizes"
+        },
+        "100": {
+          "n": 171148,
+          "kind": "interpolated between measured sizes"
+        }
+      }
+    },
+    "sqlite_vec/semantic_multi_hop_blend0.3": {
+      "points": [
+        [
+          10000,
+          15.055199968628585
+        ],
+        [
+          100000,
+          77.23860000260174
+        ],
+        [
+          1000000,
+          2490.491300006397
+        ]
+      ],
+      "fit": {
+        "intercept_ms": -91.37732779426113,
+        "ms_per_1k_vectors": 2.5737991741985673,
+        "r2": 0.996372587463102
+      },
+      "crossings": {
+        "50": {
+          "n": 60576,
+          "kind": "interpolated between measured sizes"
+        },
+        "100": {
+          "n": 108488,
+          "kind": "interpolated between measured sizes"
+        }
+      }
+    },
+    "sqlite_vec/semantic_subgraph": {
+      "points": [
+        [
+          10000,
+          6.285900017246604
+        ],
+        [
+          100000,
+          60.623299970757216
+        ],
+        [
+          1000000,
+          1622.8530000080355
+        ]
+      ],
+      "fit": {
+        "intercept_ms": -56.35468333881993,
+        "ms_per_1k_vectors": 1.6746182432545027,
+        "r2": 0.9972259290003094
+      },
+      "crossings": {
+        "50": {
+          "n": 82404,
+          "kind": "interpolated between measured sizes"
+        },
+        "100": {
+          "n": 122684,
+          "kind": "interpolated between measured sizes"
+        }
+      }
+    },
+    "sqlite_vec/similarity_search_gc_off": {
+      "points": [
+        [
+          10000,
+          3.410800010897219
+        ],
+        [
+          100000,
+          32.74300001794472
+        ],
+        [
+          1000000,
+          887.7367000095546
+        ]
+      ],
+      "fit": {
+        "intercept_ms": -31.052316652171292,
+        "ms_per_1k_vectors": 0.9162589639593782,
+        "r2": 0.9971839899798861
+      },
+      "crossings": {
+        "50": {
+          "n": 118165,
+          "kind": "interpolated between measured sizes"
+        },
+        "100": {
+          "n": 170797,
+          "kind": "interpolated between measured sizes"
+        }
+      }
+    },
+    "raw_numpy_floor": {
+      "points": [
+        [
+          10000,
+          0.7206000154837966
+        ],
+        [
+          100000,
+          5.290500004775822
+        ],
+        [
+          1000000,
+          48.62180002965033
+        ]
+      ],
+      "fit": {
+        "intercept_ms": 0.34437223156499736,
+        "ms_per_1k_vectors": 0.048288093112806255,
+        "r2": 0.9999819326012702
+      },
+      "crossings": {
+        "50": {
+          "n": 1028320,
+          "kind": "extrapolated (linear fit)"
+        },
+        "100": {
+          "n": 2063772,
+          "kind": "extrapolated (linear fit)"
+        }
+      }
+    }
+  }
+}

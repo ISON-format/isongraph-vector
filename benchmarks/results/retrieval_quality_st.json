@@ -1,0 +1,3168 @@
+{
+  "config": {
+    "seed": 7,
+    "encoder": "st",
+    "services": 240,
+    "incidents_per_service": 4.0,
+    "questions": 200,
+    "budgets": "10,20",
+    "threshold": 0.1,
+    "quick": false,
+    "out_prefix": "benchmarks/results/retrieval_quality_st"
+  },
+  "environment": {
+    "python": "3.12.7",
+    "platform": "Windows-11-10.0.26300-SP0",
+    "processor": "Intel64 Family 6 Model 183 Stepping 1, GenuineIntel",
+    "numpy": "2.4.2",
+    "psutil": "7.0.0",
+    "cpu_count": 32,
+    "ram_gb": 47.7,
+    "sqlite_vec": "0.1.9",
+    "ison_graph": "1.4.0"
+  },
+  "graph": {
+    "nodes": 1710,
+    "edges": 2628,
+    "by_type": {
+      "datastore": 160,
+      "incident": 960,
+      "person": 88,
+      "runbook": 240,
+      "service": 240,
+      "team": 22
+    }
+  },
+  "questions": {
+    "total": 200,
+    "by_type": {
+      "impact": 50,
+      "incident_owner": 50,
+      "incident_rootcause": 50,
+      "service_deps": 50
+    },
+    "mean_gold_size": 5.44,
+    "mean_support_size": 4.44
+  },
+  "sanity": {
+    "subgraph_vs_multi_hop_node_set_mismatches": 0,
+    "component_count_mismatches_vs_library": 0
+  },
+  "results": {
+    "10": {
+      "vector_only/vector": {
+        "seed_recall": 0.74,
+        "support_recall": 0.16123809523809524,
+        "context_recall": 0.28659523809523807,
+        "precision": 0.135,
+        "complete": 0.095,
+        "nodes": 10.0,
+        "components": 8.29,
+        "ms": 5.814029001630843,
+        "context_recall_ci95": 0.04232025296393205,
+        "ms_median": 4.865399998379871,
+        "n": 200,
+        "wtl_vs_vector": null,
+        "support_recall_seed_hit_subset": 0.2178893178893179,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.5797142857142856,
+            "context_recall": 0.7130952380952381,
+            "precision": 0.31,
+            "complete": 0.38,
+            "nodes": 10.0,
+            "components": 6.2,
+            "ms": 7.796742005739361,
+            "context_recall_ci95": 0.07827112423422121,
+            "ms_median": 4.737150011351332,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.52,
+            "support_recall": 0.0,
+            "context_recall": 0.13,
+            "precision": 0.052000000000000005,
+            "complete": 0.0,
+            "nodes": 10.0,
+            "components": 10.0,
+            "ms": 5.52239200565964,
+            "context_recall_ci95": 0.034971988791031035,
+            "ms_median": 5.031300010159612,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.44,
+            "support_recall": 0.0,
+            "context_recall": 0.0747063492063492,
+            "precision": 0.044000000000000004,
+            "complete": 0.0,
+            "nodes": 10.0,
+            "components": 9.94,
+            "ms": 5.070977999130264,
+            "context_recall_ci95": 0.025600933721397885,
+            "ms_median": 4.87299999804236,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.06523809523809523,
+            "context_recall": 0.22857936507936508,
+            "precision": 0.134,
+            "complete": 0.0,
+            "nodes": 10.0,
+            "components": 7.02,
+            "ms": 4.866003995994106,
+            "context_recall_ci95": 0.03350211705121902,
+            "ms_median": 4.76479998906143,
+            "n": 50
+          }
+        }
+      },
+      "hop2_out_decay0.8/multi_hop": {
+        "seed_recall": 0.705,
+        "support_recall": 0.33337896825396823,
+        "context_recall": 0.41873015873015873,
+        "precision": 0.2155,
+        "complete": 0.11,
+        "nodes": 10.0,
+        "components": 3.16,
+        "ms": 5.573843499587383,
+        "context_recall_ci95": 0.045735713559074805,
+        "ms_median": 5.062050011474639,
+        "n": 200,
+        "wtl_vs_vector": "91/75/34",
+        "support_recall_seed_hit_subset": 0.44657067782067783,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.33642857142857147,
+            "context_recall": 0.5278809523809523,
+            "precision": 0.21400000000000002,
+            "complete": 0.08,
+            "nodes": 10.0,
+            "components": 1.7,
+            "ms": 5.849566000979394,
+            "context_recall_ci95": 0.06147129736714525,
+            "ms_median": 4.981449979823083,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.44,
+            "support_recall": 0.16666666666666663,
+            "context_recall": 0.235,
+            "precision": 0.094,
+            "complete": 0.0,
+            "nodes": 10.0,
+            "components": 4.66,
+            "ms": 5.272052000509575,
+            "context_recall_ci95": 0.07194692488216574,
+            "ms_median": 4.955500015057623,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.38,
+            "support_recall": 0.09172222222222222,
+            "context_recall": 0.1404126984126984,
+            "precision": 0.086,
+            "complete": 0.0,
+            "nodes": 10.0,
+            "components": 4.38,
+            "ms": 5.217017998220399,
+            "context_recall_ci95": 0.0540011127457368,
+            "ms_median": 5.073500011349097,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.7386984126984127,
+            "context_recall": 0.7716269841269842,
+            "precision": 0.46799999999999997,
+            "complete": 0.36,
+            "nodes": 10.0,
+            "components": 1.9,
+            "ms": 5.956737998640165,
+            "context_recall_ci95": 0.051884740495605215,
+            "ms_median": 5.322799988789484,
+            "n": 50
+          }
+        }
+      },
+      "hop2_out_decay0.8/subgraph": {
+        "seed_recall": 0.705,
+        "support_recall": 0.33337896825396823,
+        "context_recall": 0.41873015873015873,
+        "precision": 0.2155,
+        "complete": 0.11,
+        "nodes": 10.0,
+        "components": 3.16,
+        "ms": 6.353137003898155,
+        "context_recall_ci95": 0.045735713559074805,
+        "ms_median": 5.975850013783202,
+        "n": 200,
+        "wtl_vs_vector": "91/75/34",
+        "support_recall_seed_hit_subset": 0.44657067782067783,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.33642857142857147,
+            "context_recall": 0.5278809523809523,
+            "precision": 0.21400000000000002,
+            "complete": 0.08,
+            "nodes": 10.0,
+            "components": 1.7,
+            "ms": 6.288606001762673,
+            "context_recall_ci95": 0.06147129736714525,
+            "ms_median": 6.009650009218603,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.44,
+            "support_recall": 0.16666666666666663,
+            "context_recall": 0.235,
+            "precision": 0.094,
+            "complete": 0.0,
+            "nodes": 10.0,
+            "components": 4.66,
+            "ms": 6.888464004732668,
+            "context_recall_ci95": 0.07194692488216574,
+            "ms_median": 6.306850031251088,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.38,
+            "support_recall": 0.09172222222222222,
+            "context_recall": 0.1404126984126984,
+            "precision": 0.086,
+            "complete": 0.0,
+            "nodes": 10.0,
+            "components": 4.38,
+            "ms": 5.809900006279349,
+            "context_recall_ci95": 0.0540011127457368,
+            "ms_median": 5.711850011721253,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.7386984126984127,
+            "context_recall": 0.7716269841269842,
+            "precision": 0.46799999999999997,
+            "complete": 0.36,
+            "nodes": 10.0,
+            "components": 1.9,
+            "ms": 6.425578002817929,
+            "context_recall_ci95": 0.051884740495605215,
+            "ms_median": 6.031650002114475,
+            "n": 50
+          }
+        }
+      },
+      "hop3_out_decay0.8/multi_hop": {
+        "seed_recall": 0.705,
+        "support_recall": 0.33337896825396823,
+        "context_recall": 0.41873015873015873,
+        "precision": 0.2155,
+        "complete": 0.11,
+        "nodes": 10.0,
+        "components": 3.16,
+        "ms": 6.190210997883696,
+        "context_recall_ci95": 0.045735713559074805,
+        "ms_median": 5.206150031881407,
+        "n": 200,
+        "wtl_vs_vector": "91/75/34",
+        "support_recall_seed_hit_subset": 0.44657067782067783,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.33642857142857147,
+            "context_recall": 0.5278809523809523,
+            "precision": 0.21400000000000002,
+            "complete": 0.08,
+            "nodes": 10.0,
+            "components": 1.7,
+            "ms": 5.426219991641119,
+            "context_recall_ci95": 0.06147129736714525,
+            "ms_median": 5.0777999858837575,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.44,
+            "support_recall": 0.16666666666666663,
+            "context_recall": 0.235,
+            "precision": 0.094,
+            "complete": 0.0,
+            "nodes": 10.0,
+            "components": 4.66,
+            "ms": 5.639496002113447,
+            "context_recall_ci95": 0.07194692488216574,
+            "ms_median": 5.275599978631362,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.38,
+            "support_recall": 0.09172222222222222,
+            "context_recall": 0.1404126984126984,
+            "precision": 0.086,
+            "complete": 0.0,
+            "nodes": 10.0,
+            "components": 4.38,
+            "ms": 8.214615997858346,
+            "context_recall_ci95": 0.0540011127457368,
+            "ms_median": 5.230649985605851,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.7386984126984127,
+            "context_recall": 0.7716269841269842,
+            "precision": 0.46799999999999997,
+            "complete": 0.36,
+            "nodes": 10.0,
+            "components": 1.9,
+            "ms": 5.480511999921873,
+            "context_recall_ci95": 0.051884740495605215,
+            "ms_median": 5.264650011667982,
+            "n": 50
+          }
+        }
+      },
+      "hop3_out_decay0.8/subgraph": {
+        "seed_recall": 0.705,
+        "support_recall": 0.33337896825396823,
+        "context_recall": 0.41873015873015873,
+        "precision": 0.2155,
+        "complete": 0.11,
+        "nodes": 10.0,
+        "components": 3.16,
+        "ms": 7.576745501137339,
+        "context_recall_ci95": 0.045735713559074805,
+        "ms_median": 6.256449967622757,
+        "n": 200,
+        "wtl_vs_vector": "91/75/34",
+        "support_recall_seed_hit_subset": 0.44657067782067783,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.33642857142857147,
+            "context_recall": 0.5278809523809523,
+            "precision": 0.21400000000000002,
+            "complete": 0.08,
+            "nodes": 10.0,
+            "components": 1.7,
+            "ms": 8.367367994505912,
+            "context_recall_ci95": 0.06147129736714525,
+            "ms_median": 5.797749996418133,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.44,
+            "support_recall": 0.16666666666666663,
+            "context_recall": 0.235,
+            "precision": 0.094,
+            "complete": 0.0,
+            "nodes": 10.0,
+            "components": 4.66,
+            "ms": 6.555342001374811,
+            "context_recall_ci95": 0.07194692488216574,
+            "ms_median": 6.327649985905737,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.38,
+            "support_recall": 0.09172222222222222,
+            "context_recall": 0.1404126984126984,
+            "precision": 0.086,
+            "complete": 0.0,
+            "nodes": 10.0,
+            "components": 4.38,
+            "ms": 6.664636008208618,
+            "context_recall_ci95": 0.0540011127457368,
+            "ms_median": 6.140000012237579,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.7386984126984127,
+            "context_recall": 0.7716269841269842,
+            "precision": 0.46799999999999997,
+            "complete": 0.36,
+            "nodes": 10.0,
+            "components": 1.9,
+            "ms": 8.719636000460014,
+            "context_recall_ci95": 0.051884740495605215,
+            "ms_median": 6.326150003587827,
+            "n": 50
+          }
+        }
+      },
+      "hop3_out_decay0.5/multi_hop": {
+        "seed_recall": 0.705,
+        "support_recall": 0.331484126984127,
+        "context_recall": 0.4170496031746032,
+        "precision": 0.21400000000000002,
+        "complete": 0.11,
+        "nodes": 10.0,
+        "components": 3.155,
+        "ms": 5.766310499748215,
+        "context_recall_ci95": 0.04559117031598065,
+        "ms_median": 5.501250008819625,
+        "n": 200,
+        "wtl_vs_vector": "91/75/34",
+        "support_recall_seed_hit_subset": 0.44401008151008153,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.33642857142857147,
+            "context_recall": 0.5278809523809523,
+            "precision": 0.21400000000000002,
+            "complete": 0.08,
+            "nodes": 10.0,
+            "components": 1.62,
+            "ms": 5.655876003438607,
+            "context_recall_ci95": 0.06147129736714525,
+            "ms_median": 5.327600025339052,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.44,
+            "support_recall": 0.16666666666666663,
+            "context_recall": 0.235,
+            "precision": 0.094,
+            "complete": 0.0,
+            "nodes": 10.0,
+            "components": 4.66,
+            "ms": 5.6767799984663725,
+            "context_recall_ci95": 0.07194692488216574,
+            "ms_median": 5.525150016183034,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.38,
+            "support_recall": 0.09172222222222222,
+            "context_recall": 0.1404126984126984,
+            "precision": 0.086,
+            "complete": 0.0,
+            "nodes": 10.0,
+            "components": 4.38,
+            "ms": 5.668025999329984,
+            "context_recall_ci95": 0.0540011127457368,
+            "ms_median": 5.546700034756213,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.7311190476190477,
+            "context_recall": 0.7649047619047619,
+            "precision": 0.462,
+            "complete": 0.36,
+            "nodes": 10.0,
+            "components": 1.96,
+            "ms": 6.064559997757897,
+            "context_recall_ci95": 0.05335629672306728,
+            "ms_median": 5.514299991773441,
+            "n": 50
+          }
+        }
+      },
+      "hop3_out_decay0.5/subgraph": {
+        "seed_recall": 0.705,
+        "support_recall": 0.331484126984127,
+        "context_recall": 0.4170496031746032,
+        "precision": 0.21400000000000002,
+        "complete": 0.11,
+        "nodes": 10.0,
+        "components": 3.155,
+        "ms": 8.33144449890824,
+        "context_recall_ci95": 0.04559117031598065,
+        "ms_median": 6.3561499991919845,
+        "n": 200,
+        "wtl_vs_vector": "91/75/34",
+        "support_recall_seed_hit_subset": 0.44401008151008153,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.33642857142857147,
+            "context_recall": 0.5278809523809523,
+            "precision": 0.21400000000000002,
+            "complete": 0.08,
+            "nodes": 10.0,
+            "components": 1.62,
+            "ms": 8.978775998111814,
+            "context_recall_ci95": 0.06147129736714525,
+            "ms_median": 6.045650021405891,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.44,
+            "support_recall": 0.16666666666666663,
+            "context_recall": 0.235,
+            "precision": 0.094,
+            "complete": 0.0,
+            "nodes": 10.0,
+            "components": 4.66,
+            "ms": 6.767381997779012,
+            "context_recall_ci95": 0.07194692488216574,
+            "ms_median": 6.533649982884526,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.38,
+            "support_recall": 0.09172222222222222,
+            "context_recall": 0.1404126984126984,
+            "precision": 0.086,
+            "complete": 0.0,
+            "nodes": 10.0,
+            "components": 4.38,
+            "ms": 7.9177599982358515,
+            "context_recall_ci95": 0.0540011127457368,
+            "ms_median": 6.340199965052307,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.7311190476190477,
+            "context_recall": 0.7649047619047619,
+            "precision": 0.462,
+            "complete": 0.36,
+            "nodes": 10.0,
+            "components": 1.96,
+            "ms": 9.661860001506284,
+            "context_recall_ci95": 0.05335629672306728,
+            "ms_median": 6.442650017561391,
+            "n": 50
+          }
+        }
+      },
+      "hop3_out_decay0.95/multi_hop": {
+        "seed_recall": 0.695,
+        "support_recall": 0.367047619047619,
+        "context_recall": 0.4449880952380953,
+        "precision": 0.2305,
+        "complete": 0.125,
+        "nodes": 10.0,
+        "components": 2.745,
+        "ms": 6.170698998321313,
+        "context_recall_ci95": 0.04659864599606721,
+        "ms_median": 5.146799987414852,
+        "n": 200,
+        "wtl_vs_vector": "91/75/34",
+        "support_recall_seed_hit_subset": 0.4774292149292149,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.2795714285714286,
+            "context_recall": 0.4907142857142857,
+            "precision": 0.2,
+            "complete": 0.06,
+            "nodes": 10.0,
+            "components": 1.86,
+            "ms": 5.270569999702275,
+            "context_recall_ci95": 0.05816803245769965,
+            "ms_median": 4.971049987943843,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.42,
+            "support_recall": 0.28,
+            "context_recall": 0.315,
+            "precision": 0.126,
+            "complete": 0.04,
+            "nodes": 10.0,
+            "components": 3.88,
+            "ms": 8.90388599713333,
+            "context_recall_ci95": 0.0916010916965513,
+            "ms_median": 5.496599973412231,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.36,
+            "support_recall": 0.16527777777777777,
+            "context_recall": 0.19844444444444445,
+            "precision": 0.124,
+            "complete": 0.04,
+            "nodes": 10.0,
+            "components": 4.14,
+            "ms": 5.276415996486321,
+            "context_recall_ci95": 0.0781729258806445,
+            "ms_median": 5.10410001152195,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.7433412698412698,
+            "context_recall": 0.7757936507936507,
+            "precision": 0.47200000000000003,
+            "complete": 0.36,
+            "nodes": 10.0,
+            "components": 1.1,
+            "ms": 5.231923999963328,
+            "context_recall_ci95": 0.05055541880323384,
+            "ms_median": 5.082800023956224,
+            "n": 50
+          }
+        }
+      },
+      "hop3_out_decay0.95/subgraph": {
+        "seed_recall": 0.695,
+        "support_recall": 0.367047619047619,
+        "context_recall": 0.4449880952380953,
+        "precision": 0.2305,
+        "complete": 0.125,
+        "nodes": 10.0,
+        "components": 2.745,
+        "ms": 6.022421996749472,
+        "context_recall_ci95": 0.04659864599606721,
+        "ms_median": 5.921949981711805,
+        "n": 200,
+        "wtl_vs_vector": "91/75/34",
+        "support_recall_seed_hit_subset": 0.4774292149292149,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.2795714285714286,
+            "context_recall": 0.4907142857142857,
+            "precision": 0.2,
+            "complete": 0.06,
+            "nodes": 10.0,
+            "components": 1.86,
+            "ms": 5.66873399540782,
+            "context_recall_ci95": 0.05816803245769965,
+            "ms_median": 5.552099988562986,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.42,
+            "support_recall": 0.28,
+            "context_recall": 0.315,
+            "precision": 0.126,
+            "complete": 0.04,
+            "nodes": 10.0,
+            "components": 3.88,
+            "ms": 6.275142001686618,
+            "context_recall_ci95": 0.0916010916965513,
+            "ms_median": 6.122849998064339,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.36,
+            "support_recall": 0.16527777777777777,
+            "context_recall": 0.19844444444444445,
+            "precision": 0.124,
+            "complete": 0.04,
+            "nodes": 10.0,
+            "components": 4.14,
+            "ms": 6.225161999464035,
+            "context_recall_ci95": 0.0781729258806445,
+            "ms_median": 6.040349981049076,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.7433412698412698,
+            "context_recall": 0.7757936507936507,
+            "precision": 0.47200000000000003,
+            "complete": 0.36,
+            "nodes": 10.0,
+            "components": 1.1,
+            "ms": 5.920649990439415,
+            "context_recall_ci95": 0.05055541880323384,
+            "ms_median": 5.869749991688877,
+            "n": 50
+          }
+        }
+      },
+      "hop3_out_blend0.3/multi_hop": {
+        "seed_recall": 0.705,
+        "support_recall": 0.3160079365079365,
+        "context_recall": 0.4038095238095238,
+        "precision": 0.205,
+        "complete": 0.1,
+        "nodes": 10.0,
+        "components": 3.165,
+        "ms": 5.076408001186792,
+        "context_recall_ci95": 0.04414187684355039,
+        "ms_median": 4.976099968189374,
+        "n": 200,
+        "wtl_vs_vector": "94/73/33",
+        "support_recall_seed_hit_subset": 0.4230963105963106,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.3492857142857143,
+            "context_recall": 0.537047619047619,
+            "precision": 0.218,
+            "complete": 0.08,
+            "nodes": 10.0,
+            "components": 1.56,
+            "ms": 4.955916004255414,
+            "context_recall_ci95": 0.06129076928869468,
+            "ms_median": 4.868149990215898,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.44,
+            "support_recall": 0.16,
+            "context_recall": 0.23,
+            "precision": 0.09200000000000001,
+            "complete": 0.0,
+            "nodes": 10.0,
+            "components": 4.7,
+            "ms": 5.116453996160999,
+            "context_recall_ci95": 0.06835671144810873,
+            "ms_median": 5.049500003224239,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.38,
+            "support_recall": 0.08855555555555555,
+            "context_recall": 0.1377142857142857,
+            "precision": 0.084,
+            "complete": 0.0,
+            "nodes": 10.0,
+            "components": 4.52,
+            "ms": 5.086850004736334,
+            "context_recall_ci95": 0.05060031210561042,
+            "ms_median": 5.00855001155287,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.6661904761904762,
+            "context_recall": 0.7104761904761905,
+            "precision": 0.426,
+            "complete": 0.32,
+            "nodes": 10.0,
+            "components": 1.88,
+            "ms": 5.14641199959442,
+            "context_recall_ci95": 0.06308026632790954,
+            "ms_median": 5.006199993658811,
+            "n": 50
+          }
+        }
+      },
+      "hop3_out_blend0.3/subgraph": {
+        "seed_recall": 0.705,
+        "support_recall": 0.3160079365079365,
+        "context_recall": 0.4038095238095238,
+        "precision": 0.205,
+        "complete": 0.1,
+        "nodes": 10.0,
+        "components": 3.165,
+        "ms": 6.500586501206271,
+        "context_recall_ci95": 0.04414187684355039,
+        "ms_median": 6.049550021998584,
+        "n": 200,
+        "wtl_vs_vector": "94/73/33",
+        "support_recall_seed_hit_subset": 0.4230963105963106,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.3492857142857143,
+            "context_recall": 0.537047619047619,
+            "precision": 0.218,
+            "complete": 0.08,
+            "nodes": 10.0,
+            "components": 1.56,
+            "ms": 6.689979999791831,
+            "context_recall_ci95": 0.06129076928869468,
+            "ms_median": 5.958649970125407,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.44,
+            "support_recall": 0.16,
+            "context_recall": 0.23,
+            "precision": 0.09200000000000001,
+            "complete": 0.0,
+            "nodes": 10.0,
+            "components": 4.7,
+            "ms": 6.121628005057573,
+            "context_recall_ci95": 0.06835671144810873,
+            "ms_median": 5.863850004971027,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.38,
+            "support_recall": 0.08855555555555555,
+            "context_recall": 0.1377142857142857,
+            "precision": 0.084,
+            "complete": 0.0,
+            "nodes": 10.0,
+            "components": 4.52,
+            "ms": 6.5336940018460155,
+            "context_recall_ci95": 0.05060031210561042,
+            "ms_median": 6.114549993071705,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.6661904761904762,
+            "context_recall": 0.7104761904761905,
+            "precision": 0.426,
+            "complete": 0.32,
+            "nodes": 10.0,
+            "components": 1.88,
+            "ms": 6.657043998129666,
+            "context_recall_ci95": 0.06308026632790954,
+            "ms_median": 6.277350010350347,
+            "n": 50
+          }
+        }
+      },
+      "hop3_out_seeds1/multi_hop": {
+        "seed_recall": 0.59,
+        "support_recall": 0.3442281746031746,
+        "context_recall": 0.4074404761904762,
+        "precision": 0.23394444444444445,
+        "complete": 0.135,
+        "nodes": 8.965,
+        "components": 1.0,
+        "ms": 5.062171001336537,
+        "context_recall_ci95": 0.04824605075116447,
+        "ms_median": 4.901350010186434,
+        "n": 200,
+        "wtl_vs_vector": "92/61/47",
+        "support_recall_seed_hit_subset": 0.4343656156156156,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.010857142857142859,
+            "context_recall": 0.29619047619047617,
+            "precision": 0.16866666666666666,
+            "complete": 0.0,
+            "nodes": 6.24,
+            "components": 1.0,
+            "ms": 4.952388001838699,
+            "context_recall_ci95": 0.033747362036823624,
+            "ms_median": 4.796099994564429,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.2,
+            "support_recall": 0.4133333333333333,
+            "context_recall": 0.36,
+            "precision": 0.14444444444444446,
+            "complete": 0.16,
+            "nodes": 9.98,
+            "components": 1.0,
+            "ms": 5.142651996575296,
+            "context_recall_ci95": 0.10584592576004048,
+            "ms_median": 4.960499994922429,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.16,
+            "support_recall": 0.20938095238095236,
+            "context_recall": 0.19777777777777777,
+            "precision": 0.13844444444444445,
+            "complete": 0.02,
+            "nodes": 9.94,
+            "components": 1.0,
+            "ms": 5.101072002435103,
+            "context_recall_ci95": 0.08765905614057677,
+            "ms_median": 4.949850001139566,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.7433412698412698,
+            "context_recall": 0.7757936507936507,
+            "precision": 0.4842222222222222,
+            "complete": 0.36,
+            "nodes": 9.7,
+            "components": 1.0,
+            "ms": 5.052572004497051,
+            "context_recall_ci95": 0.05055541880323384,
+            "ms_median": 4.814100015209988,
+            "n": 50
+          }
+        }
+      },
+      "hop3_out_seeds1/subgraph": {
+        "seed_recall": 0.59,
+        "support_recall": 0.3442281746031746,
+        "context_recall": 0.4074404761904762,
+        "precision": 0.23394444444444445,
+        "complete": 0.135,
+        "nodes": 8.965,
+        "components": 1.0,
+        "ms": 5.955525501340162,
+        "context_recall_ci95": 0.04824605075116447,
+        "ms_median": 5.7687999797053635,
+        "n": 200,
+        "wtl_vs_vector": "92/61/47",
+        "support_recall_seed_hit_subset": 0.4343656156156156,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.010857142857142859,
+            "context_recall": 0.29619047619047617,
+            "precision": 0.16866666666666666,
+            "complete": 0.0,
+            "nodes": 6.24,
+            "components": 1.0,
+            "ms": 5.634426001925021,
+            "context_recall_ci95": 0.033747362036823624,
+            "ms_median": 5.504149972693995,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.2,
+            "support_recall": 0.4133333333333333,
+            "context_recall": 0.36,
+            "precision": 0.14444444444444446,
+            "complete": 0.16,
+            "nodes": 9.98,
+            "components": 1.0,
+            "ms": 6.331993998028338,
+            "context_recall_ci95": 0.10584592576004048,
+            "ms_median": 5.922300013480708,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.16,
+            "support_recall": 0.20938095238095236,
+            "context_recall": 0.19777777777777777,
+            "precision": 0.13844444444444445,
+            "complete": 0.02,
+            "nodes": 9.94,
+            "components": 1.0,
+            "ms": 6.120502003468573,
+            "context_recall_ci95": 0.08765905614057677,
+            "ms_median": 5.935050023254007,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.7433412698412698,
+            "context_recall": 0.7757936507936507,
+            "precision": 0.4842222222222222,
+            "complete": 0.36,
+            "nodes": 9.7,
+            "components": 1.0,
+            "ms": 5.735180001938716,
+            "context_recall_ci95": 0.05055541880323384,
+            "ms_median": 5.649250000715256,
+            "n": 50
+          }
+        }
+      },
+      "hop3_out_seeds2/multi_hop": {
+        "seed_recall": 0.62,
+        "support_recall": 0.34281349206349204,
+        "context_recall": 0.41156547619047623,
+        "precision": 0.22028968253968256,
+        "complete": 0.12,
+        "nodes": 9.73,
+        "components": 1.46,
+        "ms": 5.984905999794137,
+        "context_recall_ci95": 0.047324986442223334,
+        "ms_median": 5.042999982833862,
+        "n": 200,
+        "wtl_vs_vector": "91/65/44",
+        "support_recall_seed_hit_subset": 0.4378029815529816,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.09028571428571429,
+            "context_recall": 0.3475238095238095,
+            "precision": 0.14360317460317462,
+            "complete": 0.04,
+            "nodes": 8.96,
+            "components": 1.26,
+            "ms": 5.303679998032749,
+            "context_recall_ci95": 0.04941321640569004,
+            "ms_median": 4.9135500157717615,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.28,
+            "support_recall": 0.32,
+            "context_recall": 0.31,
+            "precision": 0.124,
+            "complete": 0.0,
+            "nodes": 10.0,
+            "components": 1.68,
+            "ms": 8.195108002983034,
+            "context_recall_ci95": 0.08693537829905612,
+            "ms_median": 5.115749983815476,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.2,
+            "support_recall": 0.21476984126984128,
+            "context_recall": 0.21044444444444443,
+            "precision": 0.138,
+            "complete": 0.08,
+            "nodes": 10.0,
+            "components": 1.74,
+            "ms": 5.469272000482306,
+            "context_recall_ci95": 0.09495926726500248,
+            "ms_median": 5.303649988491088,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.7461984126984127,
+            "context_recall": 0.7782936507936508,
+            "precision": 0.47555555555555556,
+            "complete": 0.36,
+            "nodes": 9.96,
+            "components": 1.16,
+            "ms": 4.971563997678459,
+            "context_recall_ci95": 0.050207063838261436,
+            "ms_median": 4.8579499998595566,
+            "n": 50
+          }
+        }
+      },
+      "hop3_out_seeds2/subgraph": {
+        "seed_recall": 0.62,
+        "support_recall": 0.34281349206349204,
+        "context_recall": 0.41156547619047623,
+        "precision": 0.22028968253968256,
+        "complete": 0.12,
+        "nodes": 9.73,
+        "components": 1.46,
+        "ms": 6.140440003655385,
+        "context_recall_ci95": 0.047324986442223334,
+        "ms_median": 5.989800003590062,
+        "n": 200,
+        "wtl_vs_vector": "91/65/44",
+        "support_recall_seed_hit_subset": 0.4378029815529816,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.09028571428571429,
+            "context_recall": 0.3475238095238095,
+            "precision": 0.14360317460317462,
+            "complete": 0.04,
+            "nodes": 8.96,
+            "components": 1.26,
+            "ms": 5.838216006522998,
+            "context_recall_ci95": 0.04941321640569004,
+            "ms_median": 5.601100012427196,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.28,
+            "support_recall": 0.32,
+            "context_recall": 0.31,
+            "precision": 0.124,
+            "complete": 0.0,
+            "nodes": 10.0,
+            "components": 1.68,
+            "ms": 6.28185200272128,
+            "context_recall_ci95": 0.08693537829905612,
+            "ms_median": 6.204700010130182,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.2,
+            "support_recall": 0.21476984126984128,
+            "context_recall": 0.21044444444444443,
+            "precision": 0.138,
+            "complete": 0.08,
+            "nodes": 10.0,
+            "components": 1.74,
+            "ms": 6.409670005086809,
+            "context_recall_ci95": 0.09495926726500248,
+            "ms_median": 6.164100021123886,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.7461984126984127,
+            "context_recall": 0.7782936507936508,
+            "precision": 0.47555555555555556,
+            "complete": 0.36,
+            "nodes": 9.96,
+            "components": 1.16,
+            "ms": 6.032022000290453,
+            "context_recall_ci95": 0.050207063838261436,
+            "ms_median": 5.853750015376136,
+            "n": 50
+          }
+        }
+      },
+      "hop2_in_decay0.8/multi_hop": {
+        "seed_recall": 0.705,
+        "support_recall": 0.2528214285714286,
+        "context_recall": 0.3395515873015873,
+        "precision": 0.16586706349206348,
+        "complete": 0.235,
+        "nodes": 8.145,
+        "components": 4.315,
+        "ms": 7.514718001766596,
+        "context_recall_ci95": 0.05413507893347386,
+        "ms_median": 6.275150022702292,
+        "n": 200,
+        "wtl_vs_vector": "31/149/20",
+        "support_recall_seed_hit_subset": 0.34165057915057917,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.9862857142857143,
+            "context_recall": 0.9883333333333333,
+            "precision": 0.42,
+            "complete": 0.94,
+            "nodes": 10.0,
+            "components": 3.24,
+            "ms": 5.662673999322578,
+            "context_recall_ci95": 0.014579132728359088,
+            "ms_median": 5.347249971237034,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.44,
+            "support_recall": 0.0,
+            "context_recall": 0.11,
+            "precision": 0.07246031746031746,
+            "complete": 0.0,
+            "nodes": 6.26,
+            "components": 5.0,
+            "ms": 9.221405999269336,
+            "context_recall_ci95": 0.0347470862087744,
+            "ms_median": 9.961000003386289,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.38,
+            "support_recall": 0.0,
+            "context_recall": 0.06498412698412698,
+            "precision": 0.061007936507936504,
+            "complete": 0.0,
+            "nodes": 6.32,
+            "components": 4.98,
+            "ms": 9.413496004417539,
+            "context_recall_ci95": 0.024900300558451792,
+            "ms_median": 7.9304999962914735,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.025,
+            "context_recall": 0.19488888888888886,
+            "precision": 0.11,
+            "complete": 0.0,
+            "nodes": 10.0,
+            "components": 4.04,
+            "ms": 5.7612960040569305,
+            "context_recall_ci95": 0.029753187525057453,
+            "ms_median": 5.229200003668666,
+            "n": 50
+          }
+        }
+      },
+      "hop2_in_decay0.8/subgraph": {
+        "seed_recall": 0.705,
+        "support_recall": 0.2528214285714286,
+        "context_recall": 0.3395515873015873,
+        "precision": 0.16586706349206348,
+        "complete": 0.235,
+        "nodes": 8.145,
+        "components": 4.315,
+        "ms": 6.2283270005718805,
+        "context_recall_ci95": 0.05413507893347386,
+        "ms_median": 5.664450000040233,
+        "n": 200,
+        "wtl_vs_vector": "31/149/20",
+        "support_recall_seed_hit_subset": 0.34165057915057917,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.9862857142857143,
+            "context_recall": 0.9883333333333333,
+            "precision": 0.42,
+            "complete": 0.94,
+            "nodes": 10.0,
+            "components": 3.24,
+            "ms": 5.805516002001241,
+            "context_recall_ci95": 0.014579132728359088,
+            "ms_median": 5.599700001766905,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.44,
+            "support_recall": 0.0,
+            "context_recall": 0.11,
+            "precision": 0.07246031746031746,
+            "complete": 0.0,
+            "nodes": 6.26,
+            "components": 5.0,
+            "ms": 5.4974499985110015,
+            "context_recall_ci95": 0.0347470862087744,
+            "ms_median": 5.275100003927946,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.38,
+            "support_recall": 0.0,
+            "context_recall": 0.06498412698412698,
+            "precision": 0.061007936507936504,
+            "complete": 0.0,
+            "nodes": 6.32,
+            "components": 4.98,
+            "ms": 7.30992800090462,
+            "context_recall_ci95": 0.024900300558451792,
+            "ms_median": 7.755250000627711,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.025,
+            "context_recall": 0.19488888888888886,
+            "precision": 0.11,
+            "complete": 0.0,
+            "nodes": 10.0,
+            "components": 4.04,
+            "ms": 6.30041400087066,
+            "context_recall_ci95": 0.029753187525057453,
+            "ms_median": 5.7373000017832965,
+            "n": 50
+          }
+        }
+      },
+      "hop3_both_decay0.8/multi_hop": {
+        "seed_recall": 0.705,
+        "support_recall": 0.48317658730158725,
+        "context_recall": 0.5231309523809524,
+        "precision": 0.2595,
+        "complete": 0.3,
+        "nodes": 10.0,
+        "components": 3.13,
+        "ms": 6.687797000049613,
+        "context_recall_ci95": 0.055527627385013226,
+        "ms_median": 5.89154998306185,
+        "n": 200,
+        "wtl_vs_vector": "117/74/9",
+        "support_recall_seed_hit_subset": 0.6498444873444873,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.9618095238095238,
+            "context_recall": 0.9671428571428571,
+            "precision": 0.40399999999999997,
+            "complete": 0.84,
+            "nodes": 10.0,
+            "components": 1.86,
+            "ms": 6.093396001961082,
+            "context_recall_ci95": 0.023603766177832254,
+            "ms_median": 5.862999998498708,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.44,
+            "support_recall": 0.16,
+            "context_recall": 0.23,
+            "precision": 0.09200000000000001,
+            "complete": 0.0,
+            "nodes": 10.0,
+            "components": 4.7,
+            "ms": 8.740667997626588,
+            "context_recall_ci95": 0.06977564044851184,
+            "ms_median": 6.451199995353818,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.38,
+            "support_recall": 0.07505555555555556,
+            "context_recall": 0.12625396825396826,
+            "precision": 0.07600000000000001,
+            "complete": 0.0,
+            "nodes": 10.0,
+            "components": 4.48,
+            "ms": 5.447470002109185,
+            "context_recall_ci95": 0.05149586276082265,
+            "ms_median": 5.230700015090406,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.7358412698412699,
+            "context_recall": 0.7691269841269842,
+            "precision": 0.466,
+            "complete": 0.36,
+            "nodes": 10.0,
+            "components": 1.48,
+            "ms": 6.469653998501599,
+            "context_recall_ci95": 0.05219687801079748,
+            "ms_median": 6.191950000356883,
+            "n": 50
+          }
+        }
+      },
+      "hop3_both_decay0.8/subgraph": {
+        "seed_recall": 0.705,
+        "support_recall": 0.48317658730158725,
+        "context_recall": 0.5231309523809524,
+        "precision": 0.2595,
+        "complete": 0.3,
+        "nodes": 10.0,
+        "components": 3.13,
+        "ms": 6.818884499953128,
+        "context_recall_ci95": 0.055527627385013226,
+        "ms_median": 6.6190500219818205,
+        "n": 200,
+        "wtl_vs_vector": "117/74/9",
+        "support_recall_seed_hit_subset": 0.6498444873444873,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.9618095238095238,
+            "context_recall": 0.9671428571428571,
+            "precision": 0.40399999999999997,
+            "complete": 0.84,
+            "nodes": 10.0,
+            "components": 1.86,
+            "ms": 6.724567998899147,
+            "context_recall_ci95": 0.023603766177832254,
+            "ms_median": 6.621800013817847,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.44,
+            "support_recall": 0.16,
+            "context_recall": 0.23,
+            "precision": 0.09200000000000001,
+            "complete": 0.0,
+            "nodes": 10.0,
+            "components": 4.7,
+            "ms": 6.522854000795633,
+            "context_recall_ci95": 0.06977564044851184,
+            "ms_median": 6.470800028182566,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.38,
+            "support_recall": 0.07505555555555556,
+            "context_recall": 0.12625396825396826,
+            "precision": 0.07600000000000001,
+            "complete": 0.0,
+            "nodes": 10.0,
+            "components": 4.48,
+            "ms": 6.925492003792897,
+            "context_recall_ci95": 0.05149586276082265,
+            "ms_median": 6.583949987543747,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.7358412698412699,
+            "context_recall": 0.7691269841269842,
+            "precision": 0.466,
+            "complete": 0.36,
+            "nodes": 10.0,
+            "components": 1.48,
+            "ms": 7.102623996324837,
+            "context_recall_ci95": 0.05219687801079748,
+            "ms_median": 6.781399977626279,
+            "n": 50
+          }
+        }
+      },
+      "hop3_both_blend0.3/multi_hop": {
+        "seed_recall": 0.72,
+        "support_recall": 0.3867896825396825,
+        "context_recall": 0.4488353174603174,
+        "precision": 0.21600000000000003,
+        "complete": 0.235,
+        "nodes": 10.0,
+        "components": 3.94,
+        "ms": 7.596195500518661,
+        "context_recall_ci95": 0.052328497032790015,
+        "ms_median": 6.502900010673329,
+        "n": 200,
+        "wtl_vs_vector": "109/85/6",
+        "support_recall_seed_hit_subset": 0.5195919133419133,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.9342857142857143,
+            "context_recall": 0.9490000000000001,
+            "precision": 0.40399999999999997,
+            "complete": 0.86,
+            "nodes": 10.0,
+            "components": 3.28,
+            "ms": 10.432409996865317,
+            "context_recall_ci95": 0.039646457597117046,
+            "ms_median": 8.230550010921434,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.48,
+            "support_recall": 0.13333333333333333,
+            "context_recall": 0.22,
+            "precision": 0.08800000000000001,
+            "complete": 0.0,
+            "nodes": 10.0,
+            "components": 5.24,
+            "ms": 5.747197994496673,
+            "context_recall_ci95": 0.06661411261887379,
+            "ms_median": 5.579249991569668,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.4,
+            "support_recall": 0.05355555555555555,
+            "context_recall": 0.11133333333333333,
+            "precision": 0.068,
+            "complete": 0.0,
+            "nodes": 10.0,
+            "components": 4.98,
+            "ms": 6.167642003856599,
+            "context_recall_ci95": 0.04232817209715557,
+            "ms_median": 5.736650025937706,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.42598412698412697,
+            "context_recall": 0.5150079365079365,
+            "precision": 0.304,
+            "complete": 0.08,
+            "nodes": 10.0,
+            "components": 2.26,
+            "ms": 8.037532006856054,
+            "context_recall_ci95": 0.06074501123650778,
+            "ms_median": 7.472000026609749,
+            "n": 50
+          }
+        }
+      },
+      "hop3_both_blend0.3/subgraph": {
+        "seed_recall": 0.72,
+        "support_recall": 0.3867896825396825,
+        "context_recall": 0.4488353174603174,
+        "precision": 0.21600000000000003,
+        "complete": 0.235,
+        "nodes": 10.0,
+        "components": 3.94,
+        "ms": 10.648218501592055,
+        "context_recall_ci95": 0.052328497032790015,
+        "ms_median": 10.03714997204952,
+        "n": 200,
+        "wtl_vs_vector": "109/85/6",
+        "support_recall_seed_hit_subset": 0.5195919133419133,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.9342857142857143,
+            "context_recall": 0.9490000000000001,
+            "precision": 0.40399999999999997,
+            "complete": 0.86,
+            "nodes": 10.0,
+            "components": 3.28,
+            "ms": 13.123582006664947,
+            "context_recall_ci95": 0.039646457597117046,
+            "ms_median": 13.328550005098805,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.48,
+            "support_recall": 0.13333333333333333,
+            "context_recall": 0.22,
+            "precision": 0.08800000000000001,
+            "complete": 0.0,
+            "nodes": 10.0,
+            "components": 5.24,
+            "ms": 10.02359600039199,
+            "context_recall_ci95": 0.06661411261887379,
+            "ms_median": 8.274500025436282,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.4,
+            "support_recall": 0.05355555555555555,
+            "context_recall": 0.11133333333333333,
+            "precision": 0.068,
+            "complete": 0.0,
+            "nodes": 10.0,
+            "components": 4.98,
+            "ms": 8.28750999760814,
+            "context_recall_ci95": 0.04232817209715557,
+            "ms_median": 7.7545500244013965,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.42598412698412697,
+            "context_recall": 0.5150079365079365,
+            "precision": 0.304,
+            "complete": 0.08,
+            "nodes": 10.0,
+            "components": 2.26,
+            "ms": 11.158186001703143,
+            "context_recall_ci95": 0.06074501123650778,
+            "ms_median": 10.854349995497614,
+            "n": 50
+          }
+        }
+      },
+      "_best_graph_variant": "hop3_both_decay0.8"
+    },
+    "20": {
+      "vector_only/vector": {
+        "seed_recall": 0.785,
+        "support_recall": 0.2277559523809524,
+        "context_recall": 0.34258134920634925,
+        "precision": 0.0825,
+        "complete": 0.185,
+        "nodes": 20.0,
+        "components": 15.42,
+        "ms": 5.218726499588229,
+        "context_recall_ci95": 0.047975715667416506,
+        "ms_median": 4.979099991032854,
+        "n": 200,
+        "wtl_vs_vector": null,
+        "support_recall_seed_hit_subset": 0.2890734000606612,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.7571428571428571,
+            "context_recall": 0.8338333333333334,
+            "precision": 0.183,
+            "complete": 0.74,
+            "nodes": 20.0,
+            "components": 11.24,
+            "ms": 5.543134002946317,
+            "context_recall_ci95": 0.08274410593309149,
+            "ms_median": 5.173649988137186,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.58,
+            "support_recall": 0.0,
+            "context_recall": 0.145,
+            "precision": 0.029000000000000005,
+            "complete": 0.0,
+            "nodes": 20.0,
+            "components": 19.94,
+            "ms": 5.335649996995926,
+            "context_recall_ci95": 0.03454909550190858,
+            "ms_median": 5.006550025427714,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.56,
+            "support_recall": 0.003333333333333333,
+            "context_recall": 0.09364285714285714,
+            "precision": 0.029000000000000005,
+            "complete": 0.0,
+            "nodes": 20.0,
+            "components": 19.82,
+            "ms": 4.993930000346154,
+            "context_recall_ci95": 0.02482399764863144,
+            "ms_median": 4.919049999443814,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.15054761904761904,
+            "context_recall": 0.29784920634920636,
+            "precision": 0.08900000000000001,
+            "complete": 0.0,
+            "nodes": 20.0,
+            "components": 10.68,
+            "ms": 5.002191998064518,
+            "context_recall_ci95": 0.04168701186250571,
+            "ms_median": 4.901300009805709,
+            "n": 50
+          }
+        }
+      },
+      "hop2_out_decay0.8/multi_hop": {
+        "seed_recall": 0.705,
+        "support_recall": 0.45124404761904763,
+        "context_recall": 0.5135119047619048,
+        "precision": 0.13912497682486072,
+        "complete": 0.16,
+        "nodes": 19.44,
+        "components": 2.61,
+        "ms": 5.258577500062529,
+        "context_recall_ci95": 0.048249254605429164,
+        "ms_median": 5.000000004656613,
+        "n": 200,
+        "wtl_vs_vector": "102/56/42",
+        "support_recall_seed_hit_subset": 0.5533363663936912,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.33642857142857147,
+            "context_recall": 0.5278809523809523,
+            "precision": 0.11694271775695925,
+            "complete": 0.08,
+            "nodes": 18.02,
+            "components": 1.48,
+            "ms": 5.227568005211651,
+            "context_recall_ci95": 0.06147129736714525,
+            "ms_median": 5.01819999772124,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.44,
+            "support_recall": 0.36666666666666664,
+            "context_recall": 0.385,
+            "precision": 0.07752941176470589,
+            "complete": 0.0,
+            "nodes": 19.94,
+            "components": 3.56,
+            "ms": 5.402631995966658,
+            "context_recall_ci95": 0.09413373465447973,
+            "ms_median": 5.0722000014502555,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.38,
+            "support_recall": 0.29254761904761906,
+            "context_recall": 0.3074444444444444,
+            "precision": 0.1,
+            "complete": 0.08,
+            "nodes": 19.92,
+            "components": 3.72,
+            "ms": 5.2361300005577505,
+            "context_recall_ci95": 0.10125145463975649,
+            "ms_median": 5.029299994930625,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.8093333333333333,
+            "context_recall": 0.8337222222222223,
+            "precision": 0.2620277777777778,
+            "complete": 0.48,
+            "nodes": 19.88,
+            "components": 1.68,
+            "ms": 5.167979998514056,
+            "context_recall_ci95": 0.047406393744949996,
+            "ms_median": 4.83814999461174,
+            "n": 50
+          }
+        }
+      },
+      "hop2_out_decay0.8/subgraph": {
+        "seed_recall": 0.705,
+        "support_recall": 0.45124404761904763,
+        "context_recall": 0.5135119047619048,
+        "precision": 0.13912497682486072,
+        "complete": 0.16,
+        "nodes": 19.44,
+        "components": 2.61,
+        "ms": 6.473250999406446,
+        "context_recall_ci95": 0.048249254605429164,
+        "ms_median": 6.11374998698011,
+        "n": 200,
+        "wtl_vs_vector": "102/56/42",
+        "support_recall_seed_hit_subset": 0.5533363663936912,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.33642857142857147,
+            "context_recall": 0.5278809523809523,
+            "precision": 0.11694271775695925,
+            "complete": 0.08,
+            "nodes": 18.02,
+            "components": 1.48,
+            "ms": 6.239805998047814,
+            "context_recall_ci95": 0.06147129736714525,
+            "ms_median": 5.9179999807383865,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.44,
+            "support_recall": 0.36666666666666664,
+            "context_recall": 0.385,
+            "precision": 0.07752941176470589,
+            "complete": 0.0,
+            "nodes": 19.94,
+            "components": 3.56,
+            "ms": 6.445829998701811,
+            "context_recall_ci95": 0.09413373465447973,
+            "ms_median": 6.331550015602261,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.38,
+            "support_recall": 0.29254761904761906,
+            "context_recall": 0.3074444444444444,
+            "precision": 0.1,
+            "complete": 0.08,
+            "nodes": 19.92,
+            "components": 3.72,
+            "ms": 6.239910003496334,
+            "context_recall_ci95": 0.10125145463975649,
+            "ms_median": 5.997250002110377,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.8093333333333333,
+            "context_recall": 0.8337222222222223,
+            "precision": 0.2620277777777778,
+            "complete": 0.48,
+            "nodes": 19.88,
+            "components": 1.68,
+            "ms": 6.9674579973798245,
+            "context_recall_ci95": 0.047406393744949996,
+            "ms_median": 6.508699967525899,
+            "n": 50
+          }
+        }
+      },
+      "hop3_out_decay0.8/multi_hop": {
+        "seed_recall": 0.705,
+        "support_recall": 0.4529107142857143,
+        "context_recall": 0.5147619047619048,
+        "precision": 0.13807575757575757,
+        "complete": 0.165,
+        "nodes": 19.545,
+        "components": 2.61,
+        "ms": 5.478476501302794,
+        "context_recall_ci95": 0.04842939494186499,
+        "ms_median": 5.126000032760203,
+        "n": 200,
+        "wtl_vs_vector": "102/56/42",
+        "support_recall_seed_hit_subset": 0.555459508644222,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.33642857142857147,
+            "context_recall": 0.5278809523809523,
+            "precision": 0.11530303030303031,
+            "complete": 0.08,
+            "nodes": 18.18,
+            "components": 1.48,
+            "ms": 4.9059040017891675,
+            "context_recall_ci95": 0.06147129736714525,
+            "ms_median": 4.748050007037818,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.44,
+            "support_recall": 0.3733333333333333,
+            "context_recall": 0.39,
+            "precision": 0.078,
+            "complete": 0.02,
+            "nodes": 20.0,
+            "components": 3.56,
+            "ms": 5.763989997794852,
+            "context_recall_ci95": 0.09614239439498061,
+            "ms_median": 5.291000008583069,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.38,
+            "support_recall": 0.29254761904761906,
+            "context_recall": 0.3074444444444444,
+            "precision": 0.099,
+            "complete": 0.08,
+            "nodes": 20.0,
+            "components": 3.72,
+            "ms": 5.883326003095135,
+            "context_recall_ci95": 0.10125145463975649,
+            "ms_median": 5.398300010710955,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.8093333333333333,
+            "context_recall": 0.8337222222222223,
+            "precision": 0.26,
+            "complete": 0.48,
+            "nodes": 20.0,
+            "components": 1.68,
+            "ms": 5.36068600253202,
+            "context_recall_ci95": 0.047406393744949996,
+            "ms_median": 4.9942499899771065,
+            "n": 50
+          }
+        }
+      },
+      "hop3_out_decay0.8/subgraph": {
+        "seed_recall": 0.705,
+        "support_recall": 0.4529107142857143,
+        "context_recall": 0.5147619047619048,
+        "precision": 0.13807575757575757,
+        "complete": 0.165,
+        "nodes": 19.545,
+        "components": 2.61,
+        "ms": 6.570275002159178,
+        "context_recall_ci95": 0.04842939494186499,
+        "ms_median": 6.160449993330985,
+        "n": 200,
+        "wtl_vs_vector": "102/56/42",
+        "support_recall_seed_hit_subset": 0.555459508644222,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.33642857142857147,
+            "context_recall": 0.5278809523809523,
+            "precision": 0.11530303030303031,
+            "complete": 0.08,
+            "nodes": 18.18,
+            "components": 1.48,
+            "ms": 6.244758003158495,
+            "context_recall_ci95": 0.06147129736714525,
+            "ms_median": 6.070399977033958,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.44,
+            "support_recall": 0.3733333333333333,
+            "context_recall": 0.39,
+            "precision": 0.078,
+            "complete": 0.02,
+            "nodes": 20.0,
+            "components": 3.56,
+            "ms": 6.827248006593436,
+            "context_recall_ci95": 0.09614239439498061,
+            "ms_median": 6.233550026081502,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.38,
+            "support_recall": 0.29254761904761906,
+            "context_recall": 0.3074444444444444,
+            "precision": 0.099,
+            "complete": 0.08,
+            "nodes": 20.0,
+            "components": 3.72,
+            "ms": 7.10500399931334,
+            "context_recall_ci95": 0.10125145463975649,
+            "ms_median": 6.812250008806586,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.8093333333333333,
+            "context_recall": 0.8337222222222223,
+            "precision": 0.26,
+            "complete": 0.48,
+            "nodes": 20.0,
+            "components": 1.68,
+            "ms": 6.104089999571443,
+            "context_recall_ci95": 0.047406393744949996,
+            "ms_median": 5.959350004559383,
+            "n": 50
+          }
+        }
+      },
+      "hop3_out_decay0.5/multi_hop": {
+        "seed_recall": 0.705,
+        "support_recall": 0.4407579365079365,
+        "context_recall": 0.5040694444444445,
+        "precision": 0.13357575757575757,
+        "complete": 0.14,
+        "nodes": 19.545,
+        "components": 2.595,
+        "ms": 5.785660996625666,
+        "context_recall_ci95": 0.04724638552727694,
+        "ms_median": 5.340050003724173,
+        "n": 200,
+        "wtl_vs_vector": "102/56/42",
+        "support_recall_seed_hit_subset": 0.539978263067435,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.33642857142857147,
+            "context_recall": 0.5278809523809523,
+            "precision": 0.11530303030303031,
+            "complete": 0.08,
+            "nodes": 18.18,
+            "components": 1.48,
+            "ms": 5.611773994751275,
+            "context_recall_ci95": 0.06147129736714525,
+            "ms_median": 5.291299981763586,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.44,
+            "support_recall": 0.3733333333333333,
+            "context_recall": 0.39,
+            "precision": 0.078,
+            "complete": 0.02,
+            "nodes": 20.0,
+            "components": 3.56,
+            "ms": 5.20697599160485,
+            "context_recall_ci95": 0.09614239439498061,
+            "ms_median": 5.095649976283312,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.38,
+            "support_recall": 0.29254761904761906,
+            "context_recall": 0.3074444444444444,
+            "precision": 0.099,
+            "complete": 0.08,
+            "nodes": 20.0,
+            "components": 3.72,
+            "ms": 5.732264003017917,
+            "context_recall_ci95": 0.10125145463975649,
+            "ms_median": 5.357699992600828,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.7607222222222222,
+            "context_recall": 0.7909523809523811,
+            "precision": 0.242,
+            "complete": 0.38,
+            "nodes": 20.0,
+            "components": 1.62,
+            "ms": 6.591629997128621,
+            "context_recall_ci95": 0.04939806064069448,
+            "ms_median": 5.839949997607619,
+            "n": 50
+          }
+        }
+      },
+      "hop3_out_decay0.5/subgraph": {
+        "seed_recall": 0.705,
+        "support_recall": 0.4407579365079365,
+        "context_recall": 0.5040694444444445,
+        "precision": 0.13357575757575757,
+        "complete": 0.14,
+        "nodes": 19.545,
+        "components": 2.595,
+        "ms": 7.43224099802319,
+        "context_recall_ci95": 0.04724638552727694,
+        "ms_median": 6.615599995711818,
+        "n": 200,
+        "wtl_vs_vector": "102/56/42",
+        "support_recall_seed_hit_subset": 0.539978263067435,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.33642857142857147,
+            "context_recall": 0.5278809523809523,
+            "precision": 0.11530303030303031,
+            "complete": 0.08,
+            "nodes": 18.18,
+            "components": 1.48,
+            "ms": 8.13947400660254,
+            "context_recall_ci95": 0.06147129736714525,
+            "ms_median": 6.54119998216629,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.44,
+            "support_recall": 0.3733333333333333,
+            "context_recall": 0.39,
+            "precision": 0.078,
+            "complete": 0.02,
+            "nodes": 20.0,
+            "components": 3.56,
+            "ms": 6.458203992806375,
+            "context_recall_ci95": 0.09614239439498061,
+            "ms_median": 6.34644998353906,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.38,
+            "support_recall": 0.29254761904761906,
+            "context_recall": 0.3074444444444444,
+            "precision": 0.099,
+            "complete": 0.08,
+            "nodes": 20.0,
+            "components": 3.72,
+            "ms": 6.973271997412667,
+            "context_recall_ci95": 0.10125145463975649,
+            "ms_median": 6.650049996096641,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.7607222222222222,
+            "context_recall": 0.7909523809523811,
+            "precision": 0.242,
+            "complete": 0.38,
+            "nodes": 20.0,
+            "components": 1.62,
+            "ms": 8.158013995271176,
+            "context_recall_ci95": 0.04939806064069448,
+            "ms_median": 7.397199980914593,
+            "n": 50
+          }
+        }
+      },
+      "hop3_out_decay0.95/multi_hop": {
+        "seed_recall": 0.705,
+        "support_recall": 0.513125,
+        "context_recall": 0.5650436507936508,
+        "precision": 0.15607575757575756,
+        "complete": 0.34,
+        "nodes": 19.545,
+        "components": 2.56,
+        "ms": 6.102931502391584,
+        "context_recall_ci95": 0.054536951335109454,
+        "ms_median": 5.24854997638613,
+        "n": 200,
+        "wtl_vs_vector": "101/57/42",
+        "support_recall_seed_hit_subset": 0.6334925690021231,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.3492857142857143,
+            "context_recall": 0.537047619047619,
+            "precision": 0.1173030303030303,
+            "complete": 0.08,
+            "nodes": 18.18,
+            "components": 1.48,
+            "ms": 5.351390005089343,
+            "context_recall_ci95": 0.06129076928869468,
+            "ms_median": 5.2759500104002655,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.44,
+            "support_recall": 0.44,
+            "context_recall": 0.44,
+            "precision": 0.08800000000000001,
+            "complete": 0.24,
+            "nodes": 20.0,
+            "components": 3.6,
+            "ms": 5.143257997697219,
+            "context_recall_ci95": 0.11507284649299329,
+            "ms_median": 5.006200022762641,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.38,
+            "support_recall": 0.2892142857142857,
+            "context_recall": 0.30503174603174604,
+            "precision": 0.099,
+            "complete": 0.1,
+            "nodes": 20.0,
+            "components": 3.84,
+            "ms": 8.13152800197713,
+            "context_recall_ci95": 0.10371178829862479,
+            "ms_median": 5.046650010626763,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.9740000000000001,
+            "context_recall": 0.9780952380952381,
+            "precision": 0.32,
+            "complete": 0.94,
+            "nodes": 20.0,
+            "components": 1.32,
+            "ms": 5.785550004802644,
+            "context_recall_ci95": 0.024470935140829146,
+            "ms_median": 5.691850034054369,
+            "n": 50
+          }
+        }
+      },
+      "hop3_out_decay0.95/subgraph": {
+        "seed_recall": 0.705,
+        "support_recall": 0.513125,
+        "context_recall": 0.5650436507936508,
+        "precision": 0.15607575757575756,
+        "complete": 0.34,
+        "nodes": 19.545,
+        "components": 2.56,
+        "ms": 8.140814000507817,
+        "context_recall_ci95": 0.054536951335109454,
+        "ms_median": 6.772749999072403,
+        "n": 200,
+        "wtl_vs_vector": "101/57/42",
+        "support_recall_seed_hit_subset": 0.6334925690021231,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.3492857142857143,
+            "context_recall": 0.537047619047619,
+            "precision": 0.1173030303030303,
+            "complete": 0.08,
+            "nodes": 18.18,
+            "components": 1.48,
+            "ms": 9.021128002787009,
+            "context_recall_ci95": 0.06129076928869468,
+            "ms_median": 6.514750013593584,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.44,
+            "support_recall": 0.44,
+            "context_recall": 0.44,
+            "precision": 0.08800000000000001,
+            "complete": 0.24,
+            "nodes": 20.0,
+            "components": 3.6,
+            "ms": 7.080769996391609,
+            "context_recall_ci95": 0.11507284649299329,
+            "ms_median": 6.848149962024763,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.38,
+            "support_recall": 0.2892142857142857,
+            "context_recall": 0.30503174603174604,
+            "precision": 0.099,
+            "complete": 0.1,
+            "nodes": 20.0,
+            "components": 3.84,
+            "ms": 6.8486840021796525,
+            "context_recall_ci95": 0.10371178829862479,
+            "ms_median": 6.492300017271191,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.9740000000000001,
+            "context_recall": 0.9780952380952381,
+            "precision": 0.32,
+            "complete": 0.94,
+            "nodes": 20.0,
+            "components": 1.32,
+            "ms": 9.612674000672996,
+            "context_recall_ci95": 0.024470935140829146,
+            "ms_median": 7.513049989938736,
+            "n": 50
+          }
+        }
+      },
+      "hop3_out_blend0.3/multi_hop": {
+        "seed_recall": 0.705,
+        "support_recall": 0.4349186507936508,
+        "context_recall": 0.5002003968253969,
+        "precision": 0.13382575757575757,
+        "complete": 0.13,
+        "nodes": 19.545,
+        "components": 2.58,
+        "ms": 5.846289500768762,
+        "context_recall_ci95": 0.04708995493990871,
+        "ms_median": 5.41005001286976,
+        "n": 200,
+        "wtl_vs_vector": "101/56/43",
+        "support_recall_seed_hit_subset": 0.5336012536649479,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.3588095238095238,
+            "context_recall": 0.5445476190476191,
+            "precision": 0.1193030303030303,
+            "complete": 0.08,
+            "nodes": 18.18,
+            "components": 1.52,
+            "ms": 5.453466001199558,
+            "context_recall_ci95": 0.06229029137835205,
+            "ms_median": 5.235450022155419,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.44,
+            "support_recall": 0.32,
+            "context_recall": 0.35,
+            "precision": 0.07,
+            "complete": 0.0,
+            "nodes": 20.0,
+            "components": 3.72,
+            "ms": 5.631808002945036,
+            "context_recall_ci95": 0.08742997197757757,
+            "ms_median": 5.298550007864833,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.38,
+            "support_recall": 0.25676984126984126,
+            "context_recall": 0.2773015873015873,
+            "precision": 0.08800000000000001,
+            "complete": 0.04,
+            "nodes": 20.0,
+            "components": 3.58,
+            "ms": 5.954289995133877,
+            "context_recall_ci95": 0.09156219770944074,
+            "ms_median": 5.657500005327165,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.8040952380952381,
+            "context_recall": 0.828952380952381,
+            "precision": 0.258,
+            "complete": 0.4,
+            "nodes": 20.0,
+            "components": 1.5,
+            "ms": 6.3455940037965775,
+            "context_recall_ci95": 0.04270050139931715,
+            "ms_median": 5.646150006214157,
+            "n": 50
+          }
+        }
+      },
+      "hop3_out_blend0.3/subgraph": {
+        "seed_recall": 0.705,
+        "support_recall": 0.4349186507936508,
+        "context_recall": 0.5002003968253969,
+        "precision": 0.13382575757575757,
+        "complete": 0.13,
+        "nodes": 19.545,
+        "components": 2.58,
+        "ms": 8.066760000074282,
+        "context_recall_ci95": 0.04708995493990871,
+        "ms_median": 6.711649999488145,
+        "n": 200,
+        "wtl_vs_vector": "101/56/43",
+        "support_recall_seed_hit_subset": 0.5336012536649479,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.3588095238095238,
+            "context_recall": 0.5445476190476191,
+            "precision": 0.1193030303030303,
+            "complete": 0.08,
+            "nodes": 18.18,
+            "components": 1.52,
+            "ms": 6.766307994257659,
+            "context_recall_ci95": 0.06229029137835205,
+            "ms_median": 6.534400017699227,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.44,
+            "support_recall": 0.32,
+            "context_recall": 0.35,
+            "precision": 0.07,
+            "complete": 0.0,
+            "nodes": 20.0,
+            "components": 3.72,
+            "ms": 7.2305180004332215,
+            "context_recall_ci95": 0.08742997197757757,
+            "ms_median": 7.0125500205904245,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.38,
+            "support_recall": 0.25676984126984126,
+            "context_recall": 0.2773015873015873,
+            "precision": 0.08800000000000001,
+            "complete": 0.04,
+            "nodes": 20.0,
+            "components": 3.58,
+            "ms": 8.701290002791211,
+            "context_recall_ci95": 0.09156219770944074,
+            "ms_median": 6.849999976111576,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.8040952380952381,
+            "context_recall": 0.828952380952381,
+            "precision": 0.258,
+            "complete": 0.4,
+            "nodes": 20.0,
+            "components": 1.5,
+            "ms": 9.568924002815038,
+            "context_recall_ci95": 0.04270050139931715,
+            "ms_median": 6.420849997084588,
+            "n": 50
+          }
+        }
+      },
+      "hop3_out_seeds1/multi_hop": {
+        "seed_recall": 0.59,
+        "support_recall": 0.4307103174603174,
+        "context_recall": 0.48178174603174606,
+        "precision": 0.19106640654666973,
+        "complete": 0.34,
+        "nodes": 14.24,
+        "components": 1.0,
+        "ms": 5.598168995638844,
+        "context_recall_ci95": 0.05736069627006489,
+        "ms_median": 5.2405999740585685,
+        "n": 200,
+        "wtl_vs_vector": "94/51/55",
+        "support_recall_seed_hit_subset": 0.525826508947528,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.013714285714285714,
+            "context_recall": 0.2986904761904762,
+            "precision": 0.16366666666666668,
+            "complete": 0.0,
+            "nodes": 6.84,
+            "components": 1.0,
+            "ms": 5.482939996290952,
+            "context_recall_ci95": 0.03383471261556359,
+            "ms_median": 5.118700006278232,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.2,
+            "support_recall": 0.45333333333333337,
+            "context_recall": 0.39,
+            "precision": 0.09986979034037857,
+            "complete": 0.2,
+            "nodes": 16.68,
+            "components": 1.0,
+            "ms": 6.04721199371852,
+            "context_recall_ci95": 0.11126257232331094,
+            "ms_median": 5.889850028324872,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.16,
+            "support_recall": 0.2557936507936508,
+            "context_recall": 0.23843650793650795,
+            "precision": 0.10185677987303375,
+            "complete": 0.16,
+            "nodes": 17.1,
+            "components": 1.0,
+            "ms": 5.14034399529919,
+            "context_recall_ci95": 0.10459489166762859,
+            "ms_median": 5.084949953015894,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 1.0,
+            "context_recall": 1.0,
+            "precision": 0.39887238930659985,
+            "complete": 1.0,
+            "nodes": 16.34,
+            "components": 1.0,
+            "ms": 5.7221799972467124,
+            "context_recall_ci95": 0.0,
+            "ms_median": 5.299249984091148,
+            "n": 50
+          }
+        }
+      },
+      "hop3_out_seeds1/subgraph": {
+        "seed_recall": 0.59,
+        "support_recall": 0.4307103174603174,
+        "context_recall": 0.48178174603174606,
+        "precision": 0.19106640654666973,
+        "complete": 0.34,
+        "nodes": 14.24,
+        "components": 1.0,
+        "ms": 7.6804715022444725,
+        "context_recall_ci95": 0.05736069627006489,
+        "ms_median": 6.391250004526228,
+        "n": 200,
+        "wtl_vs_vector": "94/51/55",
+        "support_recall_seed_hit_subset": 0.525826508947528,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.013714285714285714,
+            "context_recall": 0.2986904761904762,
+            "precision": 0.16366666666666668,
+            "complete": 0.0,
+            "nodes": 6.84,
+            "components": 1.0,
+            "ms": 10.899058002978563,
+            "context_recall_ci95": 0.03383471261556359,
+            "ms_median": 8.712900016689673,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.2,
+            "support_recall": 0.45333333333333337,
+            "context_recall": 0.39,
+            "precision": 0.09986979034037857,
+            "complete": 0.2,
+            "nodes": 16.68,
+            "components": 1.0,
+            "ms": 6.3215060089714825,
+            "context_recall_ci95": 0.11126257232331094,
+            "ms_median": 6.202150019817054,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.16,
+            "support_recall": 0.2557936507936508,
+            "context_recall": 0.23843650793650795,
+            "precision": 0.10185677987303375,
+            "complete": 0.16,
+            "nodes": 17.1,
+            "components": 1.0,
+            "ms": 6.541377997491509,
+            "context_recall_ci95": 0.10459489166762859,
+            "ms_median": 6.515000015497208,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 1.0,
+            "context_recall": 1.0,
+            "precision": 0.39887238930659985,
+            "complete": 1.0,
+            "nodes": 16.34,
+            "components": 1.0,
+            "ms": 6.9599439995363355,
+            "context_recall_ci95": 0.0,
+            "ms_median": 6.4285999978892505,
+            "n": 50
+          }
+        }
+      },
+      "hop3_out_seeds2/multi_hop": {
+        "seed_recall": 0.62,
+        "support_recall": 0.4562222222222222,
+        "context_recall": 0.5042539682539683,
+        "precision": 0.15420602099568817,
+        "complete": 0.305,
+        "nodes": 18.0,
+        "components": 1.42,
+        "ms": 6.29351899784524,
+        "context_recall_ci95": 0.055715794382574936,
+        "ms_median": 5.80265000462532,
+        "n": 200,
+        "wtl_vs_vector": "99/50/51",
+        "support_recall_seed_hit_subset": 0.5534602163583056,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.10314285714285715,
+            "context_recall": 0.35669047619047617,
+            "precision": 0.11046136173767752,
+            "complete": 0.04,
+            "nodes": 13.44,
+            "components": 1.26,
+            "ms": 6.29798999405466,
+            "context_recall_ci95": 0.05080095755877923,
+            "ms_median": 5.923799995798618,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.28,
+            "support_recall": 0.5,
+            "context_recall": 0.445,
+            "precision": 0.09241025641025642,
+            "complete": 0.24,
+            "nodes": 19.66,
+            "components": 1.6,
+            "ms": 5.494611994363368,
+            "context_recall_ci95": 0.11137701737791329,
+            "ms_median": 5.099750007502735,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.2,
+            "support_recall": 0.2569047619047619,
+            "context_recall": 0.24654761904761904,
+            "precision": 0.08322222222222223,
+            "complete": 0.14,
+            "nodes": 19.96,
+            "components": 1.68,
+            "ms": 6.892486001597717,
+            "context_recall_ci95": 0.10483851721270204,
+            "ms_median": 6.068349990528077,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.9648412698412698,
+            "context_recall": 0.9687777777777778,
+            "precision": 0.33073024361259656,
+            "complete": 0.8,
+            "nodes": 18.94,
+            "components": 1.14,
+            "ms": 6.488988001365215,
+            "context_recall_ci95": 0.018574766369432817,
+            "ms_median": 6.031149969203398,
+            "n": 50
+          }
+        }
+      },
+      "hop3_out_seeds2/subgraph": {
+        "seed_recall": 0.62,
+        "support_recall": 0.4562222222222222,
+        "context_recall": 0.5042539682539683,
+        "precision": 0.15420602099568817,
+        "complete": 0.305,
+        "nodes": 18.0,
+        "components": 1.42,
+        "ms": 10.544777501490898,
+        "context_recall_ci95": 0.055715794382574936,
+        "ms_median": 9.548600006382912,
+        "n": 200,
+        "wtl_vs_vector": "99/50/51",
+        "support_recall_seed_hit_subset": 0.5534602163583056,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.10314285714285715,
+            "context_recall": 0.35669047619047617,
+            "precision": 0.11046136173767752,
+            "complete": 0.04,
+            "nodes": 13.44,
+            "components": 1.26,
+            "ms": 9.16619399562478,
+            "context_recall_ci95": 0.05080095755877923,
+            "ms_median": 8.572100021410733,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.28,
+            "support_recall": 0.5,
+            "context_recall": 0.445,
+            "precision": 0.09241025641025642,
+            "complete": 0.24,
+            "nodes": 19.66,
+            "components": 1.6,
+            "ms": 8.97009800421074,
+            "context_recall_ci95": 0.11137701737791329,
+            "ms_median": 8.165350009221584,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.2,
+            "support_recall": 0.2569047619047619,
+            "context_recall": 0.24654761904761904,
+            "precision": 0.08322222222222223,
+            "complete": 0.14,
+            "nodes": 19.96,
+            "components": 1.68,
+            "ms": 13.32379000261426,
+            "context_recall_ci95": 0.10483851721270204,
+            "ms_median": 13.469000026816502,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.9648412698412698,
+            "context_recall": 0.9687777777777778,
+            "precision": 0.33073024361259656,
+            "complete": 0.8,
+            "nodes": 18.94,
+            "components": 1.14,
+            "ms": 10.719028003513813,
+            "context_recall_ci95": 0.018574766369432817,
+            "ms_median": 11.435450025601313,
+            "n": 50
+          }
+        }
+      },
+      "hop2_in_decay0.8/multi_hop": {
+        "seed_recall": 0.705,
+        "support_recall": 0.25758928571428574,
+        "context_recall": 0.3436488095238095,
+        "precision": 0.10146480785296574,
+        "complete": 0.25,
+        "nodes": 13.15,
+        "components": 4.34,
+        "ms": 5.753174998098984,
+        "context_recall_ci95": 0.05462176442537068,
+        "ms_median": 4.839899978833273,
+        "n": 200,
+        "wtl_vs_vector": "13/147/40",
+        "support_recall_seed_hit_subset": 0.3281392174704277,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 1.0,
+            "context_recall": 1.0,
+            "precision": 0.21539097744360902,
+            "complete": 1.0,
+            "nodes": 19.86,
+            "components": 3.18,
+            "ms": 5.329175998922437,
+            "context_recall_ci95": 0.0,
+            "ms_median": 5.224450025707483,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.44,
+            "support_recall": 0.0,
+            "context_recall": 0.11,
+            "precision": 0.07246031746031746,
+            "complete": 0.0,
+            "nodes": 6.42,
+            "components": 5.0,
+            "ms": 4.842047997517511,
+            "context_recall_ci95": 0.0347470862087744,
+            "ms_median": 4.61294999695383,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.38,
+            "support_recall": 0.0,
+            "context_recall": 0.06498412698412698,
+            "precision": 0.061007936507936504,
+            "complete": 0.0,
+            "nodes": 6.32,
+            "components": 4.98,
+            "ms": 4.8352259991224855,
+            "context_recall_ci95": 0.024900300558451792,
+            "ms_median": 4.714950016932562,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.030357142857142857,
+            "context_recall": 0.19961111111111113,
+            "precision": 0.057,
+            "complete": 0.0,
+            "nodes": 20.0,
+            "components": 4.2,
+            "ms": 8.006249996833503,
+            "context_recall_ci95": 0.02950887282341774,
+            "ms_median": 4.841249989112839,
+            "n": 50
+          }
+        }
+      },
+      "hop2_in_decay0.8/subgraph": {
+        "seed_recall": 0.705,
+        "support_recall": 0.25758928571428574,
+        "context_recall": 0.3436488095238095,
+        "precision": 0.10146480785296574,
+        "complete": 0.25,
+        "nodes": 13.15,
+        "components": 4.34,
+        "ms": 6.884521498868708,
+        "context_recall_ci95": 0.05462176442537068,
+        "ms_median": 6.219250004505739,
+        "n": 200,
+        "wtl_vs_vector": "13/147/40",
+        "support_recall_seed_hit_subset": 0.3281392174704277,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 1.0,
+            "context_recall": 1.0,
+            "precision": 0.21539097744360902,
+            "complete": 1.0,
+            "nodes": 19.86,
+            "components": 3.18,
+            "ms": 8.552966002607718,
+            "context_recall_ci95": 0.0,
+            "ms_median": 6.417949975002557,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.44,
+            "support_recall": 0.0,
+            "context_recall": 0.11,
+            "precision": 0.07246031746031746,
+            "complete": 0.0,
+            "nodes": 6.42,
+            "components": 5.0,
+            "ms": 6.414130001794547,
+            "context_recall_ci95": 0.0347470862087744,
+            "ms_median": 6.16725001600571,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.38,
+            "support_recall": 0.0,
+            "context_recall": 0.06498412698412698,
+            "precision": 0.061007936507936504,
+            "complete": 0.0,
+            "nodes": 6.32,
+            "components": 4.98,
+            "ms": 6.194879998220131,
+            "context_recall_ci95": 0.024900300558451792,
+            "ms_median": 6.086199980927631,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.030357142857142857,
+            "context_recall": 0.19961111111111113,
+            "precision": 0.057,
+            "complete": 0.0,
+            "nodes": 20.0,
+            "components": 4.2,
+            "ms": 6.3761099928524345,
+            "context_recall_ci95": 0.02950887282341774,
+            "ms_median": 6.25465001212433,
+            "n": 50
+          }
+        }
+      },
+      "hop3_both_decay0.8/multi_hop": {
+        "seed_recall": 0.71,
+        "support_recall": 0.5887599206349207,
+        "context_recall": 0.608484126984127,
+        "precision": 0.15475,
+        "complete": 0.35,
+        "nodes": 20.0,
+        "components": 2.735,
+        "ms": 7.218273498874623,
+        "context_recall_ci95": 0.054207068666986005,
+        "ms_median": 5.984000017633662,
+        "n": 200,
+        "wtl_vs_vector": "112/80/8",
+        "support_recall_seed_hit_subset": 0.7348852492164594,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.992,
+            "context_recall": 0.9933333333333333,
+            "precision": 0.212,
+            "complete": 0.98,
+            "nodes": 20.0,
+            "components": 1.56,
+            "ms": 6.0806379991117865,
+            "context_recall_ci95": 0.013066666666666667,
+            "ms_median": 5.91599999461323,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.44,
+            "support_recall": 0.34,
+            "context_recall": 0.365,
+            "precision": 0.073,
+            "complete": 0.0,
+            "nodes": 20.0,
+            "components": 3.74,
+            "ms": 10.96512799966149,
+            "context_recall_ci95": 0.0951691126364011,
+            "ms_median": 8.355099998880178,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.4,
+            "support_recall": 0.26826984126984127,
+            "context_recall": 0.2898095238095238,
+            "precision": 0.094,
+            "complete": 0.06,
+            "nodes": 20.0,
+            "components": 3.82,
+            "ms": 5.416987998178229,
+            "context_recall_ci95": 0.097259526658965,
+            "ms_median": 5.306250008288771,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.7547698412698413,
+            "context_recall": 0.7857936507936507,
+            "precision": 0.24,
+            "complete": 0.36,
+            "nodes": 20.0,
+            "components": 1.82,
+            "ms": 6.410339998546988,
+            "context_recall_ci95": 0.04858565555723135,
+            "ms_median": 6.32489999406971,
+            "n": 50
+          }
+        }
+      },
+      "hop3_both_decay0.8/subgraph": {
+        "seed_recall": 0.71,
+        "support_recall": 0.5887599206349207,
+        "context_recall": 0.608484126984127,
+        "precision": 0.15475,
+        "complete": 0.35,
+        "nodes": 20.0,
+        "components": 2.735,
+        "ms": 8.692286499135662,
+        "context_recall_ci95": 0.054207068666986005,
+        "ms_median": 7.071250001899898,
+        "n": 200,
+        "wtl_vs_vector": "112/80/8",
+        "support_recall_seed_hit_subset": 0.7348852492164594,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 0.992,
+            "context_recall": 0.9933333333333333,
+            "precision": 0.212,
+            "complete": 0.98,
+            "nodes": 20.0,
+            "components": 1.56,
+            "ms": 12.405133999418467,
+            "context_recall_ci95": 0.013066666666666667,
+            "ms_median": 7.874750008340925,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.44,
+            "support_recall": 0.34,
+            "context_recall": 0.365,
+            "precision": 0.073,
+            "complete": 0.0,
+            "nodes": 20.0,
+            "components": 3.74,
+            "ms": 6.805585996480659,
+            "context_recall_ci95": 0.0951691126364011,
+            "ms_median": 6.611299992073327,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.4,
+            "support_recall": 0.26826984126984127,
+            "context_recall": 0.2898095238095238,
+            "precision": 0.094,
+            "complete": 0.06,
+            "nodes": 20.0,
+            "components": 3.82,
+            "ms": 6.956919999793172,
+            "context_recall_ci95": 0.097259526658965,
+            "ms_median": 6.561150017660111,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.7547698412698413,
+            "context_recall": 0.7857936507936507,
+            "precision": 0.24,
+            "complete": 0.36,
+            "nodes": 20.0,
+            "components": 1.82,
+            "ms": 8.60150600085035,
+            "context_recall_ci95": 0.04858565555723135,
+            "ms_median": 7.344449986703694,
+            "n": 50
+          }
+        }
+      },
+      "hop3_both_blend0.3/multi_hop": {
+        "seed_recall": 0.72,
+        "support_recall": 0.48737698412698416,
+        "context_recall": 0.5301507936507937,
+        "precision": 0.1325,
+        "complete": 0.33,
+        "nodes": 20.0,
+        "components": 3.425,
+        "ms": 8.362020001513883,
+        "context_recall_ci95": 0.055298872524337524,
+        "ms_median": 7.029749976936728,
+        "n": 200,
+        "wtl_vs_vector": "106/78/16",
+        "support_recall_seed_hit_subset": 0.6147583661914872,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 1.0,
+            "context_recall": 1.0,
+            "precision": 0.214,
+            "complete": 1.0,
+            "nodes": 20.0,
+            "components": 1.96,
+            "ms": 8.826586003415287,
+            "context_recall_ci95": 0.0,
+            "ms_median": 8.04810001864098,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.48,
+            "support_recall": 0.16,
+            "context_recall": 0.24,
+            "precision": 0.04800000000000001,
+            "complete": 0.0,
+            "nodes": 20.0,
+            "components": 5.32,
+            "ms": 8.871434000320733,
+            "context_recall_ci95": 0.06994397758206207,
+            "ms_median": 5.431049969047308,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.4,
+            "support_recall": 0.10688888888888888,
+            "context_recall": 0.15568253968253967,
+            "precision": 0.049,
+            "complete": 0.0,
+            "nodes": 20.0,
+            "components": 4.6,
+            "ms": 8.334612000035122,
+            "context_recall_ci95": 0.05586253604459193,
+            "ms_median": 8.014499966520816,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.6826190476190476,
+            "context_recall": 0.724920634920635,
+            "precision": 0.21899999999999997,
+            "complete": 0.32,
+            "nodes": 20.0,
+            "components": 1.82,
+            "ms": 7.415448002284393,
+            "context_recall_ci95": 0.06154609233315696,
+            "ms_median": 6.836949993157759,
+            "n": 50
+          }
+        }
+      },
+      "hop3_both_blend0.3/subgraph": {
+        "seed_recall": 0.72,
+        "support_recall": 0.48737698412698416,
+        "context_recall": 0.5301507936507937,
+        "precision": 0.1325,
+        "complete": 0.33,
+        "nodes": 20.0,
+        "components": 3.425,
+        "ms": 9.074285501264967,
+        "context_recall_ci95": 0.055298872524337524,
+        "ms_median": 7.735549996141344,
+        "n": 200,
+        "wtl_vs_vector": "106/78/16",
+        "support_recall_seed_hit_subset": 0.6147583661914872,
+        "by_type": {
+          "impact": {
+            "seed_recall": 1.0,
+            "support_recall": 1.0,
+            "context_recall": 1.0,
+            "precision": 0.214,
+            "complete": 1.0,
+            "nodes": 20.0,
+            "components": 1.96,
+            "ms": 8.314906001323834,
+            "context_recall_ci95": 0.0,
+            "ms_median": 8.19169997703284,
+            "n": 50
+          },
+          "incident_owner": {
+            "seed_recall": 0.48,
+            "support_recall": 0.16,
+            "context_recall": 0.24,
+            "precision": 0.04800000000000001,
+            "complete": 0.0,
+            "nodes": 20.0,
+            "components": 5.32,
+            "ms": 8.706061997218058,
+            "context_recall_ci95": 0.06994397758206207,
+            "ms_median": 7.306150015210733,
+            "n": 50
+          },
+          "incident_rootcause": {
+            "seed_recall": 0.4,
+            "support_recall": 0.10688888888888888,
+            "context_recall": 0.15568253968253967,
+            "precision": 0.049,
+            "complete": 0.0,
+            "nodes": 20.0,
+            "components": 4.6,
+            "ms": 10.979760002810508,
+            "context_recall_ci95": 0.05586253604459193,
+            "ms_median": 7.665499986615032,
+            "n": 50
+          },
+          "service_deps": {
+            "seed_recall": 1.0,
+            "support_recall": 0.6826190476190476,
+            "context_recall": 0.724920634920635,
+            "precision": 0.21899999999999997,
+            "complete": 0.32,
+            "nodes": 20.0,
+            "components": 1.82,
+            "ms": 8.296414003707469,
+            "context_recall_ci95": 0.06154609233315696,
+            "ms_median": 7.79040003544651,
+            "n": 50
+          }
+        }
+      },
+      "_best_graph_variant": "hop3_both_decay0.8"
+    }
+  },
+  "questions_sample": [
+    {
+      "id": "incident_owner-000",
+      "type": "incident_owner",
+      "text": "after rejected and lockout users unauthorized. Reference code e7616. Who owns the affected service and who is on call for it?",
+      "seed_gold": [
+        [
+          "incident",
+          "INC-0232"
+        ]
+      ],
+      "support_gold": [
+        [
+          "person",
+          "p0077"
+        ],
+        [
+          "service",
+          "campaigns-service"
+        ],
+        [
+          "team",
+          "meridian"
+        ]
+      ],
+      "natural_direction": "out"
+    },
+    {
+      "id": "incident_owner-001",
+      "type": "incident_owner",
+      "text": "users timeouts and stalls across delays. It hits the reporting flow. Reference code e2162. Who owns the affected service and who is on call for it?",
+      "seed_gold": [
+        [
+          "incident",
+          "INC-0253"
+        ]
+      ],
+      "support_gold": [
+        [
+          "person",
+          "p0017"
+        ],
+        [
+          "service",
+          "reporting-gateway"
+        ],
+        [
+          "team",
+          "helix"
+        ]
+      ],
+      "natural_direction": "out"
+    },
+    {
+      "id": "incident_owner-002",
+      "type": "incident_owner",
+      "text": "reported throttled and congestion across queueing. It hits the notifications flow. Reference code e6962. Who owns the affected service and who is on call for it?",
+      "seed_gold": [
+        [
+          "incident",
+          "INC-0586"
+        ]
+      ],
+      "support_gold": [
+        [
+          "person",
+          "p0065"
+        ],
+        [
+          "service",
+          "notifications-gateway"
+        ],
+        [
+          "team",
+          "dynamo"
+        ]
+      ],
+      "natural_direction": "out"
+    },
+    {
+      "id": "incident_owner-003",
+      "type": "incident_owner",
+      "text": "noticed unresponsive and unavailable reported blackout. It hits the webhooks flow. Reference code e9821. Who owns the affected service and who is on call for it?",
+      "seed_gold": [
+        [
+          "incident",
+          "INC-0273"
+        ]
+      ],
+      "support_gold": [
+        [
+          "person",
+          "p0073"
+        ],
+        [
+          "service",
+          "webhooks-service"
+        ],
+        [
+          "team",
+          "borealis"
+        ]
+      ],
+      "natural_direction": "out"
+    },
+    {
+      "id": "incident_owner-004",
+      "type": "incident_owner",
+      "text": "sustained overload and throttled reported backlog. Reference code e1538. Who owns the affected service and who is on call for it?",
+      "seed_gold": [
+        [
+          "incident",
+          "INC-0833"
+        ]
+      ],
+      "support_gold": [
+        [
+          "person",
+          "p0073"
+        ],
+        [
+          "service",
+          "push-worker"
+        ],
+        [
+          "team",
+          "borealis"
+        ]
+      ],
+      "natural_direction": "out"
+    },
+    {
+      "id": "incident_owner-005",
+      "type": "incident_owner",
+      "text": "across crashes and faults customers errors. It hits the sms flow. Reference code e1860. Who owns the affected service and who is on call for it?",
+      "seed_gold": [
+        [
+          "incident",
+          "INC-0346"
+        ]
+      ],
+      "support_gold": [
+        [
+          "person",
+          "p0069"
+        ],
+        [
+          "service",
+          "sms-ingest"
+        ],
+        [
+          "team",
+          "cobalt"
+        ]
+      ],
+      "natural_direction": "out"
+    },
+    {
+      "id": "incident_owner-006",
+      "type": "incident_owner",
+      "text": "several exceptions and 5xx users errors. It hits the sms flow. Reference code e2329. Who owns the affected service and who is on call for it?",
+      "seed_gold": [
+        [
+          "incident",
+          "INC-0827"
+        ]
+      ],
+      "support_gold": [
+        [
+          "person",
+          "p0069"
+        ],
+        [
+          "service",
+          "sms-scheduler"
+        ],
+        [
+          "team",
+          "cobalt"
+        ]
+      ],
+      "natural_direction": "out"
+    },
+    {
+      "id": "incident_owner-007",
+      "type": "incident_owner",
+      "text": "across revoked and rejected during expired. It hits the reporting flow. Who owns the affected service and who is on call for it?",
+      "seed_gold": [
+        [
+          "incident",
+          "INC-0880"
+        ]
+      ],
+      "support_gold": [
+        [
+          "person",
+          "p0017"
+        ],
+        [
+          "service",
+          "reporting-gateway"
+        ],
+        [
+          "team",
+          "helix"
+        ]
+      ],
+      "natural_direction": "out"
+    }
+  ],
+  "runtime_s": 67.9
+}
