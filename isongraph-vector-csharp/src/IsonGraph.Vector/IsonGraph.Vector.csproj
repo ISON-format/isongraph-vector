@@ -23,6 +23,7 @@
     <!-- The SQLite store shares the top-k selection helper rather than
          duplicating it; it is an implementation detail, not public API. -->
     <InternalsVisibleTo Include="IsonGraph.Vector.Sqlite" />
+    <InternalsVisibleTo Include="IsonGraph.Vector.Tests" />
   </ItemGroup>
 
   <PropertyGroup>

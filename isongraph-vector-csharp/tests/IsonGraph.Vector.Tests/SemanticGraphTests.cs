@@ -489,6 +489,72 @@ public class SemanticGraphTests
         Assert.True(Math.Abs(result.Score - 0.81f) < 1e-5f, $"score was {result.Score}");
     }
 
+    private static SemanticGraph PathGraph(params string[] ids)
+    {
+        var graph = new SemanticGraph("paths", new FixedEncoder(), autoEmbed: false);
+        foreach (var id in ids) graph.AddNode("n", id);
+        return graph;
+    }
+
+    private static void Chain(SemanticGraph graph, params string[] ids)
+    {
+        for (int i = 0; i + 1 < ids.Length; i++)
+            graph.Graph.AddEdge("R", new NodeRef("n", ids[i]), new NodeRef("n", ids[i + 1]));
+    }
+
+    [Fact]
+    public void SemanticPathPicksTheBestScoringSeedNotTheFirstReachable()
+    {
+        // FixedEncoder queries with [1,0,0,0]. A is the better seed (1.0) but
+        // three hops out: 1.0 * 0.9^3 = 0.729. B scores 0.9 and is one hop
+        // out: 0.9 * 0.9 = 0.81 - the better path.
+        var graph = PathGraph("A", "x", "y", "B", "T");
+        Chain(graph, "A", "x", "y", "T");
+        Chain(graph, "B", "T");
+        graph.EmbeddingStore.Add(new NodeRef("n", "A"), "a", new[] { 1.0f, 0f, 0f, 0f });
+        graph.EmbeddingStore.Add(new NodeRef("n", "B"), "b", new[] { 0.9f, MathF.Sqrt(0.19f), 0f, 0f });
+
+        var result = graph.SemanticPath("q", new NodeRef("n", "T"), "R", topKSeeds: 3);
+
+        Assert.NotNull(result);
+        Assert.Equal(1, result!.HopCount);
+        Assert.Equal("B", result.Path[0].Id);
+        Assert.True(Math.Abs(result.Score - 0.81f) < 1e-5f, $"score was {result.Score}");
+    }
+
+    [Fact]
+    public void SemanticPathClampsANegativeSeedScoreToZero()
+    {
+        // Cosine -1.0: decaying it would give -0.9, i.e. a longer path would
+        // score higher than a shorter one. It must pass on nothing instead.
+        var graph = PathGraph("A", "T");
+        Chain(graph, "A", "T");
+        graph.EmbeddingStore.Add(new NodeRef("n", "A"), "a", new[] { -1.0f, 0f, 0f, 0f });
+
+        var result = graph.SemanticPath("q", new NodeRef("n", "T"), "R", threshold: -1.0f);
+
+        Assert.NotNull(result);
+        Assert.Equal(0f, result!.Score);
+    }
+
+    [Fact]
+    public void SemanticPathTieGoesToTheMoreSimilarSeed()
+    {
+        // Both seeds are negative so both clamp to 0 and tie; the better
+        // (less negative) seed arrives first and must keep the win.
+        var graph = PathGraph("S1", "S2", "m", "T");
+        Chain(graph, "S1", "m", "T");
+        Chain(graph, "S2", "T");
+        graph.EmbeddingStore.Add(new NodeRef("n", "S1"), "a", new[] { -0.5f, MathF.Sqrt(0.75f), 0f, 0f });
+        graph.EmbeddingStore.Add(new NodeRef("n", "S2"), "b", new[] { -1.0f, 0f, 0f, 0f });
+
+        var result = graph.SemanticPath("q", new NodeRef("n", "T"), "R", threshold: -1.0f);
+
+        Assert.NotNull(result);
+        Assert.Equal("S1", result!.Path[0].Id);
+        Assert.Equal(0f, result.Score);
+    }
+
     [Fact]
     public void SemanticPathReturnsNullWithoutARoute()
     {
@@ -653,6 +719,203 @@ public class PortabilityTests
         Assert.Equal(expected.Length, stored.Length);
         for (int i = 0; i < expected.Length; i++)
             Assert.True(Math.Abs(stored[i] - expected[i]) < 1e-6f);
+    }
+}
+
+public class UpdateNodeTests
+{
+    private static Dictionary<string, object?> Props(string key, object? value) =>
+        new() { [key] = value };
+
+    [Fact]
+    public void ReEmbedsWhenAnEmbedFieldChanges()
+    {
+        var encoder = new MockEncoder(16);
+        var graph = new SemanticGraph("u", encoder);
+        graph.AddNode("person", "1", Props("name", "Alice"));
+        var before = graph.GetEmbedding(new NodeRef("person", "1"))!;
+
+        graph.UpdateNode("person", "1", Props("name", "Zebra"));
+
+        var after = graph.GetEmbedding(new NodeRef("person", "1"))!;
+        Assert.Equal("Zebra", after.Text);
+        Assert.NotEqual(before.Vector, after.Vector);
+        Assert.Equal(encoder.Encode("Zebra"), after.Vector);
+        Assert.Equal("Zebra", graph.Graph.GetNode("person", "1").Properties["name"]);
+    }
+
+    [Fact]
+    public void RemovesTheVectorWhenNothingIsLeftToEmbed()
+    {
+        var graph = new SemanticGraph("u", new MockEncoder(16));
+        graph.AddNode("person", "1", Props("name", "Alice"));
+        Assert.NotNull(graph.GetEmbedding(new NodeRef("person", "1")));
+
+        graph.UpdateNode("person", "1", Props("name", ""));
+
+        Assert.Null(graph.GetEmbedding(new NodeRef("person", "1")));
+        Assert.Equal(0, graph.EmbeddingStore.Count);
+    }
+
+    [Fact]
+    public void LeavesTheEmbeddingAloneWhenNoEmbedFieldChanged()
+    {
+        var graph = new SemanticGraph("u", new MockEncoder(16));
+        graph.AddNode("person", "1", Props("name", "Alice"));
+        var before = graph.GetEmbedding(new NodeRef("person", "1"));
+
+        graph.UpdateNode("person", "1", Props("age", 30L));
+
+        Assert.Same(before, graph.GetEmbedding(new NodeRef("person", "1")));
+        Assert.Equal(30L, graph.Graph.GetNode("person", "1").Properties["age"]);
+    }
+
+    [Fact]
+    public void LeavesTheEmbeddingAloneWhenAutoEmbedIsOff()
+    {
+        var graph = new SemanticGraph("u", new MockEncoder(16), autoEmbed: false);
+        graph.AddNode("person", "1", Props("name", "Alice"), "managed by the caller");
+        var before = graph.GetEmbedding(new NodeRef("person", "1"));
+
+        graph.UpdateNode("person", "1", Props("name", "Zebra"));
+
+        Assert.Same(before, graph.GetEmbedding(new NodeRef("person", "1")));
+        Assert.Equal("managed by the caller", before!.Text);
+    }
+
+    [Fact]
+    public void ReEmbedsOnlyFromTheConfiguredFields()
+    {
+        var graph = new SemanticGraph("u", new MockEncoder(16), embedFields: new[] { "bio" });
+        graph.AddNode("person", "1", new() { ["name"] = "Alice", ["bio"] = "engineer" });
+
+        graph.UpdateNode("person", "1", Props("name", "Zebra"));
+        Assert.Equal("engineer", graph.GetEmbedding(new NodeRef("person", "1"))!.Text);
+
+        graph.UpdateNode("person", "1", Props("bio", "pilot"));
+        Assert.Equal("pilot", graph.GetEmbedding(new NodeRef("person", "1"))!.Text);
+    }
+}
+
+public class GraphPersistenceTests : IDisposable
+{
+    private readonly string _dir =
+        Directory.CreateDirectory(
+            System.IO.Path.Combine(System.IO.Path.GetTempPath(), "isongraph-vector-" + Guid.NewGuid().ToString("N"))).FullName;
+
+    public void Dispose()
+    {
+        try { Directory.Delete(_dir, recursive: true); } catch (IOException) { }
+    }
+
+    private static Dictionary<string, object?> Props(string k, object? v) => new() { [k] = v };
+
+    private static SemanticGraph Sample(bool directed = true)
+    {
+        var graph = new SemanticGraph("saved", new MockEncoder(32), directed: directed);
+        graph.AddNode("person", "1", Props("name", "Alice"));
+        graph.AddNode("person", "007", Props("name", "Bond"));
+        graph.AddNode("doc", "d", new() { ["name"] = "Doc", ["pages"] = 12L });
+        graph.Graph.AddEdge("KNOWS", new NodeRef("person", "1"), new NodeRef("person", "007"));
+        graph.Graph.AddEdge("WROTE", new NodeRef("person", "1"), new NodeRef("doc", "d"));
+        return graph;
+    }
+
+    [Fact]
+    public void RoundTripsGraphAndEmbeddings()
+    {
+        var path = System.IO.Path.Combine(_dir, "g.ison");
+        var graph = Sample();
+        graph.Save(path);
+
+        Assert.True(File.Exists(path));
+        Assert.True(File.Exists(path + ".embeddings.json"));
+        Assert.Equal(path + ".embeddings.json", SemanticGraph.EmbeddingsPathFor(path));
+
+        var loaded = SemanticGraph.Load(path, new MockEncoder(32));
+        // the ISON file format carries no graph name; it comes from the file name
+        Assert.Equal("g", loaded.Name);
+        Assert.Equal(3, loaded.Graph.NodeCount());
+        Assert.Equal(2, loaded.Graph.EdgeCount());
+        Assert.Equal(3, loaded.EmbeddingStore.Count);
+        Assert.Equal(12L, loaded.Graph.GetNode("doc", "d").Properties["pages"]);
+        foreach (var node in graph.Graph.Nodes())
+        {
+            var nodeRef = new NodeRef(node.Type, node.Id);
+            Assert.Equal(graph.GetEmbedding(nodeRef)!.Vector, loaded.GetEmbedding(nodeRef)!.Vector);
+            Assert.Equal(graph.GetEmbedding(nodeRef)!.Text, loaded.GetEmbedding(nodeRef)!.Text);
+        }
+
+        // searches work again after the round trip
+        var hits = loaded.SimilaritySearch("Alice", 1, null, -1.0f);
+        Assert.Equal("1", hits[0].NodeRef.Id);
+    }
+
+    [Fact]
+    public void KeepsAnUndirectedGraphsEdgesThroughARoundTrip()
+    {
+        var path = System.IO.Path.Combine(_dir, "u.ison");
+        var original = Sample(directed: false);
+        original.Save(path);
+
+        var loaded = SemanticGraph.Load(path, new MockEncoder(32));
+        // The file stores both mirrored directions of every edge, so the edge
+        // set survives even though the format cannot record "undirected".
+        Assert.Equal(original.Graph.EdgeCount(), loaded.Graph.EdgeCount());
+        Assert.Single(loaded.Graph.Neighbors(new NodeRef("person", "007"), "KNOWS"));
+    }
+
+    [Fact]
+    public void GraphOnlySaveWritesNoSidecarAndLoadsEmpty()
+    {
+        var path = System.IO.Path.Combine(_dir, "g.ison");
+        Sample().Save(path, embeddings: false);
+        Assert.False(File.Exists(path + ".embeddings.json"));
+
+        var loaded = SemanticGraph.Load(path, new MockEncoder(32));
+        Assert.Equal(3, loaded.Graph.NodeCount());
+        Assert.Equal(0, loaded.EmbeddingStore.Count);
+    }
+
+    [Fact]
+    public void LoadCanSkipTheSidecar()
+    {
+        var path = System.IO.Path.Combine(_dir, "g.ison");
+        Sample().Save(path);
+        var loaded = SemanticGraph.Load(path, new MockEncoder(32), embeddings: false);
+        Assert.Equal(0, loaded.EmbeddingStore.Count);
+    }
+
+    [Fact]
+    public void LoadDoesNotReEmbedFromTheGraphProperties()
+    {
+        // A custom text (not derivable from properties) must survive a load.
+        var path = System.IO.Path.Combine(_dir, "g.ison");
+        var graph = new SemanticGraph("saved", new MockEncoder(32));
+        graph.AddNode("person", "1", Props("name", "Alice"), "hand-written text");
+        graph.Save(path);
+
+        var loaded = SemanticGraph.Load(path, new MockEncoder(32));
+        Assert.Equal("hand-written text", loaded.GetEmbedding(new NodeRef("person", "1"))!.Text);
+    }
+
+    [Fact]
+    public void LoadsASidecarWrittenByThePythonPort()
+    {
+        // Python's integer ids arrive unquoted; they must land on the string
+        // ids of the nodes in the graph file.
+        var path = System.IO.Path.Combine(_dir, "py.ison");
+        var graph = new SemanticGraph("py", new MockEncoder(4), autoEmbed: false);
+        graph.AddNode("person", "1");
+        graph.AddNode("account", "007");
+        graph.Save(path, embeddings: false);
+        File.WriteAllText(path + ".embeddings.json",
+            """{"format":"ison-embeddings","version":1,"dimension":4,"count":2,"embeddings":[{"type":"person","id":1,"id_type":"int","text":"Alice","model":"mock-4","vector":[-0.8610728979110718,-0.33433854579925537,0.8408418893814087,-0.2771846055984497]},{"type":"account","id":"007","id_type":"str","text":"Bond","model":"mock-4","vector":[-0.9531009197235107,0.9167747497558594,0.5073114633560181,-0.0420149564743042]}]}""");
+
+        var loaded = SemanticGraph.Load(path, new MockEncoder(4));
+        Assert.Equal(2, loaded.EmbeddingStore.Count);
+        Assert.Equal("Alice", loaded.GetEmbedding(new NodeRef("person", "1"))!.Text);
+        Assert.Equal("Bond", loaded.GetEmbedding(new NodeRef("account", "007"))!.Text);
     }
 }
 

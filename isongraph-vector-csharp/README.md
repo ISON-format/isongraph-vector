@@ -103,6 +103,121 @@ Alongside those: `SemanticPath` to reach a specific target from a
 semantically-relevant start, `EmbedAllNodes` to backfill an existing graph in
 one batched encoder call, and `EmbedNodes` for batching your own pairs.
 
+`SemanticPath` scores every seed that reaches the target as
+`max(seedScore, 0) * decay^hops` and returns the best, so a slightly less
+similar seed one hop away beats a better seed five hops away (a tie goes to the
+more similar seed). A negative seed score is clamped to 0, as in
+`SemanticMultiHop`.
+
+## Filtering, weighting and connecting
+
+**Filter by node.** `SimilaritySearch`, `SemanticMultiHop`, `SemanticPath` and
+`SemanticSubgraph` take a `nodeFilter` (`Func<Node, bool>`) and `nodeTypes`
+(on `MultiHopOptions` for the traversals). They combine by AND with each other
+and with `nodeType`. Seeds must pass and are chosen *among* passing nodes, so a
+filtered-out best match never takes a seed slot, and only passing nodes are
+returned. By default a node that fails can still be walked *through* (it costs a
+hop and its decay, and a returned path may list it); `StrictFilter = true` (or
+`strictFilter: true` on `SemanticPath`) makes the filter a hard wall. A
+`SemanticPath` whose target fails returns `null`. A reference with no node in
+the graph fails whenever a `nodeFilter` is set.
+
+```csharp
+var people = graph.SemanticMultiHop("who builds search?", new MultiHopOptions
+{
+    NodeTypes = new[] { "person" },
+    NodeFilter = n => n.Properties.TryGetValue("active", out var a) && a is true,
+});
+```
+
+**Weight the edges.** `WeightField = "w"` multiplies each hop's decay by
+`clamp(edge["w"], 0, 1)`. A missing, non-numeric, boolean or NaN weight counts as
+1.0; a weight of 0 scores 0 but stays reachable; a node is scored by its best
+route, which may be longer than the shortest. With `WeightField = null` (the
+default) scores are bit-identical to before.
+
+**Keep the slice connected.** `SemanticSubgraph(query, options, connect: true,
+connectMaxHops: 2)` adds connector nodes so the selected nodes fall into as few
+weakly connected components as possible: greedily, it adds the interior of the
+shortest route (at most `connectMaxHops` edges, honouring `RelType`/`Direction`)
+between two components until one remains or nothing fits. The result can hold
+more than `TopKResults` nodes, connectors are not marked, and without
+`StrictFilter` a connector may fail the filter. `connectMaxHops` below 1 throws.
+
+## Models and consistency
+
+Every stored vector records the model that made it (`IEmbeddingEncoder.ModelName`,
+`"mock-<dim>"` for `MockEncoder`; encoders that do not say record `"unknown"`,
+and vectors handed in with no encoder record `"provided"`). Encoders and stores
+also carry a free-form `Version`.
+
+```csharp
+graph.EmbeddingStore.Models();          // { "mock-384": 120 }
+graph.SetEncoder(newEncoder);
+graph.StaleEmbeddings();                // nodes whose vector is another model's or width
+graph.ReembedStale(batchSize: 256);     // re-encode them, keeping custom embed text
+```
+
+`"unknown"`/`"provided"` vectors are never stale unless you pass
+`includeUnknown: true` (a dimension mismatch always counts). A text query whose
+encoder differs from the stored vectors' model raises the store's `Warning`
+event once per pair of models (standard error if nobody listens); construct with
+`onModelMismatch: ModelMismatchMode.Error` for a `ModelMismatchException`, or
+`Ignore`. Vector queries are never checked. `Clear(resetDimension)` forgets the
+pinned width (it defaults to true, as `Clear()` always did).
+
+`Save` writes the graph file, then the sidecar, each atomically (temp file,
+flush, move), and records a `GraphDigest` of the graph as it re-reads from the
+file just written, plus `encoder_model` and `encoder_version`, after the
+`embeddings` array so version-1 readers ignore them. `Load` verifies the digest:
+
+```csharp
+SemanticGraph.Load(path, encoder);                                          // mismatch throws GraphEmbeddingMismatchException
+SemanticGraph.Load(path, encoder, onMismatch: GraphMismatchMode.Warn);      // use the vectors anyway
+SemanticGraph.Load(path, encoder, onMismatch: GraphMismatchMode.Reembed);   // rebuild them from the graph
+```
+
+A sidecar with no digest, or a digest of a basis this build does not know
+(`nodes-edges-json-v1` is the one it writes), is loaded as before. The digest is
+byte-identical to the Python port's, so a pair saved by one port verifies in the
+other; `GraphDigest.Compute(graph)` and `GraphDigest.OfText(isonText)` expose it.
+`store.LastImportMeta` holds the metadata of the last imported sidecar.
+
+## Keeping embeddings in step
+
+Change a node through `SemanticGraph.UpdateNode`, not `graph.Graph.UpdateNode`:
+
+```csharp
+graph.UpdateNode("person", "1", new() { ["name"] = "Alicia" });
+```
+
+With auto-embed on, touching any embed field re-embeds the node from its new
+properties; if nothing is left to embed the stale vector is dropped. Updates to
+other fields, and graphs created with `autoEmbed: false`, leave the embedding
+alone. `ISONGraph` is sealed, so the wrapped `Graph.UpdateNode` cannot be
+overridden and still works — but it bypasses the re-embedding and leaves the
+vector stale.
+
+## Saving and loading a graph
+
+The ISON file format carries nodes and edges only, so `Save` writes the
+embeddings to a sidecar next to it, and `Load` restores them:
+
+```csharp
+graph.Save("social.ison");                 // also writes social.ison.embeddings.json
+var loaded = SemanticGraph.Load("social.ison", new MockEncoder(384));
+
+graph.Save("social.ison", embeddings: false);   // graph file only
+SemanticGraph.EmbeddingsPathFor("social.ison"); // "social.ison.embeddings.json"
+```
+
+The sidecar is the same `ison-embeddings` payload as `ToJson`, so a graph saved
+by the Python port loads here and vice versa. `Load` does not re-embed from node
+properties (the saved vectors and texts are kept exactly), and you pass the
+encoder the graph was saved with so later text queries land in the same vector
+space. As in the other ports, the graph name comes back from the file name and
+the graph comes back directed (an undirected graph's mirrored edges are kept).
+
 ## Storing the vectors
 
 The core package keeps embeddings in memory. Add `IsonGraph.Vector.Sqlite` and
@@ -177,6 +292,18 @@ store.FromJson(json);
   spells them (`true`/`false`, not .NET's `True`), so the same graph produces
   the same text in every port. Floats use the invariant culture — `1.5` never
   `1,5`.
+- **Digests and ids.** C# node ids are strings. `Save`/`Load` take the digest
+  from the file's text, where an integer id is unquoted, so a pair written by
+  the Python port verifies here. `GraphDigest.Compute(graph)` of an in-memory
+  graph cannot know which ids "meant" integers: it treats plain decimal text
+  (`-?[0-9]+`) as one, or takes a predicate. Integers beyond 64 bits read as
+  strings here but as integers in Python, so a graph holding one verifies with a
+  false mismatch (use `GraphMismatchMode.Warn`). The IsonGraph 1.4.0 package
+  this depends on cannot read the `meta.graph` block Python writes for an
+  undirected graph, so such a file does not load here.
+- **Warnings are events, not exceptions.** There is no `warnings` module in
+  .NET: subscribe to `Warning` (or pass `onWarning` to `Load`), or they go to
+  standard error.
 - **The vec0 natives come from a redistribution.** asg017's own `sqlite-vec`
   package has never left prerelease on NuGet, and a stable package cannot
   depend on a prerelease one, so this port takes its natives from
@@ -187,7 +314,7 @@ store.FromJson(json);
 ## Tests
 
 ```bash
-dotnet test        # 61 tests
+dotnet test        # 160 tests
 ```
 
 ## Links
