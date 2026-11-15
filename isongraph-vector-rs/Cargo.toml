@@ -39,6 +39,10 @@ rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 sqlite-vec = { version = "0.1.9", optional = true }
 md-5 = { version = "0.10", optional = true }
 
+# Optional: HttpEncoder, which sends texts to an embedding endpoint. A small
+# blocking client with rustls; off by default so the default build gains nothing.
+ureq = { version = "2.12", default-features = false, features = ["tls"], optional = true }
+
 [dev-dependencies]
 tempfile = "3"
 
@@ -55,3 +59,6 @@ default = []
 # The schema matches the other language ports byte for byte, so a database
 # written by one can be opened by another.
 sqlite = ["dep:rusqlite", "dep:sqlite-vec", "dep:md-5"]
+# HttpEncoder: an EmbeddingEncoder that POSTs texts to an OpenAI-compatible or
+# Ollama embeddings endpoint. Texts leave the process; see the README.
+http-encoder = ["dep:ureq"]

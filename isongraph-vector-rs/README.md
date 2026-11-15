@@ -25,11 +25,16 @@ isongraph-vector-rs = "1.0"
 
 # or, with the SQLite-backed store and sqlite-vec:
 isongraph-vector-rs = { version = "1.0", features = ["sqlite"] }
+
+# or, with an encoder that calls an HTTP embeddings endpoint (OpenAI / Ollama):
+isongraph-vector-rs = { version = "1.0", features = ["http-encoder"] }
 ```
 
 Built on [`ison-graph`](https://crates.io/crates/ison-graph) 1.4. The `sqlite`
 feature pulls in `rusqlite` with its bundled SQLite, so it needs nothing
-installed on the system.
+installed on the system. The `http-encoder` feature adds a small blocking HTTP
+client (`ureq` with rustls); with it off, the default, the crate has no HTTP
+dependency at all.
 
 ## The idea, in one example
 
@@ -53,8 +58,8 @@ for (id, name, role) in [
         None,
     )?;
 }
-graph.graph_mut().add_edge("KNOWS", ("person", "1"), ("person", "2"), vec![])?;
-graph.graph_mut().add_edge("KNOWS", ("person", "2"), ("person", "3"), vec![])?;
+graph.add_edge("KNOWS", ("person", "1"), ("person", "2"), vec![])?;
+graph.add_edge("KNOWS", ("person", "2"), ("person", "3"), vec![])?;
 
 let results = graph.semantic_multi_hop_with(
     "Alice software engineer",
@@ -99,11 +104,13 @@ build a property list). If all your values are strings,
 re-exported for the same reason - it appears in every store signature, so
 naming one should not cost you a second dependency.
 
-`ISONGraph` is wrapped by composition rather than inherited from, so the
-underlying graph stays available through `graph()` and `graph_mut()` — which is
-where the edges above are added. `graph_mut()` sits below the semantic layer
-and does not touch the embeddings, so use `SemanticGraph::update_node` and
-`remove_node` for node changes rather than the same methods on `graph_mut()`.
+`ISONGraph` is wrapped by composition. Read access to the underlying graph is
+`graph()`. There is deliberately no mutable access: `graph().update_node(..)`
+and `remove_node(..)` would change a node's text, or delete it, behind the
+embedding store's back and leave stale vectors. Edges are added and removed
+through `SemanticGraph::add_edge` and `remove_edge` (they carry no text, so
+embeddings are unaffected); nodes through `add_node`, `update_node` and
+`remove_node`, which keep each vector in step.
 
 **Updating a node keeps its embedding honest.** With `auto_embed` on,
 `update_node` re-embeds the node from its merged properties when any embed
@@ -222,6 +229,17 @@ store.add_batch(&[                       // one encoder call, one transaction
 ])?;
 ```
 
+The SQLite store has the same model lifecycle as the in-memory one: each write
+is stamped with the encoder's `model_name()` (`"provided"` when you hand in a
+vector and there is no encoder), and `models()`, `stale(model, dimension,
+include_unknown)`, `on_model_mismatch` / `warnings()` for text queries,
+`set_version`, `clear_with(reset_dimension)`, `export_embeddings_with(digest)`,
+`save_embeddings_with(path, digest)` (atomic) and `last_import_meta()` behave as
+described under *Models and stale vectors*. Differences: `models()` and
+`stale()` return a `Result`, because they read the database. A database made by
+an older release of any port, with no `model` column, opens fine: the column is
+added and the vectors already there count as `"unknown"`.
+
 Pass `true` for that last argument and top-k searches are answered by a
 sqlite-vec `vec0` virtual table instead of a scan. It does not change what you
 get back: `vec0` runs an exact brute-force KNN in C, not an approximate index
@@ -236,6 +254,41 @@ Top-k results come out of `select_nth_unstable_by` rather than sorting all of
 them, which is where a third of the query time used to go. Filtering by node
 type stays exact too: the type is a `vec0` metadata column, so it narrows the
 search rather than filtering its results.
+
+## Embedding over HTTP
+
+With the `http-encoder` feature, `HttpEncoder` is an `EmbeddingEncoder` that
+asks an embeddings endpoint:
+
+```rust
+use isongraph_vector_rs::{HttpEncoder, SemanticGraph};
+use std::time::Duration;
+
+let encoder = HttpEncoder::new("http://localhost:11434/api/embed", "nomic-embed-text", 768)
+    .with_api_key(std::env::var("EMBED_API_KEY")?)   // optional
+    .with_batch_size(32)
+    .with_timeout(Duration::from_secs(30))
+    .with_version("v1.5");
+let graph = SemanticGraph::new("kb", Box::new(encoder));
+```
+
+**Every text you embed or search with is sent to that URL.** Use an endpoint you
+are willing to give that text to, and prefer `https://` for anything off your
+own machine. The request is `POST` with `{"model": ..., "input": [texts]}`; the
+answer may be OpenAI-shaped (`data[i].embedding`, ordered by `index`) or Ollama's
+`/api/embed` (`embeddings`). `model_name()` is the model you pass, so vectors are
+stamped with it and a different model is caught by the checks above. HTTP 429
+and 5xx are retried (twice by default, honouring `Retry-After`); redirects are
+not followed, so the key cannot be forwarded elsewhere; the key is never put
+in an error message or `Debug` output.
+
+The dimension is given up front (or learned once with `.probe_dimension()?`).
+Because `EmbeddingEncoder` methods cannot return errors, a failed request makes
+`encode` / `encode_batch` return *empty* vectors, which every store refuses
+(`EmbeddingError::EmptyVector`) — nothing bad is ever stored. The cause is in
+`encoder.last_error()` and on stderr; `try_encode` / `try_encode_batch` return it
+directly. The client is blocking: call it from a blocking context, not straight
+from an async task.
 
 ## Saving and loading a graph
 
@@ -294,8 +347,9 @@ store.from_json(&json, false)?;
 - **One embedding per node**, from one text field or a concatenation. No
   multi-vector nodes, no edge embeddings.
 - **`MockEncoder` has no semantic structure.** Use it to test plumbing, never
-  to judge relevance quality. This port ships no real encoder — implement
-  `EmbeddingEncoder` over the model of your choice.
+  to judge relevance quality. For real vectors use `HttpEncoder` (feature
+  `http-encoder`, which sends your texts to the endpoint you configure) or
+  implement `EmbeddingEncoder` over the model of your choice.
 - **`NodeId` is string-typed here.** The shared payload format carries an
   `id_type` of `str` or `int`; this port reads and preserves `int` written by
   another, but every id it originates is a string.
@@ -316,8 +370,9 @@ store.from_json(&json, false)?;
 ## Tests
 
 ```bash
-cargo test                      # 121 unit tests + 2 doctests
-cargo test --features sqlite    # + 14 SQLite tests
+cargo test                      # 122 unit tests + 2 doctests
+cargo test --features sqlite    # + 22 SQLite tests
+cargo test --features http-encoder   # + 18 HTTP encoder tests (local mock server)
 cargo clippy --all-targets --features sqlite -- -D warnings
 cargo fmt --check
 ```

@@ -49,6 +49,13 @@ pub mod sqlite_store;
 #[cfg(feature = "sqlite")]
 pub use sqlite_store::SqliteEmbeddingStore;
 
+/// HTTP embeddings endpoint as an encoder, behind the `http-encoder` feature.
+/// Texts are sent to the configured URL.
+#[cfg(feature = "http-encoder")]
+pub mod http_encoder;
+#[cfg(feature = "http-encoder")]
+pub use http_encoder::{HttpEncoder, HttpEncoderError};
+
 pub const VERSION: &str = "1.0.0";
 
 /// Portable embedding payload shared by every language port, so a store built
@@ -68,6 +75,33 @@ pub const UNKNOWN_MODELS: [&str; 2] = ["unknown", "provided"];
 
 fn is_unknown_model(model: &str) -> bool {
     UNKNOWN_MODELS.contains(&model)
+}
+
+/// The message for a text query whose encoder is not the stored vectors'
+/// model, and the key that de-duplicates its warning (one per model pair).
+/// Sorts `foreign` in place. Shared by the in-memory and SQLite stores so the
+/// wording cannot drift between them.
+pub(crate) fn mismatch_report(current: &str, foreign: &mut [&String]) -> (String, String) {
+    foreign.sort();
+    let listed = foreign
+        .iter()
+        .map(|m| format!("'{m}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let message = format!(
+        "encoder model '{current}' differs from the model that produced the stored \
+         vectors ({listed}); scores compare vectors from different spaces. Re-embed \
+         with reembed_stale() or search with the original encoder."
+    );
+    let key = format!(
+        "{current}\u{0}{}",
+        foreign
+            .iter()
+            .map(|m| m.as_str())
+            .collect::<Vec<_>>()
+            .join("\u{0}")
+    );
+    (message, key)
 }
 
 // =============================================================================
@@ -684,28 +718,10 @@ impl EmbeddingStore {
         if foreign.is_empty() {
             return Ok(());
         }
-        foreign.sort();
-        let listed = foreign
-            .iter()
-            .map(|m| format!("'{m}'"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let message = format!(
-            "encoder model '{current}' differs from the model that produced the stored \
-             vectors ({listed}); scores compare vectors from different spaces. Re-embed \
-             with reembed_stale() or search with the original encoder."
-        );
+        let (message, key) = mismatch_report(&current, &mut foreign);
         if self.on_model_mismatch == ModelMismatch::Error {
             return Err(EmbeddingError::ModelMismatch(message));
         }
-        let key = format!(
-            "{current}\u{0}{}",
-            foreign
-                .iter()
-                .map(|m| m.as_str())
-                .collect::<Vec<_>>()
-                .join("\u{0}")
-        );
         let first_time = self
             .warned
             .lock()
@@ -1520,16 +1536,36 @@ impl SemanticGraph {
         &self.graph
     }
 
-    /// Mutable access to the underlying graph, for edges and other structure.
+    /// Add an edge between two existing nodes.
     ///
-    /// This is an escape hatch below the semantic layer: it does not touch the
-    /// embedding store. Changing node properties through it
-    /// (`graph_mut().update_node(..)`) leaves the node's embedding describing
-    /// text it no longer carries, and removing a node through it leaves an
-    /// orphaned vector. Use `SemanticGraph::update_node` and
-    /// `SemanticGraph::remove_node` for those.
-    pub fn graph_mut(&mut self) -> &mut ISONGraph {
-        &mut self.graph
+    /// Edges carry no text, so they never touch the embedding store. This and
+    /// `remove_edge` are the only structural mutations the underlying graph
+    /// lets through: node changes go through `add_node`, `update_node` and
+    /// `remove_node`, which keep each node's vector in step. (There is
+    /// deliberately no `graph_mut()`: it would let a caller change a node's
+    /// text, or remove the node, behind the embedding store's back.)
+    pub fn add_edge(
+        &mut self,
+        rel_type: &str,
+        source: (&str, &str),
+        target: (&str, &str),
+        properties: Vec<(&str, Value)>,
+    ) -> Result<(), EmbeddingError> {
+        self.graph
+            .add_edge(rel_type, source, target, properties)
+            .map_err(|e| EmbeddingError::GraphError(e.to_string()))
+    }
+
+    /// Remove an edge. Nodes and their embeddings are untouched.
+    pub fn remove_edge(
+        &mut self,
+        rel_type: &str,
+        source: (&str, &str),
+        target: (&str, &str),
+    ) -> Result<(), EmbeddingError> {
+        self.graph
+            .remove_edge(rel_type, source, target)
+            .map_err(|e| EmbeddingError::GraphError(e.to_string()))
     }
 
     pub fn embedding_store(&self) -> &EmbeddingStore {
@@ -2800,7 +2836,6 @@ mod tests {
         graph.add_node("person", "1", vec![], None).unwrap();
         graph.add_node("person", "2", vec![], None).unwrap();
         graph
-            .graph_mut()
             .add_edge("KNOWS", ("person", "1"), ("person", "2"), vec![])
             .unwrap();
         // person:1 matches the query perfectly, person:2 slightly less well.
@@ -3108,7 +3143,6 @@ mod tests {
             .unwrap();
 
         graph
-            .graph_mut()
             .add_edge("KNOWS", ("person", "1"), ("person", "2"), vec![])
             .unwrap();
 
@@ -3162,7 +3196,6 @@ mod tests {
             .set_encoder(Box::new(FixedEncoder));
         graph.add_node("person", "3", vec![], None).unwrap();
         graph
-            .graph_mut()
             .add_edge("KNOWS", ("person", "2"), ("person", "3"), vec![])
             .unwrap();
         graph
@@ -3189,7 +3222,6 @@ mod tests {
         graph.add_node("person", "1", vec![], None).unwrap();
         graph.add_node("person", "2", vec![], None).unwrap();
         graph
-            .graph_mut()
             .add_edge("KNOWS", ("person", "1"), ("person", "2"), vec![])
             .unwrap();
         graph
@@ -3237,11 +3269,9 @@ mod tests {
             graph.add_node("person", id, vec![], None).unwrap();
         }
         graph
-            .graph_mut()
             .add_edge("KNOWS", ("person", "1"), ("person", "2"), vec![])
             .unwrap();
         graph
-            .graph_mut()
             .add_edge("KNOWS", ("person", "1"), ("person", "3"), vec![])
             .unwrap();
         graph
@@ -3318,11 +3348,9 @@ mod tests {
             graph.add_node("person", id, vec![], None).unwrap();
         }
         graph
-            .graph_mut()
             .add_edge("KNOWS", ("person", "1"), ("person", "2"), vec![])
             .unwrap();
         graph
-            .graph_mut()
             .add_edge("KNOWS", ("person", "2"), ("person", "3"), vec![])
             .unwrap();
         // Distinct vectors, and a threshold that admits only person:1, so the
@@ -3492,11 +3520,9 @@ mod tests {
             )
             .unwrap();
         graph
-            .graph_mut()
             .add_edge("KNOWS", ("person", "1"), ("person", "2"), vec![])
             .unwrap();
         graph
-            .graph_mut()
             .add_edge("KNOWS", ("person", "2"), ("person", "3"), vec![])
             .unwrap();
 
@@ -3805,6 +3831,42 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_edges_are_added_and_removed_without_touching_embeddings() {
+        let mut graph = SemanticGraph::new("e", Box::new(MockEncoder::new(8)));
+        for id in ["1", "2"] {
+            graph
+                .add_node("person", id, vec![("name", text_prop(id))], None)
+                .unwrap();
+        }
+        let before = graph.embedding_store().count();
+        graph
+            .add_edge("KNOWS", ("person", "1"), ("person", "2"), vec![])
+            .unwrap();
+        assert!(graph
+            .graph()
+            .has_edge("KNOWS", ("person", "1"), ("person", "2")));
+        assert!(matches!(
+            graph.add_edge("KNOWS", ("person", "1"), ("person", "2"), vec![]),
+            Err(EmbeddingError::GraphError(_))
+        ));
+        assert!(matches!(
+            graph.add_edge("KNOWS", ("person", "1"), ("person", "9"), vec![]),
+            Err(EmbeddingError::GraphError(_))
+        ));
+        graph
+            .remove_edge("KNOWS", ("person", "1"), ("person", "2"))
+            .unwrap();
+        assert!(!graph
+            .graph()
+            .has_edge("KNOWS", ("person", "1"), ("person", "2")));
+        assert!(matches!(
+            graph.remove_edge("KNOWS", ("person", "1"), ("person", "2")),
+            Err(EmbeddingError::GraphError(_))
+        ));
+        assert_eq!(graph.embedding_store().count(), before);
+    }
+
     // -- semantic_path picks the best seed ---------------------------------
 
     /// Seeds a (score 1.0) and s (score 0.9) both reach the target; a is three
@@ -3815,10 +3877,7 @@ mod tests {
             graph.add_node("n", id, vec![], None).unwrap();
         }
         for (from, to) in [("a", "b"), ("b", "c"), ("c", "t"), ("s", "t")] {
-            graph
-                .graph_mut()
-                .add_edge("E", ("n", from), ("n", to), vec![])
-                .unwrap();
+            graph.add_edge("E", ("n", from), ("n", to), vec![]).unwrap();
         }
         let vectors: [(&str, Vec<f32>); 3] = [
             ("a", vec![1.0, 0.0, 0.0, 0.0]),
@@ -3885,7 +3944,6 @@ mod tests {
         graph.add_node("n", "neg", vec![], None).unwrap();
         graph.add_node("n", "t", vec![], None).unwrap();
         graph
-            .graph_mut()
             .add_edge("E", ("n", "neg"), ("n", "t"), vec![])
             .unwrap();
         // Opposite to the query: cosine -1. The target has no embedding, so it
@@ -3941,7 +3999,6 @@ mod tests {
             .add_node("doc", "007", vec![("text", text_prop("Bond file"))], None)
             .unwrap();
         graph
-            .graph_mut()
             .add_edge("KNOWS", ("person", "1"), ("person", "2"), vec![])
             .unwrap();
         graph
@@ -4097,7 +4154,6 @@ mod tests {
                 .unwrap();
         }
         graph
-            .graph_mut()
             .add_edge("KNOWS", ("person", "1"), ("person", "2"), vec![])
             .unwrap();
         graph
@@ -4135,11 +4191,9 @@ mod tests {
             .add_node("company", "100", vec![("name", text_prop("C"))], None)
             .unwrap();
         graph
-            .graph_mut()
             .add_edge("KNOWS", ("person", "1"), ("company", "100"), vec![])
             .unwrap();
         graph
-            .graph_mut()
             .add_edge("KNOWS", ("company", "100"), ("person", "3"), vec![])
             .unwrap();
         let store = graph.embedding_store_mut();
@@ -4288,7 +4342,6 @@ mod tests {
             .unwrap();
         graph.add_node("account", "007", vec![], None).unwrap();
         graph
-            .graph_mut()
             .add_edge(
                 "KNOWS",
                 ("person", "1"),
@@ -4990,16 +5043,23 @@ mod tests {
                 .add_node("n", id, vec![("kind", text_prop(kind))], None)
                 .unwrap();
         }
-        let g = graph.graph_mut();
         if a_to_x {
-            g.add_edge(rel_ab, ("n", "A"), ("n", "X"), vec![]).unwrap();
+            graph
+                .add_edge(rel_ab, ("n", "A"), ("n", "X"), vec![])
+                .unwrap();
         } else {
-            g.add_edge(rel_ab, ("n", "X"), ("n", "A"), vec![]).unwrap();
+            graph
+                .add_edge(rel_ab, ("n", "X"), ("n", "A"), vec![])
+                .unwrap();
         }
         if b_to_x {
-            g.add_edge(rel_xb, ("n", "B"), ("n", "X"), vec![]).unwrap();
+            graph
+                .add_edge(rel_xb, ("n", "B"), ("n", "X"), vec![])
+                .unwrap();
         } else {
-            g.add_edge(rel_xb, ("n", "X"), ("n", "B"), vec![]).unwrap();
+            graph
+                .add_edge(rel_xb, ("n", "X"), ("n", "B"), vec![])
+                .unwrap();
         }
         let store = graph.embedding_store_mut();
         store.add(nid("n", "A"), "a", Some(vec![1.0, 0.0])).unwrap();
@@ -5109,10 +5169,7 @@ mod tests {
             graph.add_node("n", id, vec![], None).unwrap();
         }
         for (s, t) in [("A", "M1"), ("M1", "M2"), ("M2", "B")] {
-            graph
-                .graph_mut()
-                .add_edge("R", ("n", s), ("n", t), vec![])
-                .unwrap();
+            graph.add_edge("R", ("n", s), ("n", t), vec![]).unwrap();
         }
         let store = graph.embedding_store_mut();
         store.add(nid("n", "A"), "a", Some(vec![1.0, 0.0])).unwrap();
@@ -5181,7 +5238,6 @@ mod tests {
         for (i, id) in ["A", "B", "C"].iter().enumerate() {
             graph.add_node("n", id, vec![], None).unwrap();
             graph
-                .graph_mut()
                 .add_edge("R", ("n", id), ("n", "HUB"), vec![])
                 .unwrap();
             graph
@@ -5256,12 +5312,10 @@ mod tests {
             graph.add_node("n", id, vec![], None).unwrap();
         }
         graph
-            .graph_mut()
             .add_edge("R", ("n", "S"), ("n", "P"), vec![("w", p_weight)])
             .unwrap();
         let q_props = q_weight.map(|w| vec![("w", w)]).unwrap_or_default();
         graph
-            .graph_mut()
             .add_edge("R", ("n", "S"), ("n", "Q"), q_props)
             .unwrap();
         graph
@@ -5346,12 +5400,14 @@ mod tests {
         for id in ["S", "M", "T"] {
             graph.add_node("n", id, vec![], None).unwrap();
         }
-        let g = graph.graph_mut();
-        g.add_edge("R", ("n", "S"), ("n", "T"), vec![("w", Value::Float(0.1))])
+        graph
+            .add_edge("R", ("n", "S"), ("n", "T"), vec![("w", Value::Float(0.1))])
             .unwrap(); // direct but weak
-        g.add_edge("R", ("n", "S"), ("n", "M"), vec![("w", Value::Float(1.0))])
+        graph
+            .add_edge("R", ("n", "S"), ("n", "M"), vec![("w", Value::Float(1.0))])
             .unwrap();
-        g.add_edge("R", ("n", "M"), ("n", "T"), vec![("w", Value::Float(1.0))])
+        graph
+            .add_edge("R", ("n", "M"), ("n", "T"), vec![("w", Value::Float(1.0))])
             .unwrap(); // 2 hops, strong
         graph
             .embedding_store_mut()
@@ -5427,10 +5483,7 @@ mod tests {
             graph.add_node("n", id, vec![], None).unwrap();
         }
         for (s, t) in [("A", "B"), ("B", "C"), ("C", "D")] {
-            graph
-                .graph_mut()
-                .add_edge("R", ("n", s), ("n", t), vec![])
-                .unwrap();
+            graph.add_edge("R", ("n", s), ("n", t), vec![]).unwrap();
         }
         graph
             .embedding_store_mut()
