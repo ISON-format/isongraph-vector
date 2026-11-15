@@ -41,12 +41,16 @@ Version: 1.0.0
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import struct
 import hashlib
 import heapq
 import json
 import threading
+import uuid
+import warnings
+from collections import deque
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import (
@@ -57,7 +61,7 @@ from pathlib import Path as FilePath
 
 # Import from ison-graph
 from ison_graph import (
-    ISONGraph, Node, NodeRef,
+    ISONGraph, Node, NodeRef, Edge,
     Direction, GraphError
 )
 
@@ -86,6 +90,16 @@ EMBEDDING_FORMAT_VERSION = 1
 #: Suffix appended to a graph path to locate its embeddings.
 EMBEDDING_SIDECAR_SUFFIX = ".embeddings.json"
 
+#: Name of the serialization :func:`graph_digest` hashes. Written next to the
+#: digest so a reader that computes a different digest (or none) can tell it is
+#: not comparable and skip the check instead of reporting a false mismatch.
+GRAPH_DIGEST_BASIS = "nodes-edges-json-v1"
+
+#: Model names that carry no information about which encoder made a vector:
+#: ``"provided"`` (vector handed in, store has no encoder) and ``"unknown"``
+#: (sidecars from ports that do not record a model).
+UNKNOWN_MODELS = frozenset({"unknown", "provided"})
+
 
 # =============================================================================
 # Errors
@@ -111,12 +125,105 @@ class NoEncoderError(EmbeddingError, ValueError):
     """Text was handed to a store that has no encoder to embed it with."""
 
 
+class ModelMismatchError(EmbeddingError):
+    """
+    A text query was encoded by a different model than the stored vectors.
+
+    Two models of the same dimension give a plausible-looking cosine score
+    between vectors that live in unrelated spaces, so the ranking is noise
+    rather than an error. Raised only with ``on_model_mismatch="error"``; the
+    default is a warning.
+    """
+
+
+class GraphEmbeddingMismatchError(EmbeddingError):
+    """
+    A graph file and its embeddings sidecar are not from the same save.
+
+    Raised by :meth:`SemanticGraph.load` when the sidecar's recorded
+    ``graph_digest`` does not match the graph that was read - the sidecar came
+    from a different save, or the graph file was edited afterwards.
+    """
+
+
+# =============================================================================
+# File helpers
+# =============================================================================
+
+def _atomic_write_text(path: Union[str, FilePath], text: str) -> None:
+    """
+    Write ``text`` to ``path`` so a reader sees the old file or the new one.
+
+    The text goes to a temp file in the same directory (same filesystem, so
+    the rename is not a copy), is flushed to disk, and then ``os.replace``d
+    into place. A crash mid-write leaves the previous file intact instead of
+    a truncated one. ``newline=''`` leaves line endings alone on every platform, so
+    a sidecar's bytes do not depend on the OS that wrote it.
+    """
+    path = FilePath(path)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        with open(tmp, 'w', encoding='utf-8', newline='') as handle:
+            handle.write(text)
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:  # pragma: no cover - fsync unsupported on this fs
+                pass
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def graph_digest(graph: ISONGraph) -> str:
+    """
+    Content digest of a graph's nodes and edges: ``"sha256:<hex>"``.
+
+    Hashes a canonical JSON rendering (``GRAPH_DIGEST_BASIS``): the
+    ``directed`` flag, every node as ``[type, id-kind, id, properties]`` and
+    every edge as ``[rel_type, source, target, properties]``, each list sorted
+    and every object key-sorted. The same graph therefore hashes the same
+    regardless of insertion order. The graph *name* is excluded (it is derived
+    from the file name on load), and so are embeddings.
+    """
+    def ref_key(ref: NodeRef) -> list:
+        return [ref[0], 'i' if isinstance(ref[1], int) and not isinstance(ref[1], bool)
+                else 's', str(ref[1])]
+
+    def dump(obj: Any) -> str:
+        return json.dumps(obj, sort_keys=True, separators=(',', ':'),
+                          ensure_ascii=True, default=str)
+
+    nodes = sorted(dump([ref_key(n.ref), n.properties]) for n in graph.nodes())
+    edges = sorted(
+        dump([e.rel_type, ref_key(e.source), ref_key(e.target), e.properties])
+        for e in graph.edges()
+    )
+    body = '{"directed":%s,"edges":[%s],"nodes":[%s]}' % (
+        'true' if graph.directed else 'false', ','.join(edges), ','.join(nodes))
+    return "sha256:" + hashlib.sha256(body.encode('utf-8')).hexdigest()
+
+
 # =============================================================================
 # Embedding Encoder Interface
 # =============================================================================
 
 class EmbeddingEncoder(ABC):
-    """Abstract base class for embedding encoders."""
+    """
+    Abstract base class for embedding encoders.
+
+    Encoders may expose two optional pieces of metadata the store records:
+    ``model_name`` (stamped on every vector it writes; decides whether stored
+    vectors are *stale* for this encoder) and ``version`` (a free-form string,
+    e.g. a model revision or weights hash, written to the sidecar).
+    """
+
+    #: Optional free-form encoder/model version; ``None`` when unknown.
+    version: Optional[str] = None
 
     @property
     @abstractmethod
@@ -144,13 +251,16 @@ class SentenceTransformerEncoder(EmbeddingEncoder):
     sentence-transformers model works; pass its name to the constructor.
     """
 
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2",
+                 version: Optional[str] = None):
         """
         Initialize encoder with a sentence-transformers model.
 
         Args:
             model_name: HuggingFace model name
+            version: Optional free-form revision string recorded in the sidecar
         """
+        self.version = version
         try:
             from sentence_transformers import SentenceTransformer
             self.model = SentenceTransformer(model_name)
@@ -205,11 +315,12 @@ class MockEncoder(EmbeddingEncoder):
     _FNV_PRIME = 0x01000193
     _MASK32 = 0xFFFFFFFF
 
-    def __init__(self, dimension: int = 384):
+    def __init__(self, dimension: int = 384, version: Optional[str] = None):
         if dimension <= 0:
             raise ValueError(f"dimension must be positive, got {dimension}")
         self._dimension = dimension
         self.model_name = f"mock-{dimension}"
+        self.version = version
 
     @property
     def dimension(self) -> int:
@@ -264,15 +375,27 @@ class SimilarityResult:
 
 class _ScanCache:
     """
-    Decoded snapshot of the whole table, rebuilt whenever it is written to.
+    Decoded, incrementally maintained snapshot of the whole table.
 
     Every search reads every row (brute force), so decoding blobs and, with
     numpy, stacking them into one matrix pays for itself immediately on the
     second query: the per-query cost drops from a Python loop over N x d
     floats to a single matrix-vector product.
+
+    With numpy the snapshot is one C-contiguous float32 matrix with spare row
+    capacity, the vector norms, a type code per row and a liveness flag. Writes
+    patch it in place instead of invalidating it: an insert appends a row, an
+    update overwrites one, a delete tombstones one (compacted once a quarter
+    of the rows are dead). Rows stay in insertion order, which is the order
+    the table's rowids give, so ties break exactly as a rebuild would.
+
+    ``n`` counts used rows including tombstones, ``dead`` the tombstones.
+    Without numpy (or with ragged vector lengths) ``matrix`` is None and
+    ``vectors``/``types`` hold plain lists; that form is rebuilt, not patched.
     """
 
-    __slots__ = ('refs', 'types', 'texts', 'vectors', 'matrix', 'norms')
+    __slots__ = ('refs', 'types', 'texts', 'vectors', 'matrix', 'norms',
+                 'n', 'dead', 'alive', 'codes', 'code_of', 'pos')
 
     def __init__(self, refs, types, texts, vectors, matrix, norms):
         self.refs = refs
@@ -281,6 +404,12 @@ class _ScanCache:
         self.vectors = vectors
         self.matrix = matrix
         self.norms = norms
+        self.n = len(refs)
+        self.dead = 0
+        self.alive = None
+        self.codes = None
+        self.code_of = None
+        self.pos = None
 
 
 class EmbeddingStore:
@@ -306,7 +435,9 @@ class EmbeddingStore:
         db_path: Union[str, FilePath] = ":memory:",
         encoder: Optional[EmbeddingEncoder] = None,
         dimension: Optional[int] = None,
-        sqlite_vec: bool = False
+        sqlite_vec: bool = False,
+        version: Optional[str] = None,
+        on_model_mismatch: str = "warn"
     ):
         """
         Initialize embedding store.
@@ -324,13 +455,34 @@ class EmbeddingStore:
                  accuracy trade - measured identical top-10 ordering, scores
                  within 2e-07 of the scan, and about 1.4x faster over
                  20,000 vectors.
+            version: Free-form version string for the encoder/model that made
+                 these vectors, recorded in the sidecar. Falls back to the
+                 encoder's own ``version`` attribute when omitted.
+            on_model_mismatch: What a *text* query does when the encoder's
+                 ``model_name`` differs from the model that produced the
+                 stored vectors: ``"warn"`` (default; one ``UserWarning`` per
+                 distinct pair), ``"error"`` (raise
+                 :class:`ModelMismatchError`) or ``"ignore"``. Vectors whose
+                 model is ``"unknown"``/``"provided"`` never trigger it.
+                 Vector queries are never checked.
 
         Raises:
             EmbeddingError: sqlite_vec=True but the package is not installed
                             or the extension cannot be loaded
+            ValueError: on_model_mismatch is not one of the three modes
         """
+        if on_model_mismatch not in ("warn", "error", "ignore"):
+            raise ValueError(
+                f"on_model_mismatch must be 'warn', 'error' or 'ignore', "
+                f"got {on_model_mismatch!r}")
         self.db_path = str(db_path)
         self.encoder = encoder
+        self._version = version
+        self.on_model_mismatch = on_model_mismatch
+        self._models_cache: Optional[Dict[str, int]] = None
+        self._warned_mismatch: set = set()
+        #: Metadata of the most recent imported sidecar (empty before any).
+        self.last_import_meta: Dict[str, Any] = {}
         self._conn: Optional[sqlite3.Connection] = None
         self._lock = threading.RLock()
         self._dimension = dimension
@@ -349,6 +501,41 @@ class EmbeddingStore:
     def sqlite_vec(self) -> bool:
         """Whether top-k search is answered from the sqlite-vec index."""
         return self._sqlite_vec
+
+    @property
+    def version(self) -> Optional[str]:
+        """Encoder/model version recorded in the sidecar, or None if unknown."""
+        if self._version is not None:
+            return self._version
+        return getattr(self.encoder, 'version', None) if self.encoder else None
+
+    @version.setter
+    def version(self, value: Optional[str]) -> None:
+        self._version = value
+
+    def _invalidate(self) -> None:
+        """Drop everything derived from the table.
+
+        Writes patch the caches in place (see :class:`_ScanCache`); this is
+        the fallback for the ones that cannot, and for a write that failed
+        part-way and left the derived state unknown.
+        """
+        self._cache = None
+        self._models_cache = None
+
+    def _models_adjust(self, old: Optional[str], new: Optional[str]) -> None:
+        """Move one row between model buckets in the cached ``models()`` counts."""
+        counts = self._models_cache
+        if counts is None:
+            return
+        if old is not None:
+            left = counts.get(old, 0) - 1
+            if left > 0:
+                counts[old] = left
+            else:
+                counts.pop(old, None)
+        if new is not None:
+            counts[new] = counts.get(new, 0) + 1
 
     # -- schema ---------------------------------------------------------
 
@@ -548,6 +735,7 @@ class EmbeddingStore:
         if isinstance(query, str):
             if self.encoder is None:
                 raise NoEncoderError("No encoder provided for text query")
+            self._check_model_compat()
             vector = self.encoder.encode(query)
         else:
             vector = list(query)
@@ -562,6 +750,100 @@ class EmbeddingStore:
 
     def _model_name(self) -> str:
         return getattr(self.encoder, 'model_name', 'unknown') if self.encoder else 'provided'
+
+    # -- model lifecycle --------------------------------------------------
+
+    def models(self) -> Dict[str, int]:
+        """
+        Which models produced the stored vectors: ``{model_name: count}``.
+
+        ``"unknown"`` / ``"provided"`` appear as-is (vectors imported from a
+        port that records no model, or handed in with no encoder attached).
+        """
+        with self._lock:
+            if self._models_cache is None:
+                rows = self._get_conn().execute(
+                    "SELECT model, COUNT(*) AS n FROM embeddings GROUP BY model"
+                ).fetchall()
+                self._models_cache = {row['model']: row['n'] for row in rows}
+            return dict(self._models_cache)
+
+    def _current_model(self) -> Optional[str]:
+        name = getattr(self.encoder, 'model_name', None) if self.encoder else None
+        return name if name and name not in UNKNOWN_MODELS else None
+
+    def _check_model_compat(self) -> None:
+        """Complain when a text query's encoder is not the stored vectors' model."""
+        if self.on_model_mismatch == "ignore":
+            return
+        current = self._current_model()
+        if current is None:
+            return
+        foreign = {m for m in self.models() if m not in UNKNOWN_MODELS and m != current}
+        if not foreign:
+            return
+        message = (
+            f"encoder model {current!r} differs from the model that produced the "
+            f"stored vectors ({', '.join(sorted(repr(m) for m in foreign))}); "
+            f"scores compare vectors from different spaces. Re-embed with "
+            f"reembed_stale() or search with the original encoder."
+        )
+        if self.on_model_mismatch == "error":
+            raise ModelMismatchError(message)
+        key = (current, frozenset(foreign))
+        if key not in self._warned_mismatch:
+            self._warned_mismatch.add(key)
+            warnings.warn(message, UserWarning, stacklevel=4)
+
+    def stale(
+        self,
+        model: Optional[str] = None,
+        dimension: Optional[int] = None,
+        include_unknown: bool = False
+    ) -> List[NodeRef]:
+        """
+        Node refs whose stored vector does not belong to the current encoder.
+
+        A vector is stale when its recorded model differs from ``model``
+        (default: the encoder's ``model_name``) or its length differs from
+        ``dimension`` (default: the encoder's ``dimension``). Vectors whose
+        model is ``"unknown"``/``"provided"`` cannot be judged by model and are
+        skipped unless ``include_unknown`` is True (a dimension mismatch still
+        counts). With no encoder and no arguments nothing can be judged and
+        the result is empty.
+        """
+        if model is None:
+            model = self._current_model()
+        if dimension is None and self.encoder is not None:
+            try:
+                dimension = int(self.encoder.dimension)
+            except (AttributeError, TypeError):
+                dimension = None
+        with self._lock:
+            rows = self._get_conn().execute("""
+                SELECT node_type, node_id, node_id_type, model, LENGTH(vector) AS n
+                FROM embeddings ORDER BY rowid
+            """).fetchall()
+            out: List[NodeRef] = []
+            for row in rows:
+                by_model = (
+                    model is not None and row['model'] != model
+                    and (include_unknown or row['model'] not in UNKNOWN_MODELS)
+                )
+                by_dim = dimension is not None and row['n'] // 4 != dimension
+                if by_model or by_dim:
+                    out.append((row['node_type'],
+                                self._restore_node_id(row['node_id'], row['node_id_type'])))
+            return out
+
+    def _reset_dimension(self) -> None:
+        """Forget the pinned dimension (and the vec0 table). Caller cleared rows."""
+        self._dimension = None
+        if self._sqlite_vec:
+            conn = self._get_conn()
+            conn.execute(f"DROP TABLE IF EXISTS {VEC_TABLE}")
+            conn.commit()
+            self._vec_ready = False
 
     # -- writes ---------------------------------------------------------
 
@@ -587,6 +869,13 @@ class EmbeddingStore:
         """
         emb_id = self._embedding_id(node_ref)
         blob = self._vector_to_bytes(vector)
+        old_model = None
+        if self._models_cache is not None:
+            previous = conn.execute(
+                "SELECT model FROM embeddings WHERE node_type = ? AND node_id = ?",
+                (node_ref[0], str(node_ref[1]))
+            ).fetchone()
+            old_model = previous['model'] if previous is not None else None
         conn.execute("""
             INSERT INTO embeddings
             (id, node_type, node_id, node_id_type, vector, text, model)
@@ -616,6 +905,9 @@ class EmbeddingStore:
                 (rowid, node_ref[0], blob)
             )
 
+        # Patch what is derived from the table rather than dropping it.
+        self._models_adjust(old_model, model)
+        self._cache_put(node_ref, node_id_type or self._node_id_type(node_ref[1]), blob, text)
         return emb_id
 
     def add(
@@ -645,9 +937,12 @@ class EmbeddingStore:
             self._check_dimension(vector, "vector")
 
             conn = self._get_conn()
-            emb_id = self._write_row(conn, node_ref, vector, text, self._model_name())
-            conn.commit()
-            self._cache = None
+            try:
+                emb_id = self._write_row(conn, node_ref, vector, text, self._model_name())
+                conn.commit()
+            except BaseException:
+                self._invalidate()
+                raise
             return emb_id
 
     def add_batch(
@@ -691,10 +986,13 @@ class EmbeddingStore:
                 self._check_dimension(vector, "vector")
 
             conn = self._get_conn()
-            for ref, text, vector in items:
-                self._write_row(conn, ref, vector, text, model)
-            conn.commit()
-            self._cache = None
+            try:
+                for ref, text, vector in items:
+                    self._write_row(conn, ref, vector, text, model)
+                conn.commit()
+            except BaseException:
+                self._invalidate()
+                raise
             return len(items)
 
     @staticmethod
@@ -705,30 +1003,46 @@ class EmbeddingStore:
         """Remove embedding for a node."""
         with self._lock:
             conn = self._get_conn()
-            if self._sqlite_vec and self._vec_ready:
+            try:
                 row = conn.execute(
-                    "SELECT rowid FROM embeddings WHERE node_type = ? AND node_id = ?",
+                    "SELECT rowid, model FROM embeddings WHERE node_type = ? AND node_id = ?",
                     (node_ref[0], str(node_ref[1]))
                 ).fetchone()
-                if row is not None:
+                if row is not None and self._sqlite_vec and self._vec_ready:
                     conn.execute(f"DELETE FROM {VEC_TABLE} WHERE rowid = ?", (row['rowid'],))
-            cursor = conn.execute("""
-                DELETE FROM embeddings
-                WHERE node_type = ? AND node_id = ?
-            """, (node_ref[0], str(node_ref[1])))
-            conn.commit()
-            self._cache = None
+                cursor = conn.execute("""
+                    DELETE FROM embeddings
+                    WHERE node_type = ? AND node_id = ?
+                """, (node_ref[0], str(node_ref[1])))
+                conn.commit()
+            except BaseException:
+                self._invalidate()
+                raise
+            if cursor.rowcount > 0:
+                if row is not None:
+                    self._models_adjust(row['model'], None)
+                self._cache_drop(node_ref)
             return cursor.rowcount > 0
 
-    def clear(self) -> None:
-        """Clear all embeddings."""
+    def clear(self, reset_dimension: bool = False) -> None:
+        """
+        Clear all embeddings.
+
+        Args:
+            reset_dimension: Also forget the pinned vector length, so the next
+                vector may have a different one (switching to an encoder of a
+                different dimension). Off by default: a store normally refuses
+                vectors of the wrong length even when empty.
+        """
         with self._lock:
             conn = self._get_conn()
             conn.execute("DELETE FROM embeddings")
             if self._sqlite_vec and self._vec_ready:
                 conn.execute(f"DELETE FROM {VEC_TABLE}")
             conn.commit()
-            self._cache = None
+            self._invalidate()
+            if reset_dimension:
+                self._reset_dimension()
 
     # -- reads ----------------------------------------------------------
 
@@ -758,73 +1072,329 @@ class EmbeddingStore:
         with self._lock:
             return self._get_conn().execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
 
+    # -- incremental scan cache -------------------------------------------
+
+    _CACHE_CHUNK = 8192
+
     def _ensure_cache(self) -> _ScanCache:
         """Build (or reuse) the decoded snapshot every search reads. Locked."""
         if self._cache is not None:
             return self._cache
 
-        rows = self._get_conn().execute("""
-            SELECT node_type, node_id, node_id_type, vector, text
-            FROM embeddings ORDER BY rowid
-        """).fetchall()
+        cursor = self._get_conn().cursor()
+        cursor.row_factory = None          # plain tuples: no Row overhead per field
+        query = ("SELECT node_type, node_id, node_id_type, vector, text "
+                 "FROM embeddings ORDER BY rowid")
+        cache = None
+        if _np is not None:
+            total = cursor.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+            if total:
+                cache = self._build_numpy_cache(cursor.execute(query), total)
+        if cache is None:
+            cache = self._build_list_cache(cursor.execute(query).fetchall())
+        self._cache = cache
+        return cache
 
-        refs: List[NodeRef] = []
-        types: List[str] = []
-        texts: List[str] = []
-        blobs: List[bytes] = []
-        for row in rows:
-            refs.append((row['node_type'],
-                         self._restore_node_id(row['node_id'], row['node_id_type'])))
-            types.append(row['node_type'])
-            texts.append(row['text'])
-            blobs.append(row['vector'])
+    def _build_numpy_cache(self, cursor, total: int) -> Optional[_ScanCache]:
+        """Stream the table into a spare-capacity float32 matrix.
 
-        matrix = None
-        norms = None
-        vectors: Optional[List[List[float]]] = None
-        uniform = bool(blobs) and len({len(b) for b in blobs}) == 1
+        Returns None when the stored vectors are not all one length (the
+        caller then falls back to the list form, which tolerates that).
+        """
+        rows = cursor.fetchmany(self._CACHE_CHUNK)
+        if not rows:
+            return None
+        width = len(rows[0][3])
+        if width == 0 or width % 4:
+            return None
+        dim = width // 4
+        capacity = total + total // 8 + 16
+        matrix = _np.empty((capacity, dim), dtype=_np.float32)
+        norms = _np.zeros(capacity, dtype=_np.float32)
+        codes = _np.zeros(capacity, dtype=_np.int32)
+        alive = _np.zeros(capacity, dtype=bool)
+        refs: List[Optional[NodeRef]] = []
+        texts: List[Optional[str]] = []
+        pos: Dict[Tuple[str, str], int] = {}
+        code_of: Dict[str, int] = {}
+        filled = 0
+        while rows:
+            m = len(rows)
+            if filled + m > capacity:
+                return None
+            types, ids, id_types, blobs, row_texts = zip(*rows)      # columns, in C
+            if set(map(len, blobs)) != {width}:
+                return None
+            block = _np.frombuffer(b"".join(blobs), dtype=_np.float32).reshape(m, dim)
+            matrix[filled:filled + m] = block
+            norms[filled:filled + m] = _np.linalg.norm(block, axis=1)
+            alive[filled:filled + m] = True
+            for t in set(types):
+                if t not in code_of:
+                    code_of[t] = len(code_of)
+            codes[filled:filled + m] = [code_of[t] for t in types]
+            keys = list(zip(types, ids))
+            if 'int' in id_types:
+                refs.extend([(t, self._restore_node_id(i, k))
+                             for t, i, k in zip(types, ids, id_types)])
+            else:
+                refs.extend(keys)           # the key tuple doubles as the ref
+            pos.update(zip(keys, range(filled, filled + m)))
+            texts.extend(row_texts)
+            filled += m
+            rows = cursor.fetchmany(self._CACHE_CHUNK)
+        cache = _ScanCache(refs, None, texts, None, matrix, norms)
+        cache.alive = alive
+        cache.codes = codes
+        cache.code_of = code_of
+        cache.pos = pos
+        return cache
 
-        if _np is not None and uniform:
-            matrix = _np.frombuffer(b"".join(blobs), dtype=_np.float32).reshape(
-                len(blobs), len(blobs[0]) // 4
-            )
-            norms = _np.linalg.norm(matrix, axis=1)
+    def _build_list_cache(self, rows) -> _ScanCache:
+        """Pure-Python form: no numpy, or vectors of mixed length."""
+        refs = [(r[0], self._restore_node_id(r[1], r[2])) for r in rows]
+        return _ScanCache(
+            refs, [r[0] for r in rows], [r[4] for r in rows],
+            [self._bytes_to_vector(r[3]) for r in rows], None, None)
+
+    @staticmethod
+    def _cache_grow(cache: _ScanCache) -> None:
+        """Make room for more rows: grow capacity by a quarter (min 1024)."""
+        capacity, dim = cache.matrix.shape
+        new_capacity = capacity + max(1024, capacity // 4)
+        n = cache.n
+        matrix = _np.empty((new_capacity, dim), dtype=_np.float32)
+        matrix[:n] = cache.matrix[:n]
+        norms = _np.zeros(new_capacity, dtype=_np.float32)
+        norms[:n] = cache.norms[:n]
+        codes = _np.zeros(new_capacity, dtype=_np.int32)
+        codes[:n] = cache.codes[:n]
+        alive = _np.zeros(new_capacity, dtype=bool)
+        alive[:n] = cache.alive[:n]
+        cache.matrix, cache.norms, cache.codes, cache.alive = matrix, norms, codes, alive
+
+    def _cache_put(self, node_ref: NodeRef, id_type: str, blob: bytes, text: str) -> None:
+        """Mirror one upserted row into the cache. Caller holds the lock."""
+        cache = self._cache
+        if cache is None:
+            return
+        matrix = cache.matrix
+        if matrix is None or len(blob) != matrix.shape[1] * 4:
+            self._cache = None             # list form / new width: rebuild lazily
+            return
+        node_type = str(node_ref[0])
+        id_text = str(node_ref[1])
+        key = (node_type, id_text)
+        ref = key if id_type != 'int' else (node_type, int(id_text))
+        row = _np.frombuffer(blob, dtype=_np.float32)
+        i = cache.pos.get(key)
+        if i is None:
+            if cache.n >= matrix.shape[0]:
+                self._cache_grow(cache)
+                matrix = cache.matrix
+            i = cache.n
+            cache.n = i + 1
+            cache.refs.append(ref)
+            cache.texts.append(text)
+            cache.pos[key] = i
+            code = cache.code_of.get(node_type)
+            if code is None:
+                code = cache.code_of[node_type] = len(cache.code_of)
+            cache.codes[i] = code
+            cache.alive[i] = True
+        else:                              # overwrite in place: keeps its position
+            cache.refs[i] = ref
+            cache.texts[i] = text
+        matrix[i] = row
+        cache.norms[i] = _np.linalg.norm(row.reshape(1, -1), axis=1)[0]
+
+    def _cache_drop(self, node_ref: NodeRef) -> None:
+        """Mirror one deleted row into the cache. Caller holds the lock."""
+        cache = self._cache
+        if cache is None:
+            return
+        if cache.matrix is None:
+            self._cache = None
+            return
+        i = cache.pos.pop((str(node_ref[0]), str(node_ref[1])), None)
+        if i is None:
+            return
+        cache.matrix[i] = 0.0
+        cache.norms[i] = 0.0
+        cache.alive[i] = False
+        cache.refs[i] = None
+        cache.texts[i] = None
+        cache.dead += 1
+        while cache.n and not cache.alive[cache.n - 1]:    # trailing tombstones
+            cache.n -= 1
+            cache.refs.pop()
+            cache.texts.pop()
+            cache.dead -= 1
+        if cache.dead > 32 and cache.dead * 4 > cache.n:
+            self._cache_compact(cache)
+
+    @staticmethod
+    def _cache_compact(cache: _ScanCache) -> None:
+        """Squeeze tombstones out, keeping the live rows in their order."""
+        live = _np.flatnonzero(cache.alive[:cache.n])
+        step = 16384
+        for start in range(0, live.size, step):
+            idx = live[start:start + step]
+            end = start + idx.size
+            # Destinations never overtake the sources still to be read.
+            cache.matrix[start:end] = cache.matrix[idx]
+            cache.norms[start:end] = cache.norms[idx]
+            cache.codes[start:end] = cache.codes[idx]
+        kept = live.size
+        cache.alive[:kept] = True
+        cache.alive[kept:cache.n] = False
+        order = live.tolist()
+        cache.refs = [cache.refs[i] for i in order]
+        cache.texts = [cache.texts[i] for i in order]
+        cache.pos = {(r[0], str(r[1])): j for j, r in enumerate(cache.refs)}
+        cache.n = kept
+        cache.dead = 0
+
+    # -- scoring ----------------------------------------------------------
+
+    @staticmethod
+    def _np_scores(cache: _ScanCache, query_vector: Sequence[float]):
+        """Cosine score of every used row (tombstones score 0), as float32."""
+        n = cache.n
+        query = _np.asarray(query_vector, dtype=_np.float32)
+        query_norm = float(_np.linalg.norm(query))
+        scores = _np.zeros(n, dtype=_np.float32)
+        if query_norm != 0.0:
+            denom = cache.norms[:n] * query_norm
+            dots = cache.matrix[:n] @ query
+            with _np.errstate(divide='ignore', invalid='ignore'):
+                _np.divide(dots, denom, out=scores, where=denom > 0)
+        return scores
+
+    def _np_candidates(self, cache, query_vector, node_type, threshold):
+        """Scores with every excluded row set to -inf, or None if nothing can match.
+
+        Excluded: tombstones, rows of another ``node_type`` and rows below
+        ``threshold`` (compared in double precision, as the scalar loop did).
+        """
+        if cache.n - cache.dead == 0:
+            return None
+        scores = self._np_scores(cache, query_vector)
+        valid = scores.astype(_np.float64) >= threshold
+        if cache.dead:
+            valid &= cache.alive[:cache.n]
+        if node_type is not None:
+            code = cache.code_of.get(node_type)
+            if code is None:
+                return None
+            valid &= cache.codes[:cache.n] == code
+        _np.putmask(scores, ~valid, -_np.inf)
+        return scores
+
+    @staticmethod
+    def _rank(scores, k: Optional[int]):
+        """Row positions of the best ``k`` finite scores, best first.
+
+        Ties keep row (insertion) order, exactly what a stable sort of the
+        rows would give. ``k=None`` ranks every finite score.
+        """
+        n = scores.shape[0]
+        if k is not None and k < n:
+            kth = _np.partition(scores, n - k)[n - k]
+            sel = _np.flatnonzero(scores >= kth if kth > -_np.inf else scores > -_np.inf)
         else:
-            vectors = [self._bytes_to_vector(b) for b in blobs]
+            sel = _np.flatnonzero(scores > -_np.inf)
+        if sel.size == 0:
+            return sel
+        order = _np.argsort(-scores[sel], kind='stable')
+        ranked = sel[order]
+        return ranked if k is None else ranked[:k]
 
-        self._cache = _ScanCache(refs, types, texts, vectors, matrix, norms)
-        return self._cache
+    def _np_search(self, cache, query_vector, top_k, node_type, threshold):
+        if top_k is not None and top_k <= 0:
+            return []
+        scores = self._np_candidates(cache, query_vector, node_type, threshold)
+        if scores is None:
+            return []
+        best = self._rank(scores, top_k)
+        refs, texts = cache.refs, cache.texts
+        return [SimilarityResult(node_ref=refs[i], score=s, text=texts[i])
+                for i, s in zip(best.tolist(), scores[best].tolist())]
 
     def _score_all(
         self,
         query_vector: Sequence[float],
         node_type: Optional[str] = None
     ) -> List[Tuple[NodeRef, float, str]]:
-        """Cosine-score every stored embedding against a query vector."""
+        """Cosine-score every stored embedding against a query vector.
+
+        The general (and fallback) form. The numpy search paths do not go
+        through it: they never build a tuple per stored row.
+        """
         cache = self._ensure_cache()
-        if not cache.refs:
+        if cache.n - cache.dead == 0:
             return []
 
         if cache.matrix is not None:
-            query = _np.asarray(query_vector, dtype=_np.float32)
-            query_norm = float(_np.linalg.norm(query))
-            if query_norm == 0.0:
-                scores = _np.zeros(len(cache.refs), dtype=_np.float32)
-            else:
-                denom = cache.norms * query_norm
-                with _np.errstate(divide='ignore', invalid='ignore'):
-                    scores = _np.where(denom > 0, (cache.matrix @ query) / denom, 0.0)
-            score_list = scores.tolist()
-        else:
-            score_list = [self._cosine_similarity(query_vector, v)
-                          for v in (cache.vectors or [])]
+            scores = self._np_scores(cache, query_vector).tolist()
+            code = None
+            if node_type is not None:
+                code = cache.code_of.get(node_type)
+                if code is None:
+                    return []
+            codes = cache.codes
+            return [(ref, scores[i], cache.texts[i])
+                    for i, ref in enumerate(cache.refs)
+                    if ref is not None and (code is None or codes[i] == code)]
 
-        out: List[Tuple[NodeRef, float, str]] = []
-        for i, ref in enumerate(cache.refs):
-            if node_type is not None and cache.types[i] != node_type:
-                continue
-            out.append((ref, float(score_list[i]), cache.texts[i]))
-        return out
+        scores = [self._cosine_similarity(query_vector, v) for v in cache.vectors]
+        return [(ref, float(scores[i]), cache.texts[i])
+                for i, ref in enumerate(cache.refs)
+                if node_type is None or cache.types[i] == node_type]
+
+    def _ranked(
+        self,
+        query: Union[str, Sequence[float]],
+        node_type: Optional[str] = None,
+        threshold: float = 0.0,
+        hint: Optional[int] = None
+    ):
+        """Every match, best first, as an iterator that ranks lazily.
+
+        For callers that apply a predicate before taking k (``node_filter``):
+        the work done is proportional to how deep they read, not to the size
+        of the store. Everything is snapshotted under the lock, so the caller
+        may run arbitrary code between ``next()`` calls with the lock free.
+        """
+        with self._lock:
+            query_vector = self._resolve_query(query)
+            cache = self._ensure_cache()
+            if cache.matrix is None:
+                results = [SimilarityResult(node_ref=ref, score=score, text=text)
+                           for ref, score, text in self._score_all(query_vector, node_type)
+                           if score >= threshold]
+                results.sort(key=lambda x: x.score, reverse=True)
+                return iter(results)
+            scores = self._np_candidates(cache, query_vector, node_type, threshold)
+            if scores is None:
+                return iter(())
+            refs = cache.refs[:]
+            texts = cache.texts[:]
+
+        def chunks():
+            k = max(64, 4 * hint) if hint else 64
+            done = 0
+            while True:
+                best = self._rank(scores, k)
+                for i in best[done:].tolist():
+                    yield SimilarityResult(
+                        node_ref=refs[i], score=float(scores[i]), text=texts[i])
+                if best.size < k:
+                    return
+                done = best.size
+                k *= 8
+
+        return chunks()
 
     def _sqlite_vec_search(
         self,
@@ -886,6 +1456,11 @@ class EmbeddingStore:
         every match (top_k=None) always uses the scan - there is nothing for an
         index to narrow down.
 
+        With numpy the scan is one matrix-vector product over a cached float32
+        matrix, a partition to find the k best, and a result object for each
+        of those k only. Ties between equal scores come back in insertion
+        order.
+
         Args:
             query: Query text or vector
             top_k: Number of results to return (None returns every match)
@@ -904,6 +1479,9 @@ class EmbeddingStore:
                 if any(query_vector):
                     return self._sqlite_vec_search(query_vector, top_k, node_type, threshold)
 
+            cache = self._ensure_cache()
+            if cache.matrix is not None:
+                return self._np_search(cache, query_vector, top_k, node_type, threshold)
             scored = self._score_all(query_vector, node_type)
 
         results = [
@@ -915,9 +1493,8 @@ class EmbeddingStore:
             results.sort(key=lambda x: x.score, reverse=True)
             return results
 
-        # Selecting the top k rather than sorting all of them. Ordering 20,000
-        # candidates to return ten cost about 3 ms of a 15 ms query; nlargest
-        # is O(n log k) and returns exactly what sorted(...)[:k] would, ties
+        # Selecting the top k rather than sorting all of them: nlargest is
+        # O(n log k) and returns exactly what sorted(...)[:k] would, ties
         # included.
         return heapq.nlargest(top_k, results, key=lambda x: x.score)
 
@@ -939,16 +1516,40 @@ class EmbeddingStore:
         """
         with self._lock:
             query_vector = self._resolve_query(query)
-            return {ref: score for ref, score, _ in self._score_all(query_vector, node_type)}
+            cache = self._ensure_cache()
+            if cache.matrix is None:
+                return {ref: score for ref, score, _ in
+                        self._score_all(query_vector, node_type)}
+            if cache.n - cache.dead == 0:
+                return {}
+            scores = self._np_scores(cache, query_vector)
+            if not cache.dead and node_type is None:
+                return dict(zip(cache.refs, scores.tolist()))
+            keep = cache.alive[:cache.n].copy()
+            if node_type is not None:
+                code = cache.code_of.get(node_type)
+                if code is None:
+                    return {}
+                keep &= cache.codes[:cache.n] == code
+            idx = _np.flatnonzero(keep)
+            refs = cache.refs
+            return {refs[i]: s for i, s in zip(idx.tolist(), scores[idx].tolist())}
 
     # -- portability ----------------------------------------------------
 
-    def export_embeddings(self) -> Dict[str, Any]:
+    def export_embeddings(self, graph_digest: Optional[str] = None) -> Dict[str, Any]:
         """
         Serialize every embedding into a portable, cross-language dict.
 
         The shape is shared by all five language ports, so a store built in
         Python can be loaded by the TypeScript, JavaScript, Rust or C++ one.
+
+        Version 1 of the payload is unchanged; the optional metadata below is
+        appended *after* ``embeddings`` as flat top-level fields, which readers
+        that do not know them ignore: ``encoder_model`` (the encoder's
+        ``model_name``), ``encoder_version`` (the store/encoder ``version``),
+        and, when ``graph_digest`` is given, ``graph_digest`` plus
+        ``graph_digest_basis``. Absent values are omitted, not written as null.
         """
         with self._lock:
             rows = self._get_conn().execute("""
@@ -965,13 +1566,22 @@ class EmbeddingStore:
                 "vector": self._bytes_to_vector(row['vector']),
             } for row in rows]
 
-            return {
+            payload: Dict[str, Any] = {
                 "format": EMBEDDING_FORMAT,
                 "version": EMBEDDING_FORMAT_VERSION,
                 "dimension": self._dimension,
                 "count": len(embeddings),
                 "embeddings": embeddings,
             }
+            encoder_model = self._current_model()
+            if encoder_model is not None:
+                payload["encoder_model"] = encoder_model
+            if self.version is not None:
+                payload["encoder_version"] = str(self.version)
+            if graph_digest is not None:
+                payload["graph_digest"] = graph_digest
+                payload["graph_digest_basis"] = GRAPH_DIGEST_BASIS
+            return payload
 
     def import_embeddings(self, payload: Dict[str, Any], replace: bool = False) -> int:
         """
@@ -997,33 +1607,52 @@ class EmbeddingStore:
             )
 
         with self._lock:
+            self.last_import_meta = {
+                key: payload[key]
+                for key in ("encoder_model", "encoder_version",
+                            "graph_digest", "graph_digest_basis")
+                if key in payload
+            }
             if replace:
                 self.clear()
                 self._dimension = payload.get("dimension")
 
             written = 0
             conn = self._get_conn()
-            for item in payload.get("embeddings", []):
-                node_id = item["id"]
-                if item.get("id_type") == 'int' and not isinstance(node_id, int):
-                    node_id = int(node_id)
-                vector = item["vector"]
-                self._check_dimension(vector, f"embedding for :{item['type']}:{node_id}")
-                ref = (item["type"], node_id)
-                self._write_row(
-                    conn, ref, vector,
-                    item.get("text", ""), item.get("model", "unknown"),
-                    node_id_type=item.get("id_type") or self._node_id_type(node_id)
-                )
-                written += 1
-            conn.commit()
-            self._cache = None
+            try:
+                for item in payload.get("embeddings", []):
+                    node_id = item["id"]
+                    if item.get("id_type") == 'int' and not isinstance(node_id, int):
+                        node_id = int(node_id)
+                    vector = item["vector"]
+                    self._check_dimension(vector, f"embedding for :{item['type']}:{node_id}")
+                    ref = (item["type"], node_id)
+                    self._write_row(
+                        conn, ref, vector,
+                        item.get("text", ""), item.get("model", "unknown"),
+                        node_id_type=item.get("id_type") or self._node_id_type(node_id)
+                    )
+                    written += 1
+                conn.commit()
+            except BaseException:
+                self._invalidate()
+                raise
             return written
 
-    def save_embeddings(self, path: Union[str, FilePath]) -> int:
-        """Write every embedding to a JSON sidecar. Returns the count."""
-        payload = self.export_embeddings()
-        FilePath(path).write_text(json.dumps(payload), encoding='utf-8')
+    def save_embeddings(
+        self,
+        path: Union[str, FilePath],
+        graph_digest: Optional[str] = None
+    ) -> int:
+        """
+        Write every embedding to a JSON sidecar, atomically. Returns the count.
+
+        The file is written to a temp file and renamed into place, so a crash
+        never leaves a half-written sidecar. ``graph_digest`` ties the sidecar
+        to one particular graph (see :func:`graph_digest`).
+        """
+        payload = self.export_embeddings(graph_digest=graph_digest)
+        _atomic_write_text(path, json.dumps(payload))
         return payload["count"]
 
     def load_embeddings(self, path: Union[str, FilePath], replace: bool = False) -> int:
@@ -1039,7 +1668,7 @@ class EmbeddingStore:
             if self._conn:
                 self._conn.close()
                 self._conn = None
-            self._cache = None
+            self._invalidate()
 
     def __enter__(self) -> 'EmbeddingStore':
         return self
@@ -1104,7 +1733,9 @@ class SemanticGraph(ISONGraph):
         encoder: Optional[EmbeddingEncoder] = None,
         auto_embed: bool = True,
         embed_fields: Optional[List[str]] = None,
-        sqlite_vec: bool = False
+        sqlite_vec: bool = False,
+        version: Optional[str] = None,
+        on_model_mismatch: str = "warn"
     ):
         """
         Initialize semantic graph.
@@ -1118,6 +1749,11 @@ class SemanticGraph(ISONGraph):
             auto_embed: Auto-embed nodes on add (using embed_fields)
             embed_fields: Fields to concatenate for auto-embedding
             sqlite_vec: Search through a sqlite-vec index (see :class:`EmbeddingStore`)
+            version: Encoder/model version string recorded in the sidecar
+                     (default: the encoder's own ``version``, if any)
+            on_model_mismatch: ``"warn"`` (default), ``"error"`` or
+                     ``"ignore"``: what a text search does when the
+                     encoder's model differs from the stored vectors' model
         """
         super().__init__(name=name, directed=directed)
 
@@ -1128,7 +1764,9 @@ class SemanticGraph(ISONGraph):
         self.embedding_store = EmbeddingStore(
             db_path=embedding_db,
             encoder=encoder,
-            sqlite_vec=sqlite_vec
+            sqlite_vec=sqlite_vec,
+            version=version,
+            on_model_mismatch=on_model_mismatch
         )
 
         self.auto_embed = auto_embed
@@ -1260,6 +1898,33 @@ class SemanticGraph(ISONGraph):
         """Get embedding for a node."""
         return self.embedding_store.get(node_ref)
 
+    def update_node(
+        self,
+        node_type: str,
+        node_id: Union[int, str],
+        **properties: Any
+    ) -> Node:
+        """
+        Update node properties, keeping the embedding in step with them.
+
+        With ``auto_embed`` on, a change to any of ``embed_fields`` re-embeds
+        the node from its new properties, so searches never rank it by text
+        it no longer carries. If the new properties leave nothing to embed,
+        the stale vector is dropped. Updates that touch no embed field, and
+        graphs with ``auto_embed`` off (whose vectors the caller manages),
+        leave the embedding alone.
+        """
+        node = super().update_node(node_type, node_id, **properties)
+
+        if self.auto_embed and any(f in properties for f in self.embed_fields):
+            text = self.embed_text_for(node.properties)
+            if text:
+                self.embed_node(node.ref, text)
+            else:
+                self.embedding_store.remove(node.ref)
+
+        return node
+
     def remove_node(self, node_type: str, node_id: Union[int, str]) -> None:
         """Remove node and its embedding."""
         ref = (node_type, node_id)
@@ -1306,12 +1971,113 @@ class SemanticGraph(ISONGraph):
 
     # -- search ---------------------------------------------------------
 
+    @staticmethod
+    def _edge_weight(edge: Edge, weight_field: str) -> float:
+        """
+        An edge's numeric ``weight_field`` property clamped to [0, 1].
+
+        A missing, non-numeric (including bool) or NaN value counts as 1.0, so
+        an unweighted edge never penalises a hop.
+        """
+        value = edge.properties.get(weight_field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return 1.0
+        value = float(value)
+        if value != value:  # NaN
+            return 1.0
+        return min(1.0, max(0.0, value))
+
+    def _adjacent(
+        self,
+        node_ref: NodeRef,
+        rel_type: Optional[str],
+        direction: Direction
+    ) -> List[Tuple[NodeRef, Edge]]:
+        """(neighbor, connecting edge) pairs, in the order ``neighbors()`` yields."""
+        pairs: List[Tuple[NodeRef, Edge]] = []
+        if direction in (Direction.OUT, Direction.BOTH):
+            for edge in self.edges(rel_type, source=node_ref):
+                pairs.append((edge.target, edge))
+        if direction in (Direction.IN, Direction.BOTH):
+            for edge in self.edges(rel_type, target=node_ref):
+                pairs.append((edge.source, edge))
+        return pairs
+
+    def _node_gate(
+        self,
+        node_filter: Optional[Callable[[Node], bool]],
+        node_types: Optional[Union[str, Sequence[str]]]
+    ) -> Optional[Callable[[NodeRef], bool]]:
+        """
+        Build the ``ref -> bool`` predicate behind ``node_filter``/``node_types``.
+
+        Returns None when neither is set, so unfiltered calls take exactly the
+        pre-existing code path. A node passes when its type is in
+        ``node_types`` (a bare string means one type; an empty sequence passes
+        nothing) *and* ``node_filter(node)`` is truthy. A ref with no node in
+        the graph cannot be shown to ``node_filter``, so it fails whenever a
+        ``node_filter`` is set. Answers are memoized for the one call.
+        """
+        if node_filter is None and node_types is None:
+            return None
+        types = None
+        if node_types is not None:
+            types = {node_types} if isinstance(node_types, str) else set(node_types)
+        memo: Dict[NodeRef, bool] = {}
+
+        def gate(ref: NodeRef) -> bool:
+            cached = memo.get(ref)
+            if cached is not None:
+                return cached
+            ok = types is None or ref[0] in types
+            if ok and node_filter is not None:
+                node = self._resolve_node(ref)
+                ok = node is not None and bool(node_filter(node))
+            memo[ref] = ok
+            return ok
+
+        return gate
+
+    def _seed_search(
+        self,
+        query: Union[str, Sequence[float]],
+        top_k: Optional[int],
+        node_type: Optional[str],
+        threshold: float,
+        gate: Optional[Callable[[NodeRef], bool]]
+    ) -> List[SimilarityResult]:
+        """
+        Top-k similarity search among the nodes that pass ``gate``.
+
+        With a gate the store cannot truncate first: the best k *unfiltered*
+        matches may all be filtered out, so every match is scored, filtered,
+        and only then cut to k.
+        """
+        if gate is None:
+            return self.embedding_store.similarity_search(query, top_k, node_type, threshold)
+        ranked = self.embedding_store._ranked(query, node_type, threshold, hint=top_k)
+        limit = None if top_k is None else max(top_k, 0)
+        results: List[SimilarityResult] = []
+        if limit == 0:
+            return results
+        # Best first, and stop as soon as k have passed: the gate (a user
+        # callback that may touch the graph) runs on the matches that are
+        # needed, not on every stored vector.
+        for result in ranked:
+            if gate(result.node_ref):
+                results.append(result)
+                if limit is not None and len(results) >= limit:
+                    break
+        return results
+
     def similarity_search(
         self,
         query: Union[str, Sequence[float]],
         top_k: Optional[int] = 10,
         node_type: Optional[str] = None,
-        threshold: float = 0.0
+        threshold: float = 0.0,
+        node_filter: Optional[Callable[[Node], bool]] = None,
+        node_types: Optional[Sequence[str]] = None
     ) -> List[SimilarityResult]:
         """
         Find similar nodes by embedding.
@@ -1321,6 +2087,12 @@ class SemanticGraph(ISONGraph):
             top_k: Number of results (None returns every match)
             node_type: Filter by type
             threshold: Minimum similarity
+            node_filter: Keep only nodes for which ``node_filter(node)`` is
+                truthy. Applied *before* ``top_k`` is taken, so you still get
+                ``top_k`` matching nodes when that many exist. An embedding
+                whose node is not in the graph fails the filter.
+            node_types: Keep only nodes whose type is in this sequence
+                (combines with ``node_type`` and ``node_filter`` by AND).
 
         Returns:
             List of SimilarityResult
@@ -1328,9 +2100,8 @@ class SemanticGraph(ISONGraph):
         if isinstance(query, str):
             encoder = self._get_encoder()
             self.embedding_store.encoder = encoder
-        return self.embedding_store.similarity_search(
-            query, top_k, node_type, threshold
-        )
+        gate = self._node_gate(node_filter, node_types)
+        return self._seed_search(query, top_k, node_type, threshold, gate)
 
     def similar_to_node(
         self,
@@ -1373,7 +2144,11 @@ class SemanticGraph(ISONGraph):
         direction: Direction = Direction.OUT,
         decay: float = 0.8,
         threshold: float = 0.3,
-        blend: float = 0.0
+        blend: float = 0.0,
+        weight_field: Optional[str] = None,
+        node_filter: Optional[Callable[[Node], bool]] = None,
+        node_types: Optional[Sequence[str]] = None,
+        strict_filter: bool = False
     ) -> List[SemanticSearchResult]:
         """
         Semantic multi-hop search.
@@ -1381,7 +2156,8 @@ class SemanticGraph(ISONGraph):
         Combines embedding similarity with graph traversal:
         1. Find top-k similar nodes as seeds (hop 0)
         2. Traverse graph following relationships
-        3. Score paths by: max(seed_similarity, 0) * decay^hop_count
+        3. Score paths by: max(seed_similarity, 0) * prod(decay * weight) over
+           the hops, where ``weight`` is 1.0 unless ``weight_field`` is set
 
         Args:
             query: Query text (or a pre-computed vector)
@@ -1398,6 +2174,28 @@ class SemanticGraph(ISONGraph):
                    two hops out, but highly relevant in its own right, is not
                    buried under a closer but unrelated neighbour. Hop-0 seeds
                    score the same either way.
+            weight_field: Name of an edge property whose numeric value
+                   multiplies the decay of every hop that crosses that edge
+                   (clamped to [0, 1]; a missing or non-numeric value counts
+                   as 1.0, so partly-weighted graphs work). A node is scored
+                   by its *best* route, which with weights can be a longer one
+                   than the fewest-hops route. None (the default) ignores
+                   edge properties entirely.
+            node_filter: Predicate on :class:`Node`. See the filtering rules
+                   below.
+            node_types: Node types allowed (a type name, or a sequence).
+            strict_filter: Make the filter a hard wall for traversal too.
+
+        Filtering rules (``node_filter`` and ``node_types`` combine with AND):
+          * Seeds must pass. The top ``top_k_seeds`` are chosen *among*
+            passing nodes, so a filtered-out best match never occupies a seed
+            slot.
+          * Only passing nodes are returned.
+          * By default a node that fails the filter can still be walked
+            *through*: it is not returned, but it still costs a hop and its
+            decay, and a returned node's ``path`` may list it. With
+            ``strict_filter=True`` a failing node is never entered, so every
+            node on every returned path passes.
 
         Returns:
             List of SemanticSearchResult sorted by score
@@ -1409,6 +2207,8 @@ class SemanticGraph(ISONGraph):
             encoder = self._get_encoder()
             self.embedding_store.encoder = encoder
 
+        gate = self._node_gate(node_filter, node_types)
+
         if blend > 0.0:
             # Blending needs a score for every node, so one exact scan serves
             # both the seed selection and the per-node relevance.
@@ -1416,17 +2216,18 @@ class SemanticGraph(ISONGraph):
             if not scores:
                 return []
             seeds = sorted(
-                ((ref, score) for ref, score in scores.items() if score >= threshold),
+                ((ref, score) for ref, score in scores.items()
+                 if score >= threshold and (gate is None or gate(ref))),
                 key=lambda item: item[1], reverse=True
             )[:top_k_seeds]
         else:
             # Only the seeds matter, so this can be answered by the
-            # sqlite-vec index when the store has one.
+            # sqlite-vec index when the store has one (unless a filter forces
+            # a full scan - see _seed_search).
             scores = {}
             seeds = [
                 (r.node_ref, r.score)
-                for r in self.embedding_store.similarity_search(
-                    query, top_k_seeds, threshold=threshold)
+                for r in self._seed_search(query, top_k_seeds, None, threshold, gate)
             ]
 
         if not seeds:
@@ -1463,43 +2264,90 @@ class SemanticGraph(ISONGraph):
                     path=[seed_ref]
                 )
 
-            # BFS traversal
-            current = [(seed_ref, [seed_ref], 0)]
-            visited = {seed_ref}
+            # Breadth-first traversal. Each node keeps its best decay factor
+            # and its fewest hops *separately*: with edge weights the route
+            # with the best factor is not always the shortest one, and a
+            # shorter route must still be expanded because it has hops left.
+            # Without weights the first (shortest) arrival is both, so this
+            # reduces to the plain visited-set BFS.
+            best_factor: Dict[NodeRef, float] = {seed_ref: 1.0}
+            best_hops: Dict[NodeRef, int] = {seed_ref: 0}
+            current = deque([(seed_ref, [seed_ref], 1.0, 0)])
 
             while current:
-                node_ref, path, hop = current.pop(0)
+                node_ref, path, factor, hop = current.popleft()
 
                 if hop >= max_hops:
                     continue
 
-                neighbors = self.neighbors(node_ref, rel_type, direction)
-
-                for neighbor in neighbors:
-                    if neighbor in visited:
+                for neighbor, edge in self._adjacent(node_ref, rel_type, direction):
+                    if neighbor in path:
+                        continue
+                    if strict_filter and gate is not None and not gate(neighbor):
                         continue
 
-                    visited.add(neighbor)
-                    new_path = path + [neighbor]
+                    weight = (1.0 if weight_field is None
+                              else self._edge_weight(edge, weight_field))
                     new_hop = hop + 1
-                    new_score = combined(traversal_base * (decay ** new_hop), neighbor)
+                    # Unweighted: decay ** hops exactly, not a running product,
+                    # so scores are bit-identical to the pre-weight releases.
+                    new_factor = (decay ** new_hop if weight_field is None
+                                  else factor * decay * weight)
 
-                    # Update if better score
-                    existing = results.get(neighbor)
-                    if existing is None or existing.score < new_score:
-                        results[neighbor] = SemanticSearchResult(
-                            node_ref=neighbor,
-                            node=self._resolve_node(neighbor),
-                            score=new_score,
-                            hop_count=new_hop,
-                            path=new_path
-                        )
+                    if (new_factor <= best_factor.get(neighbor, -1.0)
+                            and new_hop >= best_hops.get(neighbor, new_hop + 1)):
+                        continue
+                    best_factor[neighbor] = max(new_factor, best_factor.get(neighbor, -1.0))
+                    best_hops[neighbor] = min(new_hop, best_hops.get(neighbor, new_hop))
 
-                    current.append((neighbor, new_path, new_hop))
+                    new_path = path + [neighbor]
+                    if gate is None or gate(neighbor):
+                        new_score = combined(traversal_base * new_factor, neighbor)
+                        # Update if better score
+                        existing = results.get(neighbor)
+                        if existing is None or existing.score < new_score:
+                            results[neighbor] = SemanticSearchResult(
+                                node_ref=neighbor,
+                                node=self._resolve_node(neighbor),
+                                score=new_score,
+                                hop_count=new_hop,
+                                path=new_path
+                            )
+
+                    current.append((neighbor, new_path, new_factor, new_hop))
 
         # Sort by score
         sorted_results = sorted(results.values(), key=lambda x: x.score, reverse=True)
         return sorted_results[:top_k_results]
+
+    def _gated_shortest_path(
+        self,
+        start: NodeRef,
+        end: NodeRef,
+        rel_type: Optional[str],
+        max_hops: int,
+        direction: Direction,
+        gate: Callable[[NodeRef], bool]
+    ) -> Optional[List[NodeRef]]:
+        """Fewest-hops path from start to end whose every node passes ``gate``."""
+        if not gate(start) or not gate(end):
+            return None
+        if start == end:
+            return [start]
+        visited = {start}
+        queue = deque([[start]])
+        while queue:
+            path = queue.popleft()
+            if len(path) - 1 >= max_hops:
+                continue
+            for neighbor, _edge in self._adjacent(path[-1], rel_type, direction):
+                if neighbor in visited or not gate(neighbor):
+                    continue
+                if neighbor == end:
+                    return path + [neighbor]
+                visited.add(neighbor)
+                queue.append(path + [neighbor])
+        return None
 
     def semantic_path(
         self,
@@ -1510,7 +2358,10 @@ class SemanticGraph(ISONGraph):
         top_k_seeds: int = 3,
         direction: Direction = Direction.OUT,
         decay: float = 0.9,
-        threshold: float = 0.0
+        threshold: float = 0.0,
+        node_filter: Optional[Callable[[Node], bool]] = None,
+        node_types: Optional[Sequence[str]] = None,
+        strict_filter: bool = False
     ) -> Optional[SemanticSearchResult]:
         """
         Find semantically-rooted path to a target node.
@@ -1529,28 +2380,151 @@ class SemanticGraph(ISONGraph):
                        so a seed can legitimately score below zero - lower
                        this to search from any starting point regardless of
                        how well it matches.
+            node_filter: Predicate on :class:`Node`; see semantic_multi_hop.
+            node_types: Node types allowed (a type name, or a sequence).
+            strict_filter: Require every node on the path to pass too.
+
+        Filtering: seeds are chosen among passing nodes, and the *target must
+        pass* or the result is None. By default the path may run through
+        failing nodes (it is the fewest-hops path, as without a filter); with
+        ``strict_filter=True`` the path is the fewest-hops path that uses
+        passing nodes only, which can be longer or not exist.
 
         Returns:
             SemanticSearchResult if path found, None otherwise
         """
-        seeds = self.similarity_search(query, top_k_seeds, threshold=threshold)
+        if isinstance(query, str):
+            encoder = self._get_encoder()
+            self.embedding_store.encoder = encoder
 
+        gate = self._node_gate(node_filter, node_types)
+        if gate is not None and not gate(target_ref):
+            return None
+
+        seeds = self._seed_search(query, top_k_seeds, None, threshold, gate)
+
+        # Every seed that reaches the target is a candidate, and the best
+        # score wins: a slightly less similar seed one hop from the target
+        # beats a better seed five hops away. Seeds arrive best-first, so
+        # a tie goes to the more similar one. As in semantic_multi_hop, a
+        # negative seed passes no relevance along rather than "decaying"
+        # toward zero and outscoring itself.
+        best: Optional[SemanticSearchResult] = None
         for seed in seeds:
-            path = self.shortest_path(
-                seed.node_ref, target_ref,
-                rel_type=rel_type,
-                max_hops=max_hops,
-                direction=direction
-            )
-            if path:
-                return SemanticSearchResult(
+            if strict_filter and gate is not None:
+                nodes = self._gated_shortest_path(
+                    seed.node_ref, target_ref, rel_type, max_hops, direction, gate)
+                if nodes is None:
+                    continue
+            else:
+                path = self.shortest_path(
+                    seed.node_ref, target_ref,
+                    rel_type=rel_type,
+                    max_hops=max_hops,
+                    direction=direction
+                )
+                if not path:
+                    continue
+                nodes = path.nodes
+            length = len(nodes) - 1
+            score = max(seed.score, 0.0) * (decay ** length)
+            if best is None or score > best.score:
+                best = SemanticSearchResult(
                     node_ref=target_ref,
                     node=self._resolve_node(target_ref),
-                    score=seed.score * (decay ** path.length),
-                    hop_count=path.length,
-                    path=path.nodes
+                    score=score,
+                    hop_count=length,
+                    path=nodes
                 )
 
+        return best
+
+    def _connect_components(
+        self,
+        keep: set,
+        rel_type: Optional[str],
+        direction: Direction,
+        max_hops: int,
+        gate: Optional[Callable[[NodeRef], bool]]
+    ) -> List[NodeRef]:
+        """
+        Grow ``keep`` with connector nodes until it is as connected as the
+        hop budget allows. Returns the connectors added, in order.
+
+        Greedy: each round finds, over all pairs of components, the shortest
+        route (at most ``max_hops`` edges, honouring ``rel_type``/
+        ``direction``) whose interior nodes lie outside ``keep``, adds its
+        interior, and recomputes components. Each round merges at least two,
+        so it terminates; it stops when one component remains or no route fits
+        the budget. ``gate`` (set for ``strict_filter``) bars failing nodes
+        from serving as connectors.
+        """
+        added: List[NodeRef] = []
+
+        def order(ref: NodeRef) -> Tuple[str, str, str]:
+            return (ref[0], type(ref[1]).__name__, str(ref[1]))
+
+        while len(keep) > 1:
+            # Weakly connected components of the induced subgraph.
+            parent = {ref: ref for ref in keep}
+
+            def find(ref: NodeRef) -> NodeRef:
+                while parent[ref] != ref:
+                    parent[ref] = parent[parent[ref]]
+                    ref = parent[ref]
+                return ref
+
+            for edge in self.edges(rel_type):
+                if edge.source in keep and edge.target in keep:
+                    parent[find(edge.source)] = find(edge.target)
+            groups: Dict[NodeRef, List[NodeRef]] = {}
+            for ref in keep:
+                groups.setdefault(find(ref), []).append(ref)
+            if len(groups) <= 1:
+                break
+
+            best_route: Optional[List[NodeRef]] = None
+            for members in sorted((sorted(g, key=order) for g in groups.values()),
+                                  key=lambda g: order(g[0])):
+                route = self._shortest_link(
+                    members, keep, rel_type, direction, max_hops, gate)
+                if route is not None and (best_route is None
+                                          or len(route) < len(best_route)):
+                    best_route = route
+            if best_route is None:
+                break
+            for ref in best_route[1:-1]:
+                keep.add(ref)
+                added.append(ref)
+        return added
+
+    def _shortest_link(
+        self,
+        members: List[NodeRef],
+        keep: set,
+        rel_type: Optional[str],
+        direction: Direction,
+        max_hops: int,
+        gate: Optional[Callable[[NodeRef], bool]]
+    ) -> Optional[List[NodeRef]]:
+        """Shortest route from any of ``members`` to a kept node outside them."""
+        visited = set(members)
+        queue = deque([[m] for m in members])
+        while queue:
+            path = queue.popleft()
+            if len(path) - 1 >= max_hops:
+                continue
+            for neighbor, _edge in self._adjacent(path[-1], rel_type, direction):
+                if neighbor in visited:
+                    continue
+                if neighbor in keep:
+                    return path + [neighbor]
+                if gate is not None and not gate(neighbor):
+                    continue
+                if self._resolve_node(neighbor) is None:
+                    continue
+                visited.add(neighbor)
+                queue.append(path + [neighbor])
         return None
 
     def semantic_subgraph(
@@ -1564,7 +2538,13 @@ class SemanticGraph(ISONGraph):
         decay: float = 0.8,
         threshold: float = 0.3,
         blend: float = 0.0,
-        name: Optional[str] = None
+        name: Optional[str] = None,
+        weight_field: Optional[str] = None,
+        node_filter: Optional[Callable[[Node], bool]] = None,
+        node_types: Optional[Sequence[str]] = None,
+        strict_filter: bool = False,
+        connect: bool = False,
+        connect_max_hops: int = 2
     ) -> 'SemanticGraph':
         """
         Extract the slice of the graph a query is actually about.
@@ -1579,19 +2559,50 @@ class SemanticGraph(ISONGraph):
         graph to inject rather than the whole store.
 
         Args:
-            Same as semantic_multi_hop, plus:
+            Same as semantic_multi_hop (including ``weight_field``,
+            ``node_filter``, ``node_types`` and ``strict_filter``), plus:
             name: Name for the returned graph (default: "<name>_subgraph")
+            connect: Also add *connector* nodes so the selected nodes fall
+                into as few connected components as possible. Components are
+                weak (edge direction ignored when judging the result), but
+                connector routes honour ``rel_type`` and ``direction``. Each
+                round adds the interior of the shortest route between two
+                components (greedy; not a minimum Steiner tree), until one
+                component remains or no route fits ``connect_max_hops``.
+                Nothing but those interior nodes is added, and they are not
+                marked in any way.
+            connect_max_hops: Longest route, counted in edges, that may join
+                two components. The default 2 allows one connector node per
+                join; 3 allows two. A direct edge needs no connector (it is
+                already an induced edge).
+
+        Note:
+            With ``connect=True`` the result can hold **more than**
+            ``top_k_results`` nodes: ``top_k_results`` caps the *selected*
+            nodes, and connectors are extra. Without ``strict_filter`` a
+            connector may be a node that fails ``node_filter``/``node_types``
+            (it is only a bridge); with it, connectors must pass too.
 
         Returns:
             A new SemanticGraph sharing this graph's encoder
         """
+        if connect_max_hops < 1:
+            raise ValueError(f"connect_max_hops must be >= 1, got {connect_max_hops}")
+
         results = self.semantic_multi_hop(
             query, rel_type=rel_type, max_hops=max_hops,
             top_k_seeds=top_k_seeds, top_k_results=top_k_results,
-            direction=direction, decay=decay, threshold=threshold, blend=blend
+            direction=direction, decay=decay, threshold=threshold, blend=blend,
+            weight_field=weight_field, node_filter=node_filter,
+            node_types=node_types, strict_filter=strict_filter
         )
 
         keep = {r.node_ref for r in results}
+        if connect and keep:
+            gate = (self._node_gate(node_filter, node_types)
+                    if strict_filter else None)
+            self._connect_components(keep, rel_type, direction, connect_max_hops, gate)
+
         sub = SemanticGraph(
             name=name or f"{self.name}_subgraph",
             directed=self.directed,
@@ -1617,6 +2628,65 @@ class SemanticGraph(ISONGraph):
 
         return sub
 
+    # -- model lifecycle ------------------------------------------------
+
+    def stale_embeddings(self, include_unknown: bool = False) -> List[NodeRef]:
+        """
+        Nodes whose stored vector was not made by the current encoder.
+
+        Stale means the vector's recorded model differs from the encoder's
+        ``model_name``, or its length differs from the encoder's
+        ``dimension``. Vectors recorded as ``"unknown"``/``"provided"`` (from
+        ports that store no model, or supplied without an encoder) cannot be
+        judged by model and are left out unless ``include_unknown`` is True;
+        a dimension mismatch always counts.
+        """
+        encoder = self._get_encoder()
+        self.embedding_store.encoder = encoder
+        return self.embedding_store.stale(include_unknown=include_unknown)
+
+    def reembed_stale(self, include_unknown: bool = False, batch_size: int = 256) -> int:
+        """
+        Re-encode every stale embedding with the current encoder.
+
+        Each vector is rebuilt from the text it was originally embedded from
+        (so a custom ``_embed_text`` survives); a vector stored with no text
+        falls back to the node's embed fields. If the encoder's dimension
+        differs from the store's, every stored vector is stale, so the store
+        is emptied, its pinned dimension reset, and everything re-embedded.
+
+        Args:
+            include_unknown: Also re-embed vectors of unknown provenance
+            batch_size: Texts per encoder call
+
+        Returns:
+            Number of embeddings rewritten
+        """
+        stale = self.stale_embeddings(include_unknown=include_unknown)
+        if not stale:
+            return 0
+
+        store = self.embedding_store
+        pairs: List[Tuple[NodeRef, str]] = []
+        for ref in stale:
+            record = store.get(ref)
+            if record is None:
+                continue
+            text = record.text
+            if not text:
+                node = self._resolve_node(ref)
+                text = (self.embed_text_for(node.properties) if node else "") or str(ref)
+            pairs.append((ref, text))
+
+        encoder = self._get_encoder()
+        if store.dimension is not None and store.dimension != encoder.dimension:
+            store.clear(reset_dimension=True)
+
+        count = 0
+        for start in range(0, len(pairs), batch_size):
+            count += self.embed_nodes(pairs[start:start + batch_size])
+        return count
+
     # -- persistence ----------------------------------------------------
 
     @staticmethod
@@ -1638,14 +2708,35 @@ class SemanticGraph(ISONGraph):
         picks up automatically. Without it a save/load round-trip silently
         returned a graph whose searches all came back empty.
 
+        Both files are written atomically (temp file, flush, ``os.replace``),
+        so a crash never leaves a truncated file. The pair cannot be replaced
+        as one unit, so the sidecar also records a :func:`graph_digest` of the
+        graph it belongs to; :meth:`load` checks it and catches a crash
+        between the two writes, a sidecar copied from another save, and a
+        graph edited afterwards. The digest is taken of the graph *as it reads
+        back from the file just written*, so a round trip that normalises a
+        value does not cause a false mismatch.
+
+        With ``embeddings=False`` an existing sidecar is left in place (and
+        will fail the digest check on load, as it no longer matches).
+
         Args:
             path: Graph file path
             format: File format
             embeddings: Write the sidecar (set False for graph-only saves)
         """
-        super().save(path, format)
+        path = FilePath(path)
+        if format == "auto":
+            format = "isonl" if path.suffix == ".isonl" else "ison"
+
+        text = self.to_isonl() if format == "isonl" else self.to_ison()
+        _atomic_write_text(path, text)
+
         if embeddings:
-            self.embedding_store.save_embeddings(self.embeddings_path_for(path))
+            reread = (ISONGraph.from_isonl(text, path.stem) if format == "isonl"
+                      else ISONGraph.from_ison(text, path.stem))
+            self.embedding_store.save_embeddings(
+                self.embeddings_path_for(path), graph_digest=graph_digest(reread))
 
     @classmethod
     def load(
@@ -1657,7 +2748,10 @@ class SemanticGraph(ISONGraph):
         embeddings: bool = True,
         auto_embed: bool = True,
         embed_fields: Optional[List[str]] = None,
-        sqlite_vec: bool = False
+        sqlite_vec: bool = False,
+        on_mismatch: str = "error",
+        version: Optional[str] = None,
+        on_model_mismatch: str = "warn"
     ) -> 'SemanticGraph':
         """
         Load graph from file, restoring embeddings from its sidecar.
@@ -1674,10 +2768,37 @@ class SemanticGraph(ISONGraph):
             auto_embed: Auto-embed nodes added to the loaded graph
             embed_fields: Fields to concatenate for auto-embedding
             sqlite_vec: Index the restored vectors with sqlite-vec
+            on_mismatch: What to do when the sidecar carries a graph digest
+                     that does not match the graph file (a sidecar from a
+                     different save, or a graph edited since):
+                     ``"error"`` (default) raises
+                     :class:`GraphEmbeddingMismatchError`; ``"warn"`` warns
+                     and loads the sidecar's vectors anyway; ``"reembed"``
+                     discards the sidecar's vectors and re-embeds every node
+                     with the encoder (:meth:`embed_all_nodes`). A sidecar
+                     without a digest (older releases, other ports) is loaded
+                     as before and never checked.
+            version: Encoder/model version string for the loaded graph's store
+                     (see :class:`EmbeddingStore`). If both it (or the
+                     encoder's own ``version``) and the sidecar's
+                     ``encoder_version`` are set and differ, a warning is
+                     issued.
+            on_model_mismatch: ``"warn"``/``"error"``/``"ignore"`` for text
+                     searches whose encoder model differs from the stored
+                     vectors' model (see :class:`EmbeddingStore`).
 
         Returns:
             SemanticGraph instance
+
+        Raises:
+            GraphEmbeddingMismatchError: digest mismatch with
+                ``on_mismatch="error"``
+            ValueError: ``on_mismatch`` is not one of the three modes
         """
+        if on_mismatch not in ("error", "warn", "reembed"):
+            raise ValueError(
+                f"on_mismatch must be 'error', 'warn' or 'reembed', got {on_mismatch!r}")
+
         # Load base graph
         base = ISONGraph.load(path, format)
 
@@ -1689,7 +2810,9 @@ class SemanticGraph(ISONGraph):
             encoder=encoder,
             auto_embed=auto_embed,
             embed_fields=embed_fields,
-            sqlite_vec=sqlite_vec
+            sqlite_vec=sqlite_vec,
+            version=version,
+            on_model_mismatch=on_model_mismatch
         )
 
         # Copy the loaded state across through the public API.
@@ -1717,7 +2840,45 @@ class SemanticGraph(ISONGraph):
         if embeddings:
             sidecar = cls.embeddings_path_for(path)
             if sidecar.is_file():
-                graph.embedding_store.load_embeddings(sidecar)
+                try:
+                    payload = json.loads(sidecar.read_text(encoding='utf-8'))
+                except ValueError as exc:
+                    graph.close()
+                    raise EmbeddingError(f"unreadable embeddings sidecar {sidecar}: {exc}") from exc
+
+                problem = None
+                recorded = payload.get("graph_digest") if isinstance(payload, dict) else None
+                if (recorded is not None
+                        and payload.get("graph_digest_basis", GRAPH_DIGEST_BASIS)
+                        == GRAPH_DIGEST_BASIS):
+                    actual = graph_digest(base)
+                    if recorded != actual:
+                        problem = (
+                            f"embeddings sidecar {sidecar} does not belong to graph "
+                            f"{FilePath(path)}: it was written for graph digest "
+                            f"{recorded}, but the graph reads as {actual} (the "
+                            f"sidecar is from a different save, or the graph was "
+                            f"edited since). Pass on_mismatch='reembed' to rebuild "
+                            f"the vectors or on_mismatch='warn' to use them anyway."
+                        )
+
+                if problem is not None and on_mismatch == "error":
+                    graph.close()
+                    raise GraphEmbeddingMismatchError(problem)
+                if problem is not None and on_mismatch == "reembed":
+                    graph.embed_all_nodes()
+                else:
+                    if problem is not None:
+                        warnings.warn(problem, UserWarning, stacklevel=2)
+                    graph.embedding_store.import_embeddings(payload)
+                    stored_version = graph.embedding_store.last_import_meta.get("encoder_version")
+                    current_version = graph.embedding_store.version
+                    if (stored_version is not None and current_version is not None
+                            and str(stored_version) != str(current_version)):
+                        warnings.warn(
+                            f"embeddings were made by encoder version {stored_version!r}, "
+                            f"but the encoder in use is version {current_version!r}",
+                            UserWarning, stacklevel=2)
 
         return graph
 
@@ -1746,11 +2907,16 @@ __all__ = [
     'EMBEDDING_FORMAT',
     'EMBEDDING_FORMAT_VERSION',
     'EMBEDDING_SIDECAR_SUFFIX',
+    'GRAPH_DIGEST_BASIS',
+    'UNKNOWN_MODELS',
+    'graph_digest',
 
     # Errors
     'EmbeddingError',
     'DimensionMismatchError',
     'NoEncoderError',
+    'ModelMismatchError',
+    'GraphEmbeddingMismatchError',
 
     # Encoders
     'EmbeddingEncoder',

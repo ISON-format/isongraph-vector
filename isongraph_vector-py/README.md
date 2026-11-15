@@ -106,6 +106,31 @@ actually about.
 stored vector — no query text, no encoder call — and drops the node itself from
 the results.
 
+**Weighted edges.** `semantic_multi_hop(..., weight_field="strength")` multiplies
+each hop's decay by that numeric edge property, clamped to [0, 1]. A missing or
+non-numeric value counts as 1.0, so a half-annotated graph still works. A node
+is scored by its *best* route, which with weights may be a longer one than the
+fewest-hops route. The default (`None`) ignores edge properties.
+
+**Filtering by node.** `similarity_search`, `semantic_multi_hop`,
+`semantic_path` and `semantic_subgraph` take `node_filter=` (a predicate on the
+`Node`) and `node_types=` (a type name or a sequence), combined with AND:
+
+- seeds are picked *among* passing nodes (a better, filtered-out match never
+  takes a seed slot), and `similarity_search` filters before it takes `top_k`;
+- only passing nodes are returned, and a `semantic_path` target must pass;
+- by default a failing node can still be walked *through* (it costs a hop and
+  its decay and may appear in a result's `path`); `strict_filter=True` makes the
+  filter a wall, so no failing node is ever entered.
+
+**Connected subgraphs.** Top-k selection can leave the slice in pieces.
+`semantic_subgraph(..., connect=True, connect_max_hops=2)` adds the interior
+nodes of the shortest routes (honouring `rel_type` and `direction`) that join
+the pieces — greedily, until one component remains or nothing fits the hop
+budget. Those connector nodes are *extra*: the result can hold more than
+`top_k_results` nodes. They are not marked, and without `strict_filter` a
+connector may be a node the filter would otherwise reject.
+
 ## Storing the vectors
 
 The store is SQLite-backed, and the default is `:memory:`. Give it a path and
@@ -181,6 +206,30 @@ Pass the `encoder=` you saved with. Without it the first text search on a
 loaded graph constructs a `SentenceTransformerEncoder` and downloads a model,
 which is rarely what you want in a test.
 
+**The two files stay a pair.** Each is written to a temp file and renamed into
+place, so a crash never leaves a truncated file; and since two files cannot be
+replaced as one, the sidecar records a `graph_digest` (sha256 over a canonical
+rendering of the nodes and edges) that `load` checks. If the sidecar is from
+another save, or the graph was edited, `load` follows `on_mismatch`:
+
+```python
+SemanticGraph.load(path, encoder=enc)                         # "error" (default)
+SemanticGraph.load(path, encoder=enc, on_mismatch="warn")     # use the vectors anyway
+SemanticGraph.load(path, encoder=enc, on_mismatch="reembed")  # rebuild every vector
+```
+
+A sidecar with no digest (older releases, other ports) loads exactly as before.
+
+**Switching models.** Every vector remembers the model that made it.
+`graph.stale_embeddings()` lists nodes whose vector is from a different model
+(or has a different dimension) than the current encoder, and
+`graph.reembed_stale()` re-encodes them from their stored text — resetting the
+store's pinned dimension if the new model is a different size. A *text* search
+whose encoder differs from the stored vectors' model warns (or raises
+`ModelMismatchError` with `on_model_mismatch="error"`), because the scores would
+compare vectors from unrelated spaces. `version="..."` (or an encoder's
+`version` attribute) is recorded in the sidecar, and `load` warns if it changed.
+
 ## One format, six languages
 
 The embedding sidecar and the SQLite schema are shared by every port — Python,
@@ -192,6 +241,10 @@ that guarantee testable rather than aspirational.
 payload = store.export_embeddings()   # portable dict, JSON-serializable
 store.import_embeddings(payload)
 ```
+
+The payload stays `version` 1. The metadata above (`graph_digest`,
+`graph_digest_basis`, `encoder_model`, `encoder_version`) is optional and sits
+after `embeddings`; readers that do not know a field ignore it.
 
 ## Things that will bite you
 
@@ -216,7 +269,7 @@ store.import_embeddings(payload)
 ## Tests
 
 ```bash
-pytest tests/                     # 73 tests, MockEncoder, no downloads
+pytest tests/                     # MockEncoder, no downloads
 USE_REAL_ENCODER=1 pytest tests/  # against real sentence-transformers
 ```
 
