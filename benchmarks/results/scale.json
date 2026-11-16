@@ -1,0 +1,1039 @@
+{
+  "config": {
+    "sizes": "1000,10000,100000,1000000",
+    "max_n": 100000,
+    "runs": 15,
+    "avg_degree": 3.0,
+    "backends": "numpy,sqlite_vec",
+    "threshold_ms": "50,100",
+    "concurrency_n": 20000,
+    "duration": 4.0,
+    "skip_concurrency": false,
+    "quick": false,
+    "out_prefix": "D:\\Goldmine\\ISON\\ison_dev\\isongraphossworking\\isongraph-vector\\benchmarks\\results\\scale"
+  },
+  "environment": {
+    "python": "3.12.7",
+    "platform": "Windows-11-10.0.26300-SP0",
+    "processor": "Intel64 Family 6 Model 183 Stepping 1, GenuineIntel",
+    "numpy": "2.4.2",
+    "psutil": "7.0.0",
+    "cpu_count": 32,
+    "ram_gb": 47.7,
+    "sqlite_vec": "0.1.9",
+    "ison_graph": "1.4.0"
+  },
+  "results": [
+    {
+      "backend": "numpy",
+      "n": 1000,
+      "dim": 384,
+      "graph_build_s": 0.007932699983939528,
+      "rss_after_graph_mb": 2.1953125,
+      "ingest_s": 0.008333099947776645,
+      "ingest_vectors_per_s": 120003.36084614106,
+      "rss_after_ingest_mb": 6.5546875,
+      "first_query_ms": 3.3359999652020633,
+      "rss_after_first_query_mb": 8.7109375,
+      "similarity_search": {
+        "median_ms": 0.26780000189319253,
+        "p95_ms": 0.27930003125220537,
+        "min_ms": 0.25779998395591974,
+        "max_ms": 0.285100017208606,
+        "runs": 15
+      },
+      "semantic_multi_hop": {
+        "median_ms": 0.519900000654161,
+        "p95_ms": 0.5920000257901847,
+        "min_ms": 0.5008000298403203,
+        "max_ms": 0.5920000257901847,
+        "runs": 5
+      },
+      "semantic_multi_hop_blend0.3": {
+        "median_ms": 0.4782000323757529,
+        "p95_ms": 0.5064999568276107,
+        "min_ms": 0.46609999844804406,
+        "max_ms": 0.5064999568276107,
+        "runs": 5
+      },
+      "semantic_subgraph": {
+        "median_ms": 1.1953999637626112,
+        "p95_ms": 1.3018000172451138,
+        "min_ms": 1.1847999994643033,
+        "max_ms": 1.3018000172451138,
+        "runs": 5
+      },
+      "similarity_search_gc_off": {
+        "median_ms": 0.25809998624026775,
+        "p95_ms": 0.27120002778247,
+        "min_ms": 0.25209999876096845,
+        "max_ms": 0.2935000229626894,
+        "runs": 15
+      },
+      "semantic_multi_hop_gc_off": {
+        "median_ms": 0.45439996756613255,
+        "p95_ms": 0.4783999756909907,
+        "min_ms": 0.4311000229790807,
+        "max_ms": 0.4783999756909907,
+        "runs": 5
+      },
+      "write_one": {
+        "median_ms": 0.12330000754445791,
+        "p95_ms": 0.15929999062791467,
+        "min_ms": 0.10830000974237919,
+        "max_ms": 0.15929999062791467,
+        "runs": 5
+      },
+      "search_after_write": {
+        "median_ms": 3.1120999483391643,
+        "p95_ms": 3.4085999941453338,
+        "min_ms": 3.0603999621234834,
+        "max_ms": 3.4085999941453338,
+        "runs": 5
+      },
+      "write_after_read_penalty_ms": 2.8442999464459717,
+      "add_batch_100_ms": 0.9445999749004841,
+      "search_after_batch_ms": 3.453000041190535,
+      "memory_mode": "rss",
+      "peak_memory_mb": 18.05859375,
+      "raw_vector_bytes_mb": 1.46484375,
+      "wall_s": 0.09648418426513672
+    },
+    {
+      "backend": "numpy",
+      "n": 10000,
+      "dim": 384,
+      "graph_build_s": 0.10433220001868904,
+      "rss_after_graph_mb": 16.484375,
+      "ingest_s": 0.09109569998690858,
+      "ingest_vectors_per_s": 109774.66555981354,
+      "rss_after_ingest_mb": 44.1328125,
+      "first_query_ms": 40.58419994544238,
+      "rss_after_first_query_mb": 61.58984375,
+      "similarity_search": {
+        "median_ms": 3.3939999993890524,
+        "p95_ms": 3.95139999454841,
+        "min_ms": 3.2282000174745917,
+        "max_ms": 13.950299995485693,
+        "runs": 15
+      },
+      "semantic_multi_hop": {
+        "median_ms": 4.77820000378415,
+        "p95_ms": 14.769800007343292,
+        "min_ms": 4.705100029241294,
+        "max_ms": 14.769800007343292,
+        "runs": 5
+      },
+      "semantic_multi_hop_blend0.3": {
+        "median_ms": 5.1525000017136335,
+        "p95_ms": 15.735799970570952,
+        "min_ms": 4.864900023676455,
+        "max_ms": 15.735799970570952,
+        "runs": 5
+      },
+      "semantic_subgraph": {
+        "median_ms": 7.652800006326288,
+        "p95_ms": 16.17169997189194,
+        "min_ms": 7.123199990019202,
+        "max_ms": 16.17169997189194,
+        "runs": 5
+      },
+      "similarity_search_gc_off": {
+        "median_ms": 2.910100040026009,
+        "p95_ms": 3.0755000188946724,
+        "min_ms": 2.669100009370595,
+        "max_ms": 5.269400018732995,
+        "runs": 15
+      },
+      "semantic_multi_hop_gc_off": {
+        "median_ms": 4.079099977388978,
+        "p95_ms": 4.406700027175248,
+        "min_ms": 3.766799985896796,
+        "max_ms": 4.406700027175248,
+        "runs": 5
+      },
+      "write_one": {
+        "median_ms": 0.8605000330135226,
+        "p95_ms": 0.9630999993532896,
+        "min_ms": 0.7241999846883118,
+        "max_ms": 0.9630999993532896,
+        "runs": 5
+      },
+      "search_after_write": {
+        "median_ms": 32.74180000880733,
+        "p95_ms": 45.68100004689768,
+        "min_ms": 32.50349999871105,
+        "max_ms": 45.68100004689768,
+        "runs": 5
+      },
+      "write_after_read_penalty_ms": 29.34780000941828,
+      "add_batch_100_ms": 1.6656999941915274,
+      "search_after_batch_ms": 34.05600000405684,
+      "memory_mode": "rss",
+      "peak_memory_mb": 175.36328125,
+      "raw_vector_bytes_mb": 14.6484375,
+      "wall_s": 0.8675665855407715
+    },
+    {
+      "backend": "numpy",
+      "n": 100000,
+      "dim": 384,
+      "graph_build_s": 1.5214064000174403,
+      "rss_after_graph_mb": 189.44140625,
+      "ingest_s": 0.9589317998033948,
+      "ingest_vectors_per_s": 104282.70292058571,
+      "rss_after_ingest_mb": 438.24609375,
+      "first_query_ms": 494.39469998469576,
+      "rss_after_first_query_mb": 588.0234375,
+      "similarity_search": {
+        "median_ms": 56.24040000839159,
+        "p95_ms": 175.03069998929277,
+        "min_ms": 51.7950999783352,
+        "max_ms": 178.656600008253,
+        "runs": 15
+      },
+      "semantic_multi_hop": {
+        "median_ms": 183.2165999803692,
+        "p95_ms": 186.60949997138232,
+        "min_ms": 67.41079996572807,
+        "max_ms": 186.60949997138232,
+        "runs": 5
+      },
+      "semantic_multi_hop_blend0.3": {
+        "median_ms": 80.34519996726885,
+        "p95_ms": 92.37000002758577,
+        "min_ms": 76.17320003919303,
+        "max_ms": 92.37000002758577,
+        "runs": 5
+      },
+      "semantic_subgraph": {
+        "median_ms": 201.60129998112097,
+        "p95_ms": 214.66230001533404,
+        "min_ms": 88.57709995936602,
+        "max_ms": 214.66230001533404,
+        "runs": 5
+      },
+      "similarity_search_gc_off": {
+        "median_ms": 45.475499995518476,
+        "p95_ms": 48.77340001985431,
+        "min_ms": 43.32390002673492,
+        "max_ms": 50.199099991004914,
+        "runs": 15
+      },
+      "semantic_multi_hop_gc_off": {
+        "median_ms": 62.41419998696074,
+        "p95_ms": 66.56899995869026,
+        "min_ms": 57.63769999612123,
+        "max_ms": 66.56899995869026,
+        "runs": 5
+      },
+      "write_one": {
+        "median_ms": 9.469800046645105,
+        "p95_ms": 10.845099983271211,
+        "min_ms": 8.508099999744445,
+        "max_ms": 10.845099983271211,
+        "runs": 5
+      },
+      "search_after_write": {
+        "median_ms": 515.0844000163488,
+        "p95_ms": 525.8605999988504,
+        "min_ms": 371.6910000075586,
+        "max_ms": 525.8605999988504,
+        "runs": 5
+      },
+      "write_after_read_penalty_ms": 458.8440000079572,
+      "add_batch_100_ms": 11.121200048364699,
+      "search_after_batch_ms": 491.61389999790117,
+      "memory_mode": "rss",
+      "peak_memory_mb": 900.53515625,
+      "raw_vector_bytes_mb": 146.484375,
+      "wall_s": 12.124620914459229
+    },
+    {
+      "backend": "sqlite_vec",
+      "n": 1000,
+      "dim": 384,
+      "graph_build_s": 0.009566799970343709,
+      "rss_after_graph_mb": 0.6796875,
+      "ingest_s": 0.022521500010043383,
+      "ingest_vectors_per_s": 44402.01583171874,
+      "rss_after_ingest_mb": 5.37109375,
+      "first_query_ms": 0.7376999710686505,
+      "rss_after_first_query_mb": 5.39453125,
+      "similarity_search": {
+        "median_ms": 0.6273000035434961,
+        "p95_ms": 0.6354000070132315,
+        "min_ms": 0.6030000513419509,
+        "max_ms": 0.6381000275723636,
+        "runs": 15
+      },
+      "semantic_multi_hop": {
+        "median_ms": 0.7210999610833824,
+        "p95_ms": 0.7649000035598874,
+        "min_ms": 0.6824000156484544,
+        "max_ms": 0.7649000035598874,
+        "runs": 5
+      },
+      "semantic_multi_hop_blend0.3": {
+        "median_ms": 0.4934000317007303,
+        "p95_ms": 3.2565000001341105,
+        "min_ms": 0.4751000087708235,
+        "max_ms": 3.2565000001341105,
+        "runs": 5
+      },
+      "semantic_subgraph": {
+        "median_ms": 1.4114999794401228,
+        "p95_ms": 1.700800028629601,
+        "min_ms": 1.3877999735996127,
+        "max_ms": 1.700800028629601,
+        "runs": 5
+      },
+      "similarity_search_gc_off": {
+        "median_ms": 0.6119000026956201,
+        "p95_ms": 0.6438000127673149,
+        "min_ms": 0.5887000006623566,
+        "max_ms": 0.6591000128537416,
+        "runs": 15
+      },
+      "semantic_multi_hop_gc_off": {
+        "median_ms": 0.6843999726697803,
+        "p95_ms": 0.7153000333346426,
+        "min_ms": 0.6596999592147768,
+        "max_ms": 0.7153000333346426,
+        "runs": 5
+      },
+      "write_one": {
+        "median_ms": 0.10080001084133983,
+        "p95_ms": 0.2864999696612358,
+        "min_ms": 0.09219994535669684,
+        "max_ms": 0.2864999696612358,
+        "runs": 5
+      },
+      "search_after_write": {
+        "median_ms": 0.624599982984364,
+        "p95_ms": 0.6707999855279922,
+        "min_ms": 0.6000000284984708,
+        "max_ms": 0.6707999855279922,
+        "runs": 5
+      },
+      "write_after_read_penalty_ms": 0.0,
+      "add_batch_100_ms": 2.5174999609589577,
+      "search_after_batch_ms": 0.6832000217400491,
+      "memory_mode": "rss",
+      "peak_memory_mb": 6.37890625,
+      "raw_vector_bytes_mb": 1.46484375,
+      "wall_s": 0.1134796142578125
+    },
+    {
+      "backend": "sqlite_vec",
+      "n": 10000,
+      "dim": 384,
+      "graph_build_s": 0.09828750003362074,
+      "rss_after_graph_mb": 3.00390625,
+      "ingest_s": 0.2197886000503786,
+      "ingest_vectors_per_s": 45498.265140720956,
+      "rss_after_ingest_mb": 63.18359375,
+      "first_query_ms": 4.082600004039705,
+      "rss_after_first_query_mb": 63.1953125,
+      "similarity_search": {
+        "median_ms": 3.7850000080652535,
+        "p95_ms": 3.9828000008128583,
+        "min_ms": 3.5116999642923474,
+        "max_ms": 4.020299995318055,
+        "runs": 15
+      },
+      "semantic_multi_hop": {
+        "median_ms": 3.7193000316619873,
+        "p95_ms": 3.825299965683371,
+        "min_ms": 3.54260002495721,
+        "max_ms": 3.825299965683371,
+        "runs": 5
+      },
+      "semantic_multi_hop_blend0.3": {
+        "median_ms": 7.244499982334673,
+        "p95_ms": 33.77769998041913,
+        "min_ms": 4.772999964188784,
+        "max_ms": 33.77769998041913,
+        "runs": 5
+      },
+      "semantic_subgraph": {
+        "median_ms": 6.706700020004064,
+        "p95_ms": 7.0751000312156975,
+        "min_ms": 6.549300043843687,
+        "max_ms": 7.0751000312156975,
+        "runs": 5
+      },
+      "similarity_search_gc_off": {
+        "median_ms": 3.7908999947831035,
+        "p95_ms": 3.8812000420875847,
+        "min_ms": 3.601200005505234,
+        "max_ms": 3.89069999800995,
+        "runs": 15
+      },
+      "semantic_multi_hop_gc_off": {
+        "median_ms": 3.7169999559409916,
+        "p95_ms": 3.867599996738136,
+        "min_ms": 3.6499000270850956,
+        "max_ms": 3.867599996738136,
+        "runs": 5
+      },
+      "write_one": {
+        "median_ms": 0.17260003369301558,
+        "p95_ms": 0.9729999583214521,
+        "min_ms": 0.1558999647386372,
+        "max_ms": 0.9729999583214521,
+        "runs": 5
+      },
+      "search_after_write": {
+        "median_ms": 3.6902999854646623,
+        "p95_ms": 3.924200020264834,
+        "min_ms": 3.4995999885722995,
+        "max_ms": 3.924200020264834,
+        "runs": 5
+      },
+      "write_after_read_penalty_ms": 0.0,
+      "add_batch_100_ms": 2.9286000062711537,
+      "search_after_batch_ms": 3.929999948013574,
+      "memory_mode": "rss",
+      "peak_memory_mb": 155.32421875,
+      "raw_vector_bytes_mb": 14.6484375,
+      "wall_s": 0.7612314224243164
+    },
+    {
+      "backend": "sqlite_vec",
+      "n": 100000,
+      "dim": 384,
+      "graph_build_s": 1.5857014000066556,
+      "rss_after_graph_mb": 171.5,
+      "ingest_s": 2.5332789999083616,
+      "ingest_vectors_per_s": 39474.530836760336,
+      "rss_after_ingest_mb": 595.5546875,
+      "first_query_ms": 37.8886999678798,
+      "rss_after_first_query_mb": 595.5703125,
+      "similarity_search": {
+        "median_ms": 34.1480000060983,
+        "p95_ms": 37.14430000400171,
+        "min_ms": 32.41459996206686,
+        "max_ms": 41.97570000542328,
+        "runs": 15
+      },
+      "semantic_multi_hop": {
+        "median_ms": 32.89879998192191,
+        "p95_ms": 35.28880001977086,
+        "min_ms": 32.81399997649714,
+        "max_ms": 35.28880001977086,
+        "runs": 5
+      },
+      "semantic_multi_hop_blend0.3": {
+        "median_ms": 93.07939995778725,
+        "p95_ms": 561.1793999560177,
+        "min_ms": 79.61079996312037,
+        "max_ms": 561.1793999560177,
+        "runs": 5
+      },
+      "semantic_subgraph": {
+        "median_ms": 57.48330004280433,
+        "p95_ms": 59.96049998793751,
+        "min_ms": 56.29639996914193,
+        "max_ms": 59.96049998793751,
+        "runs": 5
+      },
+      "similarity_search_gc_off": {
+        "median_ms": 33.09199999785051,
+        "p95_ms": 34.5507999882102,
+        "min_ms": 32.45630004676059,
+        "max_ms": 35.67830001702532,
+        "runs": 15
+      },
+      "semantic_multi_hop_gc_off": {
+        "median_ms": 32.66220004297793,
+        "p95_ms": 35.86800000630319,
+        "min_ms": 32.35639998456463,
+        "max_ms": 35.86800000630319,
+        "runs": 5
+      },
+      "write_one": {
+        "median_ms": 0.25459995958954096,
+        "p95_ms": 8.436900039669126,
+        "min_ms": 0.18780003301799297,
+        "max_ms": 8.436900039669126,
+        "runs": 5
+      },
+      "search_after_write": {
+        "median_ms": 35.70639999816194,
+        "p95_ms": 43.893399997614324,
+        "min_ms": 34.00430001784116,
+        "max_ms": 43.893399997614324,
+        "runs": 5
+      },
+      "write_after_read_penalty_ms": 1.5583999920636415,
+      "add_batch_100_ms": 4.230199963785708,
+      "search_after_batch_ms": 33.18169998237863,
+      "memory_mode": "rss",
+      "peak_memory_mb": 737.921875,
+      "raw_vector_bytes_mb": 146.484375,
+      "wall_s": 8.846843481063843
+    }
+  ],
+  "skipped": [],
+  "concurrency": [
+    {
+      "backend": "numpy",
+      "n": 20000,
+      "readers": 4,
+      "writers": 0,
+      "scenario": "store_ops",
+      "duration_s": 4.08,
+      "reads": 351,
+      "reads_per_s": 85.99599136215407,
+      "writes_ok": 0,
+      "writes_per_s": 0.0,
+      "errors": {},
+      "first_error": {},
+      "rows_expected": 20000,
+      "rows_found": 20000,
+      "lost_writes": 0,
+      "read_latency": {
+        "median_ms": 49.861199979204684,
+        "p95_ms": 66.48270000005141,
+        "min_ms": 27.25700003793463,
+        "max_ms": 75.09280001977459,
+        "runs": 351
+      }
+    },
+    {
+      "backend": "numpy",
+      "n": 20000,
+      "readers": 4,
+      "writers": 1,
+      "scenario": "store_ops",
+      "duration_s": 4.15,
+      "reads": 144,
+      "reads_per_s": 34.67725767932117,
+      "writes_ok": 41,
+      "writes_per_s": 9.873385867028945,
+      "errors": {},
+      "first_error": {},
+      "rows_expected": 20041,
+      "rows_found": 20041,
+      "lost_writes": 0,
+      "read_latency": {
+        "median_ms": 112.02909998246469,
+        "p95_ms": 135.460699966643,
+        "min_ms": 40.02069996204227,
+        "max_ms": 246.60720000974834,
+        "runs": 144
+      }
+    },
+    {
+      "backend": "numpy",
+      "n": 20000,
+      "readers": 2,
+      "writers": 4,
+      "scenario": "store_ops",
+      "duration_s": 4.17,
+      "reads": 57,
+      "reads_per_s": 13.670547199279119,
+      "writes_ok": 127,
+      "writes_per_s": 30.458938496639437,
+      "errors": {},
+      "first_error": {},
+      "rows_expected": 20127,
+      "rows_found": 20127,
+      "lost_writes": 0,
+      "read_latency": {
+        "median_ms": 153.24729995336384,
+        "p95_ms": 169.64570002164692,
+        "min_ms": 7.203199958894402,
+        "max_ms": 215.44549998361617,
+        "runs": 57
+      }
+    },
+    {
+      "backend": "numpy",
+      "n": 20000,
+      "readers": 3,
+      "writers": 1,
+      "scenario": "graph_ops",
+      "duration_s": 4.08,
+      "reads": 96,
+      "reads_per_s": 23.5306344350786,
+      "writes_ok": 44,
+      "writes_per_s": 10.784874116077692,
+      "errors": {},
+      "first_error": {},
+      "rows_expected": 20044,
+      "rows_found": 20044,
+      "lost_writes": 0,
+      "read_latency": {
+        "median_ms": 124.8885499953758,
+        "p95_ms": 159.76589999627322,
+        "min_ms": 10.402899992186576,
+        "max_ms": 219.8540000244975,
+        "runs": 96
+      }
+    },
+    {
+      "backend": "sqlite_vec",
+      "n": 20000,
+      "readers": 4,
+      "writers": 0,
+      "scenario": "store_ops",
+      "duration_s": 4.02,
+      "reads": 575,
+      "reads_per_s": 142.92528892605642,
+      "writes_ok": 0,
+      "writes_per_s": 0.0,
+      "errors": {},
+      "first_error": {},
+      "rows_expected": 20000,
+      "rows_found": 20000,
+      "lost_writes": 0,
+      "read_latency": {
+        "median_ms": 7.067999977152795,
+        "p95_ms": 127.26400000974536,
+        "min_ms": 6.327399984002113,
+        "max_ms": 258.3578000194393,
+        "runs": 575
+      }
+    },
+    {
+      "backend": "sqlite_vec",
+      "n": 20000,
+      "readers": 4,
+      "writers": 1,
+      "scenario": "store_ops",
+      "duration_s": 4.03,
+      "reads": 575,
+      "reads_per_s": 142.7228202943869,
+      "writes_ok": 63,
+      "writes_per_s": 15.637456832254566,
+      "errors": {},
+      "first_error": {},
+      "rows_expected": 20063,
+      "rows_found": 20063,
+      "lost_writes": 0,
+      "read_latency": {
+        "median_ms": 7.093499996699393,
+        "p95_ms": 106.15750000579283,
+        "min_ms": 6.286300020292401,
+        "max_ms": 273.1162999989465,
+        "runs": 575
+      }
+    },
+    {
+      "backend": "sqlite_vec",
+      "n": 20000,
+      "readers": 2,
+      "writers": 4,
+      "scenario": "store_ops",
+      "duration_s": 4.01,
+      "reads": 549,
+      "reads_per_s": 136.8524265958837,
+      "writes_ok": 488,
+      "writes_per_s": 121.6466014185633,
+      "errors": {},
+      "first_error": {},
+      "rows_expected": 20488,
+      "rows_found": 20488,
+      "lost_writes": 0,
+      "read_latency": {
+        "median_ms": 7.243599975481629,
+        "p95_ms": 46.546700003091246,
+        "min_ms": 6.24339998466894,
+        "max_ms": 125.78910001320764,
+        "runs": 549
+      }
+    },
+    {
+      "backend": "sqlite_vec",
+      "n": 20000,
+      "readers": 3,
+      "writers": 1,
+      "scenario": "graph_ops",
+      "duration_s": 4.02,
+      "reads": 538,
+      "reads_per_s": 133.87640704416353,
+      "writes_ok": 206,
+      "writes_per_s": 51.26122648902916,
+      "errors": {},
+      "first_error": {},
+      "rows_expected": 20206,
+      "rows_found": 20206,
+      "lost_writes": 0,
+      "read_latency": {
+        "median_ms": 22.079399961512536,
+        "p95_ms": 27.818200003821403,
+        "min_ms": 6.799699971452355,
+        "max_ms": 43.6850999831222,
+        "runs": 538
+      }
+    }
+  ],
+  "floor": {
+    "1000": {
+      "median_ms": 0.026100024115294218,
+      "p95_ms": 0.033299962524324656,
+      "min_ms": 0.02239999594166875,
+      "max_ms": 0.04529999569058418,
+      "runs": 15
+    },
+    "10000": {
+      "median_ms": 0.21700002253055573,
+      "p95_ms": 0.3627999685704708,
+      "min_ms": 0.18719997024163604,
+      "max_ms": 0.42860000394284725,
+      "runs": 15
+    },
+    "100000": {
+      "median_ms": 4.019999993033707,
+      "p95_ms": 4.957000026479363,
+      "min_ms": 3.4126999671570957,
+      "max_ms": 6.527199991978705,
+      "runs": 15
+    }
+  },
+  "analysis": {
+    "numpy/similarity_search": {
+      "points": [
+        [
+          1000,
+          0.26780000189319253
+        ],
+        [
+          10000,
+          3.3939999993890524
+        ],
+        [
+          100000,
+          56.24040000839159
+        ]
+      ],
+      "fit": {
+        "intercept_ms": -2.477822223833426,
+        "ms_per_1k_vectors": 0.5871822223222503,
+        "r2": 1.0
+      },
+      "crossings": {
+        "50": {
+          "n": 89372,
+          "kind": "interpolated between measured sizes"
+        },
+        "100": {
+          "n": 174524,
+          "kind": "extrapolated (linear fit)"
+        }
+      }
+    },
+    "numpy/semantic_multi_hop": {
+      "points": [
+        [
+          1000,
+          0.519900000654161
+        ],
+        [
+          10000,
+          4.77820000378415
+        ],
+        [
+          100000,
+          183.2165999803692
+        ]
+      ],
+      "fit": {
+        "intercept_ms": -15.048288882503021,
+        "ms_per_1k_vectors": 1.9826488886287224,
+        "r2": 1.0
+      },
+      "crossings": {
+        "50": {
+          "n": 32808,
+          "kind": "interpolated between measured sizes"
+        },
+        "100": {
+          "n": 58027,
+          "kind": "interpolated between measured sizes"
+        }
+      }
+    },
+    "numpy/semantic_multi_hop_blend0.3": {
+      "points": [
+        [
+          1000,
+          0.4782000323757529
+        ],
+        [
+          10000,
+          5.1525000017136335
+        ],
+        [
+          100000,
+          80.34519996726885
+        ]
+      ],
+      "fit": {
+        "intercept_ms": -3.2022444389035893,
+        "ms_per_1k_vectors": 0.8354744440617243,
+        "r2": 1.0
+      },
+      "crossings": {
+        "50": {
+          "n": 63679,
+          "kind": "interpolated between measured sizes"
+        },
+        "100": {
+          "n": 123525,
+          "kind": "extrapolated (linear fit)"
+        }
+      }
+    },
+    "numpy/semantic_subgraph": {
+      "points": [
+        [
+          1000,
+          1.1953999637626112
+        ],
+        [
+          10000,
+          7.652800006326288
+        ],
+        [
+          100000,
+          201.60129998112097
+        ]
+      ],
+      "fit": {
+        "intercept_ms": -13.89703332420637,
+        "ms_per_1k_vectors": 2.1549833330532735,
+        "r2": 1.0
+      },
+      "crossings": {
+        "50": {
+          "n": 29650,
+          "kind": "interpolated between measured sizes"
+        },
+        "100": {
+          "n": 52852,
+          "kind": "interpolated between measured sizes"
+        }
+      }
+    },
+    "numpy/similarity_search_gc_off": {
+      "points": [
+        [
+          1000,
+          0.25809998624026775
+        ],
+        [
+          10000,
+          2.910100040026009
+        ],
+        [
+          100000,
+          45.475499995518476
+        ]
+      ],
+      "fit": {
+        "intercept_ms": -1.81938884391758,
+        "ms_per_1k_vectors": 0.47294888839436056,
+        "r2": 1.0
+      },
+      "crossings": {
+        "50": {
+          "n": 109566,
+          "kind": "extrapolated (linear fit)"
+        },
+        "100": {
+          "n": 215286,
+          "kind": "extrapolated (linear fit)"
+        }
+      }
+    },
+    "sqlite_vec/similarity_search": {
+      "points": [
+        [
+          1000,
+          0.6273000035434961
+        ],
+        [
+          10000,
+          3.7850000080652535
+        ],
+        [
+          100000,
+          34.1480000060983
+        ]
+      ],
+      "fit": {
+        "intercept_ms": 0.4113333416171519,
+        "ms_per_1k_vectors": 0.33736666664481146,
+        "r2": 1.0
+      },
+      "crossings": {
+        "50": {
+          "n": 146987,
+          "kind": "extrapolated (linear fit)"
+        },
+        "100": {
+          "n": 295194,
+          "kind": "extrapolated (linear fit)"
+        }
+      }
+    },
+    "sqlite_vec/semantic_multi_hop": {
+      "points": [
+        [
+          1000,
+          0.7210999610833824
+        ],
+        [
+          10000,
+          3.7193000316619873
+        ],
+        [
+          100000,
+          32.89879998192191
+        ]
+      ],
+      "fit": {
+        "intercept_ms": 0.4771333705220134,
+        "ms_per_1k_vectors": 0.3242166661139991,
+        "r2": 1.0
+      },
+      "crossings": {
+        "50": {
+          "n": 152746,
+          "kind": "extrapolated (linear fit)"
+        },
+        "100": {
+          "n": 306964,
+          "kind": "extrapolated (linear fit)"
+        }
+      }
+    },
+    "sqlite_vec/semantic_multi_hop_blend0.3": {
+      "points": [
+        [
+          1000,
+          0.4934000317007303
+        ],
+        [
+          10000,
+          7.244499982334673
+        ],
+        [
+          100000,
+          93.07939995778725
+        ]
+      ],
+      "fit": {
+        "intercept_ms": -2.292711126048909,
+        "ms_per_1k_vectors": 0.9537211108383616,
+        "r2": 1.0
+      },
+      "crossings": {
+        "50": {
+          "n": 54830,
+          "kind": "interpolated between measured sizes"
+        },
+        "100": {
+          "n": 107256,
+          "kind": "extrapolated (linear fit)"
+        }
+      }
+    },
+    "sqlite_vec/semantic_subgraph": {
+      "points": [
+        [
+          1000,
+          1.4114999794401228
+        ],
+        [
+          10000,
+          6.706700020004064
+        ],
+        [
+          100000,
+          57.48330004280433
+        ]
+      ],
+      "fit": {
+        "intercept_ms": 1.0648555730262848,
+        "ms_per_1k_vectors": 0.5641844446977806,
+        "r2": 1.0
+      },
+      "crossings": {
+        "50": {
+          "n": 86736,
+          "kind": "interpolated between measured sizes"
+        },
+        "100": {
+          "n": 175359,
+          "kind": "extrapolated (linear fit)"
+        }
+      }
+    },
+    "sqlite_vec/similarity_search_gc_off": {
+      "points": [
+        [
+          1000,
+          0.6119000026956201
+        ],
+        [
+          10000,
+          3.7908999947831035
+        ],
+        [
+          100000,
+          33.09199999785051
+        ]
+      ],
+      "fit": {
+        "intercept_ms": 0.5352222166645121,
+        "ms_per_1k_vectors": 0.32556777781185986,
+        "r2": 1.0
+      },
+      "crossings": {
+        "50": {
+          "n": 151933,
+          "kind": "extrapolated (linear fit)"
+        },
+        "100": {
+          "n": 305511,
+          "kind": "extrapolated (linear fit)"
+        }
+      }
+    },
+    "raw_numpy_floor": {
+      "points": [
+        [
+          1000,
+          0.026100024115294218
+        ],
+        [
+          10000,
+          0.21700002253055573
+        ],
+        [
+          100000,
+          4.019999993033707
+        ]
+      ],
+      "fit": {
+        "intercept_ms": -0.2055555297475698,
+        "ms_per_1k_vectors": 0.04225555522781277,
+        "r2": 1.0
+      },
+      "crossings": {
+        "50": {
+          "n": 1188140,
+          "kind": "extrapolated (linear fit)"
+        },
+        "100": {
+          "n": 2371417,
+          "kind": "extrapolated (linear fit)"
+        }
+      }
+    }
+  }
+}

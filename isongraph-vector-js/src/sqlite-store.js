@@ -29,7 +29,7 @@
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { DatabaseSync } from 'node:sqlite';
-import { DimensionMismatchError, EmbeddingError, NoEncoderError, EMBEDDING_FORMAT, EMBEDDING_FORMAT_VERSION, selectTopK, } from './index.js';
+import { DimensionMismatchError, EmbeddingError, ModelMismatchError, NoEncoderError, EMBEDDING_FORMAT, EMBEDDING_FORMAT_VERSION, GRAPH_DIGEST_BASIS, UNKNOWN_MODELS, selectTopK, } from './index.js';
 /** Virtual table holding the vec0 index, alongside the `embeddings` table. */
 export const VEC_TABLE = 'vec_embeddings';
 /** SQLite-backed embedding storage. */
@@ -42,12 +42,21 @@ export class SqliteEmbeddingStore {
      * @param sqliteVec Answer top-k searches through a sqlite-vec vec0 virtual
      *                  table instead of scanning every row. Results are the same
      *                  either way - vec0 runs an exact brute-force KNN in C.
+     * @param options   `version` (recorded in the sidecar) and `onModelMismatch`
+     *                  ('warn' | 'error' | 'ignore'), as for EmbeddingStore
      */
-    constructor(path = ':memory:', encoder, sqliteVec = false) {
+    constructor(path = ':memory:', encoder, sqliteVec = false, options = {}) {
         this._dimension = null;
         this._vecReady = false;
+        this._onModelMismatch = 'warn';
+        this._warnedMismatch = new Set();
+        this._modelsCache = null;
+        /** Metadata of the most recent imported sidecar (empty before any). */
+        this.lastImportMeta = {};
         this._encoder = encoder ?? null;
         this._sqliteVec = sqliteVec;
+        this._version = options.version ?? null;
+        this.onModelMismatch = options.onModelMismatch ?? 'warn';
         this._db = new DatabaseSync(path, { allowExtension: sqliteVec });
         if (sqliteVec)
             this._loadVecExtension();
@@ -91,6 +100,15 @@ export class SqliteEmbeddingStore {
       CREATE INDEX IF NOT EXISTS idx_embeddings_node
           ON embeddings(node_type, node_id);
     `);
+        // The shared schema has always had a `model` column, but a database made by
+        // a very early build may not. Add it with the "no information" default, so
+        // such rows read as 'unknown' rather than as some real model. ADD COLUMN
+        // with a default is metadata-only in SQLite (no rewrite) and every other
+        // port ignores columns it does not know.
+        const columns = this._db.prepare('PRAGMA table_info(embeddings)').all();
+        if (!columns.some(c => c.name === 'model')) {
+            this._db.exec("ALTER TABLE embeddings ADD COLUMN model TEXT DEFAULT 'unknown'");
+        }
     }
     _adoptStoredDimension() {
         const row = this._db
@@ -137,6 +155,26 @@ export class SqliteEmbeddingStore {
     set encoder(encoder) {
         this._encoder = encoder;
     }
+    /** Encoder/model version recorded in the sidecar, or null if unknown. */
+    get version() {
+        if (this._version !== null)
+            return this._version;
+        const fromEncoder = this._encoder?.version;
+        return fromEncoder === undefined || fromEncoder === null ? null : fromEncoder;
+    }
+    set version(value) {
+        this._version = value;
+    }
+    /** How a text query reacts to vectors from another model (see EmbeddingStoreOptions). */
+    get onModelMismatch() {
+        return this._onModelMismatch;
+    }
+    set onModelMismatch(mode) {
+        if (mode !== 'warn' && mode !== 'error' && mode !== 'ignore') {
+            throw new EmbeddingError(`onModelMismatch must be 'warn', 'error' or 'ignore', got ${JSON.stringify(mode)}`);
+        }
+        this._onModelMismatch = mode;
+    }
     /** Surrogate primary key, matching what the other ports compute. */
     static _embeddingId(nodeRef) {
         return createHash('md5').update(`${nodeRef[0]}:${nodeRef[1]}`).digest('hex').slice(0, 16);
@@ -176,8 +214,116 @@ export class SqliteEmbeddingStore {
         n2 = Math.sqrt(n2);
         return n1 === 0 || n2 === 0 ? 0 : dot / (n1 * n2);
     }
+    /** Model recorded on vectors written now: the encoder's, or "provided"/"unknown". */
     _modelName() {
-        return this._encoder ? 'unknown' : 'provided';
+        if (!this._encoder)
+            return 'provided';
+        return this._encoder.modelName || 'unknown';
+    }
+    /** The encoder's model, or null when it has none (or an uninformative one). */
+    _currentModel() {
+        const name = this._encoder?.modelName;
+        return name && !UNKNOWN_MODELS.has(name) ? name : null;
+    }
+    /**
+     * Which models produced the stored vectors: `{ modelName: count }`.
+     *
+     * "unknown" / "provided" appear as-is (vectors imported from a port that
+     * records no model, or handed in with no encoder attached). The counts are
+     * cached, and the cache is dropped on every write through this store and
+     * whenever another connection commits a change (`PRAGMA data_version`).
+     */
+    models() {
+        const dataVersion = Number(this._db.prepare('PRAGMA data_version').get().data_version);
+        if (this._modelsCache === null || this._modelsCache.dataVersion !== dataVersion) {
+            const rows = this._db
+                .prepare("SELECT COALESCE(model, 'unknown') AS m, COUNT(*) AS n FROM embeddings GROUP BY m")
+                .all();
+            const counts = {};
+            for (const row of rows)
+                counts[row.m] = Number(row.n);
+            this._modelsCache = { dataVersion, counts };
+        }
+        return { ...this._modelsCache.counts };
+    }
+    /** Complain when a text query's encoder is not the stored vectors' model. */
+    _checkModelCompat() {
+        if (this._onModelMismatch === 'ignore')
+            return;
+        const current = this._currentModel();
+        if (current === null)
+            return;
+        const foreign = Object.keys(this.models())
+            .filter(m => !UNKNOWN_MODELS.has(m) && m !== current)
+            .sort();
+        if (foreign.length === 0)
+            return;
+        const message = `encoder model '${current}' differs from the model that produced the ` +
+            `stored vectors (${foreign.map(m => `'${m}'`).join(', ')}); ` +
+            `scores compare vectors from different spaces. Re-embed the stale ` +
+            `vectors (see stale()) or search with the original encoder.`;
+        if (this._onModelMismatch === 'error')
+            throw new ModelMismatchError(message);
+        const key = JSON.stringify([current, foreign]);
+        if (!this._warnedMismatch.has(key)) {
+            this._warnedMismatch.add(key);
+            if (typeof console !== 'undefined')
+                console.warn(message);
+        }
+    }
+    /**
+     * Node refs whose stored vector does not belong to the current encoder.
+     *
+     * A vector is stale when its recorded model differs from `model` (default:
+     * the encoder's `modelName`) or its length differs from `dimension`
+     * (default: the encoder's `dimension`). Vectors whose model is
+     * "unknown"/"provided" cannot be judged by model and are skipped unless
+     * `includeUnknown` is true (a dimension mismatch still counts). With no
+     * encoder and no arguments nothing can be judged and the result is empty.
+     *
+     * Takes either the positional form or an options object.
+     */
+    stale(modelOrOptions, dimensionArg, includeUnknownArg = false) {
+        const options = modelOrOptions !== null && typeof modelOrOptions === 'object'
+            ? modelOrOptions
+            : { model: modelOrOptions, dimension: dimensionArg, includeUnknown: includeUnknownArg };
+        const model = options.model ?? this._currentModel();
+        let dimension = options.dimension ?? null;
+        if (dimension === null && this._encoder) {
+            const d = Number(this._encoder.dimension);
+            dimension = Number.isFinite(d) ? Math.trunc(d) : null;
+        }
+        const includeUnknown = options.includeUnknown ?? false;
+        const rows = this._db
+            .prepare("SELECT node_type, node_id, node_id_type, COALESCE(model, 'unknown') AS model, " +
+            'LENGTH(vector) AS n FROM embeddings ORDER BY node_type, node_id')
+            .all();
+        const out = [];
+        for (const row of rows) {
+            const byModel = model !== null &&
+                row.model !== model &&
+                (includeUnknown || !UNKNOWN_MODELS.has(row.model));
+            const byDim = dimension !== null && Number(row.n) / 4 !== dimension;
+            if (byModel || byDim) {
+                out.push([row.node_type, row.node_id_type === 'int' ? Number(row.node_id) : row.node_id]);
+            }
+        }
+        return out;
+    }
+    /** Resolve a query to a vector, checking model compatibility for text. */
+    _resolveQuery(query) {
+        let queryVector;
+        if (typeof query === 'string') {
+            if (!this._encoder)
+                throw new NoEncoderError('No encoder provided for text query');
+            this._checkModelCompat();
+            queryVector = this._encoder.encode(query);
+        }
+        else {
+            queryVector = query;
+        }
+        this._checkQuery(queryVector);
+        return queryVector;
     }
     /**
      * Insert or update one row, keeping the vec0 index in step.
@@ -188,6 +334,7 @@ export class SqliteEmbeddingStore {
     _writeRow(nodeRef, vector, text, model, nodeIdType = 'str') {
         const embId = SqliteEmbeddingStore._embeddingId(nodeRef);
         const blob = SqliteEmbeddingStore._pack(vector);
+        this._modelsCache = null;
         this._db.prepare(`
       INSERT INTO embeddings
       (id, node_type, node_id, node_id_type, vector, text, model)
@@ -247,7 +394,7 @@ export class SqliteEmbeddingStore {
     }
     get(nodeRef) {
         const row = this._db
-            .prepare('SELECT id, node_type, node_id, vector, text FROM embeddings ' +
+            .prepare('SELECT id, node_type, node_id, vector, text, model FROM embeddings ' +
             'WHERE node_type = ? AND node_id = ?')
             .get(String(nodeRef[0]), String(nodeRef[1]));
         if (!row)
@@ -257,9 +404,11 @@ export class SqliteEmbeddingStore {
             nodeRef: [row.node_type, row.node_id],
             vector: SqliteEmbeddingStore._unpack(row.vector),
             text: row.text,
+            model: row.model ?? 'unknown',
         };
     }
     remove(nodeRef) {
+        this._modelsCache = null;
         if (this._sqliteVec && this._vecReady) {
             const row = this._db
                 .prepare('SELECT rowid AS rid FROM embeddings WHERE node_type = ? AND node_id = ?')
@@ -275,11 +424,29 @@ export class SqliteEmbeddingStore {
     count() {
         return Number(this._db.prepare('SELECT COUNT(*) AS c FROM embeddings').get().c);
     }
-    clear() {
+    /**
+     * Clear all embeddings.
+     *
+     * @param resetDimension Also forget the pinned vector length, so the next
+     *   vector may have a different one (switching to an encoder of a different
+     *   dimension); with the sqlite-vec index on, the vec0 table - fixed to the
+     *   old width - is dropped and rebuilt at the new one. Off by default: a
+     *   store normally refuses vectors of the wrong length even when empty.
+     */
+    clear(resetDimension = false) {
+        this._modelsCache = null;
         this._db.exec('DELETE FROM embeddings');
-        if (this._sqliteVec && this._vecReady)
-            this._db.exec(`DELETE FROM ${VEC_TABLE}`);
-        this._dimension = null;
+        if (this._sqliteVec && this._vecReady) {
+            if (resetDimension) {
+                this._db.exec(`DROP TABLE IF EXISTS ${VEC_TABLE}`);
+                this._vecReady = false;
+            }
+            else {
+                this._db.exec(`DELETE FROM ${VEC_TABLE}`);
+            }
+        }
+        if (resetDimension)
+            this._dimension = null;
     }
     /**
      * Cosine similarity against a stored blob, without materialising it.
@@ -346,16 +513,7 @@ export class SqliteEmbeddingStore {
         return results;
     }
     similaritySearch(query, topK = 10, nodeType, threshold = 0.0) {
-        let queryVector;
-        if (typeof query === 'string') {
-            if (!this._encoder)
-                throw new NoEncoderError('No encoder provided for text query');
-            queryVector = this._encoder.encode(query);
-        }
-        else {
-            queryVector = query;
-        }
-        this._checkQuery(queryVector);
+        const queryVector = this._resolveQuery(query);
         // A zero vector has no direction for cosine to measure; vec0 returns NaN
         // there, while the scan defines it as 0.0.
         if (this._sqliteVec && topK !== null && topK > 0 && queryVector.some(v => v !== 0)) {
@@ -373,42 +531,53 @@ export class SqliteEmbeddingStore {
      * blending needs a score for every node.
      */
     scoreMap(query, nodeType) {
-        let queryVector;
-        if (typeof query === 'string') {
-            if (!this._encoder)
-                throw new NoEncoderError('No encoder provided for text query');
-            queryVector = this._encoder.encode(query);
-        }
-        else {
-            queryVector = query;
-        }
-        this._checkQuery(queryVector);
+        const queryVector = this._resolveQuery(query);
         const scores = new Map();
         for (const result of this._scan(queryVector, nodeType)) {
             scores.set(`${result.nodeRef[0]}:${result.nodeRef[1]}`, result.score);
         }
         return scores;
     }
-    /** Serialize every embedding into the portable cross-language payload. */
-    exportEmbeddings() {
+    /**
+     * Serialize every embedding into the portable cross-language payload.
+     *
+     * Beyond the version-1 fields it appends, when known: `encoder_model` (the
+     * encoder's modelName), `encoder_version` (this store's `version`) and, when
+     * `graphDigest` is given, `graph_digest` plus `graph_digest_basis`. Absent
+     * values are omitted, not written as null. Each embedding carries the
+     * `model` that produced it.
+     */
+    exportEmbeddings(graphDigest) {
         const rows = this._db
-            .prepare('SELECT node_type, node_id, node_id_type, vector, text FROM embeddings ' +
-            'ORDER BY node_type, node_id')
+            .prepare("SELECT node_type, node_id, node_id_type, vector, text, COALESCE(model, 'unknown') AS model " +
+            'FROM embeddings ORDER BY node_type, node_id')
             .all();
         const embeddings = rows.map(row => ({
             type: row.node_type,
             id: row.node_id,
             id_type: (row.node_id_type === 'int' ? 'int' : 'str'),
             text: row.text,
+            model: row.model,
             vector: SqliteEmbeddingStore._unpack(row.vector),
         }));
-        return {
+        const payload = {
             format: EMBEDDING_FORMAT,
             version: EMBEDDING_FORMAT_VERSION,
             dimension: this._dimension,
             count: embeddings.length,
             embeddings,
         };
+        const encoderModel = this._currentModel();
+        if (encoderModel !== null)
+            payload.encoder_model = encoderModel;
+        const version = this.version;
+        if (version !== null)
+            payload.encoder_version = String(version);
+        if (graphDigest !== undefined && graphDigest !== null) {
+            payload.graph_digest = graphDigest;
+            payload.graph_digest_basis = GRAPH_DIGEST_BASIS;
+        }
+        return payload;
     }
     /** Load a payload produced by exportEmbeddings (in any language port). */
     importEmbeddings(payload, replace = false) {
@@ -419,14 +588,22 @@ export class SqliteEmbeddingStore {
             throw new EmbeddingError(`unsupported ${EMBEDDING_FORMAT} version ${payload.version} ` +
                 `(this build reads version ${EMBEDDING_FORMAT_VERSION})`);
         }
-        if (replace)
-            this.clear();
+        const meta = {};
+        for (const key of ['encoder_model', 'encoder_version', 'graph_digest', 'graph_digest_basis']) {
+            if (payload[key] !== undefined && payload[key] !== null)
+                meta[key] = payload[key];
+        }
+        this.lastImportMeta = meta;
+        if (replace) {
+            this.clear(true);
+            this._dimension = payload.dimension ?? null;
+        }
         let written = 0;
         this._db.exec('BEGIN');
         try {
             for (const item of payload.embeddings ?? []) {
                 this._checkDimension(item.vector, 'vector');
-                this._writeRow([item.type, String(item.id)], item.vector, item.text ?? '', 'unknown', item.id_type ?? 'str');
+                this._writeRow([item.type, String(item.id)], item.vector, item.text ?? '', item.model ?? 'unknown', item.id_type ?? 'str');
                 written++;
             }
             this._db.exec('COMMIT');

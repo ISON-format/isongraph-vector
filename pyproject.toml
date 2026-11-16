@@ -61,6 +61,12 @@ fast = [
 vec = [
     "sqlite-vec>=0.1.6",
 ]
+# The opt-in approximate nearest-neighbour index (EmbeddingStore(ann="ivf")).
+# It is plain numpy, so this is the same requirement as `fast`; the name just
+# says what it is for.
+ann = [
+    "numpy>=1.21.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/ISON-format/isongraph-vector"

@@ -1,0 +1,18 @@
+# Rust half of the graph-file cross-port check (see ../graph_files.py).
+#
+# A standalone package that depends on the port by path. It is deliberately not
+# a member of any workspace and not an example inside the port, so building it
+# never touches the port's directory: the orchestrator builds it with
+# --target-dir pointing outside the repository.
+[package]
+name = "cross_port_graph"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+isongraph-vector-rs = { path = "../../../isongraph-vector-rs" }
+serde_json = "1.0"
+
+# Keeps cargo from looking upward for a workspace root.
+[workspace]

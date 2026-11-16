@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    C# half of the graph-file cross-port check (see ../graph_files.py).
+
+    The port's sources are compiled into this assembly rather than referenced as
+    a project. A ProjectReference would build the port in place and write its
+    bin/ and obj/ inside the port's directory; compiling the files here keeps
+    every build product in this project's own (out-of-tree) output. The
+    orchestrator passes BaseIntermediateOutputPath and OutDir outside the
+    repository.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>CrossPortGraph</RootNamespace>
+    <PortSrc>$(MSBuildThisFileDirectory)../../../isongraph-vector-csharp/src/IsonGraph.Vector/</PortSrc>
+    <!-- Forward slashes throughout: property functions do not normalise
+         separators on Linux. Whatever IsonGraph version the port itself builds against. -->
+    <PortCsproj>$([System.IO.File]::ReadAllText('$(PortSrc)IsonGraph.Vector.csproj'))</PortCsproj>
+    <IsonGraphVersion>$([System.Text.RegularExpressions.Regex]::Match('$(PortCsproj)', 'PackageReference Include="IsonGraph" Version="([^"]+)"').Groups[1].Value)</IsonGraphVersion>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="$(PortSrc)**/*.cs" Exclude="$(PortSrc)bin/**;$(PortSrc)obj/**" />
+    <PackageReference Include="IsonGraph" Version="$(IsonGraphVersion)" />
+  </ItemGroup>
+
+</Project>

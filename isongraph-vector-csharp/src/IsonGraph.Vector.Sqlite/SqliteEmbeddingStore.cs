@@ -29,6 +29,11 @@ public sealed class SqliteEmbeddingStore : IDisposable
     private int? _dimension;
     private readonly bool _sqliteVec;
     private bool _vecReady;
+    private string? _version;
+    private ModelMismatchMode _onModelMismatch;
+    private Dictionary<string, int>? _modelsCache;
+    private readonly HashSet<string> _warnedMismatch = new();
+    private IReadOnlyDictionary<string, string> _lastImportMeta = new Dictionary<string, string>();
 
     /// <summary>
     /// Open (or create) a store. Use ":memory:" for a scratch store.
@@ -40,11 +45,24 @@ public sealed class SqliteEmbeddingStore : IDisposable
     /// of scanning every row. Results are the same either way - vec0 runs an
     /// exact brute-force KNN in C.
     /// </param>
+    /// <param name="version">
+    /// Free-form version of the encoder/model that made these vectors, recorded
+    /// in the sidecar. Falls back to the encoder's own Version.
+    /// </param>
+    /// <param name="onModelMismatch">
+    /// What a text query does when the encoder's ModelName differs from the
+    /// model that produced the stored vectors (see <see cref="EmbeddingStore"/>).
+    /// </param>
     public SqliteEmbeddingStore(string path = ":memory:", IEmbeddingEncoder? encoder = null,
-                                bool sqliteVec = false)
+                                bool sqliteVec = false, string? version = null,
+                                ModelMismatchMode onModelMismatch = ModelMismatchMode.Warn)
     {
+        if (!Enum.IsDefined(onModelMismatch))
+            throw new ArgumentOutOfRangeException(nameof(onModelMismatch), onModelMismatch, "unknown ModelMismatchMode");
         _encoder = encoder;
         _sqliteVec = sqliteVec;
+        _version = version;
+        _onModelMismatch = onModelMismatch;
 
         _conn = new SqliteConnection($"Data Source={path}");
         _conn.Open();
@@ -109,6 +127,33 @@ public sealed class SqliteEmbeddingStore : IDisposable
     {
         get => _encoder;
         set => _encoder = value;
+    }
+
+    /// <summary>Encoder/model version recorded in the sidecar: the one set explicitly, else the encoder's own.</summary>
+    public string? Version
+    {
+        get => _version ?? _encoder?.Version;
+        set => _version = value;
+    }
+
+    /// <summary>What a text query does when the encoder's model differs from the stored vectors'.</summary>
+    public ModelMismatchMode OnModelMismatch
+    {
+        get => _onModelMismatch;
+        set
+        {
+            if (!Enum.IsDefined(value)) throw new ArgumentOutOfRangeException(nameof(value), value, "unknown ModelMismatchMode");
+            _onModelMismatch = value;
+        }
+    }
+
+    /// <summary>Raised with a message when the store has something to warn about; with no subscriber it goes to standard error.</summary>
+    public event Action<string>? Warning;
+
+    /// <summary>Metadata of the most recently imported payload (only the keys it carried).</summary>
+    public IReadOnlyDictionary<string, string> LastImportMeta
+    {
+        get { lock (_lock) return _lastImportMeta; }
     }
 
     private void CreateSchema()
@@ -280,6 +325,7 @@ public sealed class SqliteEmbeddingStore : IDisposable
     {
         var embId = EmbeddingId(nodeRef);
         var blob = Pack(vector);
+        _modelsCache = null;
 
         using (var cmd = _conn.CreateCommand())
         {
@@ -327,7 +373,73 @@ public sealed class SqliteEmbeddingStore : IDisposable
         return embId;
     }
 
-    private string ModelName() => _encoder is null ? "provided" : "unknown";
+    private string ModelName() => ModelCompat.Stamp(_encoder);
+
+    /// <summary>
+    /// Which models produced the stored vectors: model name to count.
+    /// "unknown" and "provided" appear as-is.
+    /// </summary>
+    public IReadOnlyDictionary<string, int> Models()
+    {
+        lock (_lock)
+        {
+            if (_modelsCache is null)
+            {
+                var counts = new Dictionary<string, int>();
+                using var cmd = _conn.CreateCommand();
+                cmd.CommandText = "SELECT COALESCE(model, 'unknown'), COUNT(*) FROM embeddings GROUP BY 1";
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read()) counts[reader.GetString(0)] = reader.GetInt32(1);
+                _modelsCache = counts;
+            }
+            return new Dictionary<string, int>(_modelsCache);
+        }
+    }
+
+    /// <summary>Complain when a text query's encoder is not the stored vectors' model.</summary>
+    private void CheckModelCompat()
+    {
+        if (_onModelMismatch == ModelMismatchMode.Ignore) return;
+        var current = ModelCompat.Current(_encoder);
+        if (current is null) return;
+        var foreign = ModelCompat.Foreign(current, Models().Keys);
+        if (foreign.Count == 0) return;
+
+        var message = ModelCompat.Message(current, foreign);
+        if (_onModelMismatch == ModelMismatchMode.Error) throw new ModelMismatchException(message);
+
+        bool first;
+        lock (_lock) first = _warnedMismatch.Add(ModelCompat.WarnKey(current, foreign));
+        if (!first) return;
+        var handler = Warning;
+        if (handler is not null) handler(message);
+        else Console.Error.WriteLine("isongraph-vector: warning: " + message);
+    }
+
+    /// <summary>
+    /// Node refs whose stored vector does not belong to the current encoder
+    /// (see <see cref="EmbeddingStore.Stale"/>).
+    /// </summary>
+    public IReadOnlyList<NodeRef> Stale(string? model = null, int? dimension = null, bool includeUnknown = false)
+    {
+        lock (_lock)
+        {
+            model ??= ModelCompat.Current(_encoder);
+            dimension ??= _encoder?.Dimension;
+
+            var stale = new List<NodeRef>();
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText =
+                "SELECT node_type, node_id, COALESCE(model, 'unknown'), LENGTH(vector) FROM embeddings ORDER BY rowid";
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                if (ModelCompat.IsStale(reader.GetString(2), reader.GetInt32(3) / 4, model, dimension, includeUnknown))
+                    stale.Add(new NodeRef(reader.GetString(0), reader.GetString(1)));
+            }
+            return stale;
+        }
+    }
 
     public string Add(NodeRef nodeRef, string text, float[]? vector = null)
     {
@@ -375,7 +487,7 @@ public sealed class SqliteEmbeddingStore : IDisposable
         {
             using var cmd = _conn.CreateCommand();
             cmd.CommandText =
-                "SELECT id, node_type, node_id, vector, text FROM embeddings " +
+                "SELECT id, node_type, node_id, vector, text, model FROM embeddings " +
                 "WHERE node_type = $t AND node_id = $i";
             cmd.Parameters.AddWithValue("$t", nodeRef.Type);
             cmd.Parameters.AddWithValue("$i", nodeRef.Id);
@@ -386,7 +498,8 @@ public sealed class SqliteEmbeddingStore : IDisposable
                 reader.GetString(0),
                 new NodeRef(reader.GetString(1), reader.GetString(2)),
                 Unpack((byte[])reader["vector"]),
-                reader.GetString(4));
+                reader.GetString(4),
+                reader.IsDBNull(5) ? "unknown" : reader.GetString(5));
         }
     }
 
@@ -394,6 +507,7 @@ public sealed class SqliteEmbeddingStore : IDisposable
     {
         lock (_lock)
         {
+            _modelsCache = null;
             if (_sqliteVec && _vecReady)
             {
                 using var find = _conn.CreateCommand();
@@ -421,10 +535,18 @@ public sealed class SqliteEmbeddingStore : IDisposable
 
     public int Count { get { lock (_lock) return (int)Scalar("SELECT COUNT(*) FROM embeddings"); } }
 
-    public void Clear()
+    /// <summary>
+    /// Clear all embeddings. With <paramref name="resetDimension"/> (the
+    /// default, as this method has always behaved) the pinned vector length is
+    /// forgotten too, and the vec0 index - whose width is part of its DDL - is
+    /// dropped so the next vector may have a different length; pass false to
+    /// keep refusing vectors of the wrong length even when empty.
+    /// </summary>
+    public void Clear(bool resetDimension = true)
     {
         lock (_lock)
         {
+            _modelsCache = null;
             using (var cmd = _conn.CreateCommand())
             {
                 cmd.CommandText = "DELETE FROM embeddings";
@@ -436,7 +558,15 @@ public sealed class SqliteEmbeddingStore : IDisposable
                 cmd.CommandText = $"DELETE FROM {VecTable}";
                 cmd.ExecuteNonQuery();
             }
+            if (!resetDimension) return;
             _dimension = null;
+            if (_sqliteVec)
+            {
+                using var drop = _conn.CreateCommand();
+                drop.CommandText = $"DROP TABLE IF EXISTS {VecTable}";
+                drop.ExecuteNonQuery();
+                _vecReady = false;
+            }
         }
     }
 
@@ -498,6 +628,7 @@ public sealed class SqliteEmbeddingStore : IDisposable
         string query, int? topK = 10, string? nodeType = null, float threshold = 0.0f)
     {
         if (_encoder is null) throw new NoEncoderException("No encoder provided for text query");
+        CheckModelCompat();
         return SimilaritySearchVector(_encoder.Encode(query), topK, nodeType, threshold);
     }
 
@@ -545,14 +676,14 @@ public sealed class SqliteEmbeddingStore : IDisposable
     }
 
     /// <summary>Serialize every embedding into the portable payload.</summary>
-    public ExportedEmbeddings ExportEmbeddings()
+    public ExportedEmbeddings ExportEmbeddings(string? graphDigest = null)
     {
         lock (_lock)
         {
             var payload = new ExportedEmbeddings { Dimension = _dimension };
             using var cmd = _conn.CreateCommand();
             cmd.CommandText =
-                "SELECT node_type, node_id, node_id_type, vector, text FROM embeddings " +
+                "SELECT node_type, node_id, node_id_type, vector, text, model FROM embeddings " +
                 "ORDER BY node_type, node_id";
             using var reader = cmd.ExecuteReader();
             while (reader.Read())
@@ -563,10 +694,18 @@ public sealed class SqliteEmbeddingStore : IDisposable
                     Id = System.Text.Json.JsonSerializer.SerializeToElement(reader.GetString(1)),
                     IdType = reader.GetString(2),
                     Text = reader.GetString(4),
+                    Model = reader.IsDBNull(5) ? "unknown" : reader.GetString(5),
                     Vector = Unpack((byte[])reader["vector"]),
                 });
             }
             payload.Count = payload.Embeddings.Count;
+            payload.EncoderModel = ModelCompat.Current(_encoder);
+            payload.EncoderVersion = Version;
+            if (graphDigest is not null)
+            {
+                payload.GraphDigest = graphDigest;
+                payload.GraphDigestBasis = IsonGraphVectorVersion.GraphDigestBasis;
+            }
             return payload;
         }
     }
@@ -584,7 +723,18 @@ public sealed class SqliteEmbeddingStore : IDisposable
 
         lock (_lock)
         {
-            if (replace) Clear();
+            var meta = new Dictionary<string, string>();
+            if (payload.EncoderModel is not null) meta["encoder_model"] = payload.EncoderModel;
+            if (payload.EncoderVersion is not null) meta["encoder_version"] = payload.EncoderVersion;
+            if (payload.GraphDigest is not null) meta["graph_digest"] = payload.GraphDigest;
+            if (payload.GraphDigestBasis is not null) meta["graph_digest_basis"] = payload.GraphDigestBasis;
+            _lastImportMeta = meta;
+
+            if (replace)
+            {
+                Clear(resetDimension: true);
+                _dimension = payload.Dimension;
+            }
 
             using var tx = _conn.BeginTransaction();
             int written = 0;
@@ -592,7 +742,7 @@ public sealed class SqliteEmbeddingStore : IDisposable
             {
                 CheckDimension(item.Vector, "vector");
                 WriteRow(new NodeRef(item.Type, item.IdAsString()), item.Vector,
-                         item.Text, "unknown", item.IdType);
+                         item.Text, item.Model ?? "unknown", item.IdType);
                 written++;
             }
             tx.Commit();
@@ -600,7 +750,8 @@ public sealed class SqliteEmbeddingStore : IDisposable
         }
     }
 
-    public string ToJson() => System.Text.Json.JsonSerializer.Serialize(ExportEmbeddings());
+    public string ToJson(string? graphDigest = null) =>
+        System.Text.Json.JsonSerializer.Serialize(ExportEmbeddings(graphDigest));
 
     public int FromJson(string json, bool replace = false)
     {
@@ -608,6 +759,18 @@ public sealed class SqliteEmbeddingStore : IDisposable
             ?? throw new EmbeddingException("payload did not deserialize");
         return ImportEmbeddings(payload, replace);
     }
+
+    /// <summary>Write every embedding to a JSON sidecar, atomically. Returns the count.</summary>
+    public int SaveEmbeddings(string path, string? graphDigest = null)
+    {
+        var payload = ExportEmbeddings(graphDigest);
+        AtomicFile.WriteText(path, System.Text.Json.JsonSerializer.Serialize(payload));
+        return payload.Count;
+    }
+
+    /// <summary>Read a JSON sidecar written by <see cref="SaveEmbeddings"/> (or by any port).</summary>
+    public int LoadEmbeddings(string path, bool replace = false) =>
+        FromJson(File.ReadAllText(path, Encoding.UTF8), replace);
 
     /// <summary>
     /// Close the connection and release the database file.

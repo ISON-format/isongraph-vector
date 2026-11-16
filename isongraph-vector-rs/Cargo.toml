@@ -22,6 +22,12 @@ keywords = ["ison", "graph", "embeddings", "semantic", "vector"]
 # before it moved here - this package hadn't been built in a long time.
 ison-graph-rs = { package = "ison-graph", version = "1.4" }
 thiserror = "1.0"
+# The ISON parser ison-graph is built on, named directly so a graph file's id
+# column can be read with its types: the graph digest tells the integer id 1
+# from the string id "1", which ISONGraph itself (string-typed ids) cannot.
+ison-rs = "1.2"
+# SHA-256 for the graph digest recorded in the embeddings sidecar.
+sha2 = "0.10"
 # The portable embedding payload every language port reads and writes, so a
 # store built by one can be searched by another.
 serde = { version = "1.0", features = ["derive"] }
@@ -32,6 +38,10 @@ serde_json = "1.0"
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 sqlite-vec = { version = "0.1.9", optional = true }
 md-5 = { version = "0.10", optional = true }
+
+# Optional: HttpEncoder, which sends texts to an embedding endpoint. A small
+# blocking client with rustls; off by default so the default build gains nothing.
+ureq = { version = "2.12", default-features = false, features = ["tls"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -49,3 +59,6 @@ default = []
 # The schema matches the other language ports byte for byte, so a database
 # written by one can be opened by another.
 sqlite = ["dep:rusqlite", "dep:sqlite-vec", "dep:md-5"]
+# HttpEncoder: an EmbeddingEncoder that POSTs texts to an OpenAI-compatible or
+# Ollama embeddings endpoint. Texts leave the process; see the README.
+http-encoder = ["dep:ureq"]

@@ -1,0 +1,157 @@
+{
+  "basis": "nodes-edges-json-v1",
+  "cases": [
+    {
+      "name": "simple",
+      "directed": true,
+      "nodes": [
+        {
+          "type": "person",
+          "id": 1,
+          "properties": {
+            "name": "Alice",
+            "age": 30
+          }
+        },
+        {
+          "type": "person",
+          "id": "b",
+          "properties": {
+            "name": "Bob"
+          }
+        }
+      ],
+      "edges": [
+        {
+          "rel_type": "KNOWS",
+          "source": [
+            "person",
+            1
+          ],
+          "target": [
+            "person",
+            "b"
+          ],
+          "properties": {
+            "since": 2020
+          }
+        }
+      ],
+      "digest": "sha256:f68d3e8cd06885e03b346ff49c88dfa5851570d023f026582ee898734e4f68b8"
+    },
+    {
+      "name": "unicode_and_types",
+      "directed": true,
+      "nodes": [
+        {
+          "type": "doc",
+          "id": "é1",
+          "properties": {
+            "text": "résumé 日本語 é \"quoted\" \\ back",
+            "ok": true,
+            "none": null,
+            "ratio": 0.5,
+            "big": 12345678901
+          }
+        }
+      ],
+      "edges": [],
+      "digest": "sha256:bb5f3ed56ada61567ff4c8b34fb54fd117ec1a8fd0a597010d3486935a529dda"
+    },
+    {
+      "name": "undirected",
+      "directed": false,
+      "nodes": [
+        {
+          "type": "n",
+          "id": 1,
+          "properties": {}
+        },
+        {
+          "type": "n",
+          "id": 2,
+          "properties": {
+            "k": "v"
+          }
+        }
+      ],
+      "edges": [
+        {
+          "rel_type": "E",
+          "source": [
+            "n",
+            1
+          ],
+          "target": [
+            "n",
+            2
+          ],
+          "properties": {
+            "w": 0.25
+          }
+        }
+      ],
+      "digest": "sha256:bda031b5077c039db2629ddbda6f9cd58adf0bfdc8c690b15fe021bde36858ba"
+    },
+    {
+      "name": "empty",
+      "directed": true,
+      "nodes": [],
+      "edges": [],
+      "digest": "sha256:d5bd462e3a98ad3bd22e0461c0e38feab88ca1a7353c1853a753cd0bfd7a0e3b"
+    },
+    {
+      "name": "ordering",
+      "directed": true,
+      "nodes": [
+        {
+          "type": "z",
+          "id": 2,
+          "properties": {
+            "b": 1,
+            "a": 2
+          }
+        },
+        {
+          "type": "a",
+          "id": 10,
+          "properties": {}
+        },
+        {
+          "type": "a",
+          "id": 9,
+          "properties": {}
+        }
+      ],
+      "edges": [
+        {
+          "rel_type": "R",
+          "source": [
+            "z",
+            2
+          ],
+          "target": [
+            "a",
+            10
+          ],
+          "properties": {}
+        },
+        {
+          "rel_type": "R",
+          "source": [
+            "a",
+            9
+          ],
+          "target": [
+            "z",
+            2
+          ],
+          "properties": {
+            "q": "x"
+          }
+        }
+      ],
+      "digest": "sha256:21bef7c25a5a49bebcc5e6232c298f7fe26051fa66a63e60be4da160a679c499"
+    }
+  ]
+}

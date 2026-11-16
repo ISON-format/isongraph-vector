@@ -11,6 +11,13 @@
  * JavaScript ports write, so a database created by any of them can be opened
  * by any other. Vectors are little-endian float32, four bytes per dimension.
  *
+ * Like the in-memory EmbeddingStore it records, per row, which model made the
+ * vector (the `model` column every port already has), warns when a text query
+ * is encoded by a different model, reports stale vectors, and reads and writes
+ * the portable payload / sidecar with its optional metadata. A database from
+ * an older release that lacks the `model` column gets it added (default
+ * 'unknown') on open; nothing else about the schema changes.
+ *
  * @example
  * ```cpp
  * #include "isongraph_vector_sqlite.hpp"
@@ -36,8 +43,10 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include <sqlite3.h>
@@ -179,6 +188,13 @@ private:
     std::optional<size_t> dimension_;
     bool sqlite_vec_ = false;
     bool vec_ready_ = false;
+    std::optional<std::string> version_;
+    ModelMismatchMode onModelMismatch_ = ModelMismatchMode::Warn;
+    mutable std::set<std::string> warnedMismatch_;
+    /// {model: count}, filled lazily and dropped by every write made here.
+    /// A change made through another connection is not seen until the next write.
+    mutable std::optional<std::map<std::string, size_t>> modelsCache_;
+    EmbeddingMeta lastImportMeta_;
 
     [[noreturn]] void fail(const std::string& what) const {
         throw EmbeddingError(what + ": " + (db_ ? sqlite3_errmsg(db_) : "no connection"));
@@ -257,6 +273,21 @@ private:
             CREATE INDEX IF NOT EXISTS idx_embeddings_node
                 ON embeddings(node_type, node_id);
         )");
+
+        // CREATE TABLE IF NOT EXISTS does nothing against a database written
+        // by an older release, which may lack columns added since. Add them
+        // rather than fail on every read; existing rows take the default.
+        std::set<std::string> columns;
+        {
+            Stmt info(db_, "PRAGMA table_info(embeddings)");
+            while (info.step()) columns.insert(info.columnText(1));
+        }
+        if (columns.count("node_id_type") == 0) {
+            exec("ALTER TABLE embeddings ADD COLUMN node_id_type TEXT NOT NULL DEFAULT 'str'");
+        }
+        if (columns.count("model") == 0) {
+            exec("ALTER TABLE embeddings ADD COLUMN model TEXT DEFAULT 'unknown'");
+        }
     }
 
     void adoptStoredDimension() {
@@ -354,7 +385,81 @@ private:
         return dot / (n1 * n2);
     }
 
-    std::string modelName() const { return encoder_ ? "unknown" : "provided"; }
+    /// Model stamped on vectors written now: the encoder's, "provided" with none.
+    std::string currentModelStamp() const {
+        if (!encoder_) return "provided";
+        std::string name = encoder_->modelName();
+        return name.empty() ? "unknown" : name;
+    }
+
+    /// SQL for a row's model, reading a NULL or empty value as "unknown".
+    static constexpr const char* MODEL_EXPR = "COALESCE(NULLIF(model, ''), 'unknown')";
+
+    /// Complain when a text query's encoder is not the stored vectors' model.
+    void checkModelCompat() const {
+        if (onModelMismatch_ == ModelMismatchMode::Ignore) return;
+        std::optional<std::string> current = currentModel();
+        if (!current.has_value()) return;
+
+        std::set<std::string> foreign;  // sorted, which also orders the message
+        for (const auto& [model, count] : models()) {
+            if (!isUnknownModel(model) && model != *current) foreign.insert(model);
+        }
+        if (foreign.empty()) return;
+
+        std::string listed;
+        for (const std::string& model : foreign) {
+            if (!listed.empty()) listed += ", ";
+            listed += "'" + model + "'";
+        }
+        std::string message =
+            "encoder model '" + *current + "' differs from the model that produced the "
+            "stored vectors (" + listed + "); scores compare vectors from different spaces. "
+            "Re-embed with the current encoder or search with the original one.";
+
+        if (onModelMismatch_ == ModelMismatchMode::Error) {
+            throw ModelMismatchError(message);
+        }
+        std::string key = *current + "\n";
+        for (const std::string& model : foreign) key += model + "\n";
+        if (warnedMismatch_.insert(key).second) {
+            emitWarning(message);
+        }
+    }
+
+    void dropVecTable() {
+        if (sqlite_vec_) exec(std::string("DROP TABLE IF EXISTS ") + VEC_TABLE);
+        vec_ready_ = false;
+    }
+
+    /**
+     * Run `body` in one transaction. On failure the transaction is rolled back
+     * and the in-memory state it may have changed (the pinned dimension, the
+     * index-ready flag, the cached model counts) is put back, so a failed
+     * write leaves the store as it found it.
+     */
+    template <typename F>
+    auto transact(F&& body) -> decltype(body()) {
+        const auto savedDimension = dimension_;
+        const bool savedVecReady = vec_ready_;
+        exec("BEGIN");
+        try {
+            if constexpr (std::is_void_v<decltype(body())>) {
+                body();
+                exec("COMMIT");
+            } else {
+                auto result = body();
+                exec("COMMIT");
+                return result;
+            }
+        } catch (...) {
+            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+            dimension_ = savedDimension;
+            vec_ready_ = savedVecReady;
+            modelsCache_.reset();
+            throw;
+        }
+    }
 
     /**
      * Insert or update one row, keeping the vec0 index in step.
@@ -366,6 +471,7 @@ private:
                          const std::string& text, const std::string& model,
                          const std::string& nodeIdType = "str") {
         std::string embId = embeddingId(ref);
+        modelsCache_.reset();
         {
             Stmt stmt(db_, R"(
                 INSERT INTO embeddings
@@ -458,17 +564,23 @@ public:
     /**
      * Open (or create) a store. Use ":memory:" for a scratch store.
      *
-     * @param path       Database path, or ":memory:"
-     * @param encoder    Encoder used when a text is added without a vector
-     * @param sqliteVec  Answer top-k searches through a sqlite-vec vec0
-     *                   virtual table instead of scanning every row. Results
-     *                   are the same either way - vec0 runs an exact
-     *                   brute-force KNN in C.
+     * @param path             Database path, or ":memory:"
+     * @param encoder          Encoder used when a text is added without a vector
+     * @param sqliteVec        Answer top-k searches through a sqlite-vec vec0
+     *                         virtual table instead of scanning every row. Results
+     *                         are the same either way - vec0 runs an exact
+     *                         brute-force KNN in C.
+     * @param onModelMismatch  What a *text* query does when the encoder's model
+     *                         differs from the model that produced the stored
+     *                         vectors (vector queries are never checked;
+     *                         "unknown"/"provided" vectors never trigger it).
      */
     explicit SqliteEmbeddingStore(const std::string& path = ":memory:",
                                   std::shared_ptr<EmbeddingEncoder> encoder = nullptr,
-                                  bool sqliteVec = false)
-        : encoder_(std::move(encoder)), sqlite_vec_(sqliteVec) {
+                                  bool sqliteVec = false,
+                                  ModelMismatchMode onModelMismatch = ModelMismatchMode::Warn)
+        : encoder_(std::move(encoder)), sqlite_vec_(sqliteVec),
+          onModelMismatch_(onModelMismatch) {
         if (sqlite_vec_) {
             // Registering as an auto-extension applies to connections opened
             // afterwards, so this must run before sqlite3_open_v2.
@@ -491,9 +603,16 @@ public:
             throw EmbeddingError("could not open " + path + ": " + message);
         }
 
-        createSchema();
-        adoptStoredDimension();
-        if (sqlite_vec_ && dimension_.has_value()) ensureVecTable(*dimension_);
+        try {
+            createSchema();
+            adoptStoredDimension();
+            if (sqlite_vec_ && dimension_.has_value()) ensureVecTable(*dimension_);
+        } catch (...) {
+            // a throwing constructor never runs the destructor
+            sqlite3_close(db_);
+            db_ = nullptr;
+            throw;
+        }
     }
 
     ~SqliteEmbeddingStore() { sqlite3_close(db_); }
@@ -510,6 +629,95 @@ public:
     void setEncoder(std::shared_ptr<EmbeddingEncoder> encoder) { encoder_ = std::move(encoder); }
     const std::shared_ptr<EmbeddingEncoder>& encoder() const { return encoder_; }
 
+    ModelMismatchMode onModelMismatch() const { return onModelMismatch_; }
+    void setOnModelMismatch(ModelMismatchMode mode) { onModelMismatch_ = mode; }
+
+    /**
+     * Encoder/model version recorded in the sidecar: the one set with
+     * setVersion, else the encoder's own, else nullopt.
+     */
+    std::optional<std::string> version() const {
+        if (version_.has_value()) return version_;
+        return encoder_ ? encoder_->version() : std::nullopt;
+    }
+    void setVersion(std::optional<std::string> version) { version_ = std::move(version); }
+
+    /** Metadata of the most recently imported payload (all unset before any). */
+    const EmbeddingMeta& lastImportMeta() const { return lastImportMeta_; }
+
+    // -- model lifecycle -------------------------------------------------
+
+    /**
+     * Which models produced the stored vectors: {modelName: count}.
+     * "unknown" / "provided" appear as-is (rows written by a port that records
+     * no model, or handed in with no encoder attached).
+     */
+    std::map<std::string, size_t> models() const {
+        if (!modelsCache_.has_value()) {
+            std::map<std::string, size_t> counts;
+            Stmt stmt(db_, std::string("SELECT m, COUNT(*) FROM (SELECT ") + MODEL_EXPR +
+                               " AS m FROM embeddings) GROUP BY m");
+            while (stmt.step()) counts[stmt.columnText(0)] = static_cast<size_t>(stmt.columnInt(1));
+            modelsCache_ = std::move(counts);
+        }
+        return *modelsCache_;
+    }
+
+    /** The encoder's model name, or nullopt with no encoder or an unnamed ("unknown") one. */
+    std::optional<std::string> currentModel() const {
+        if (!encoder_) return std::nullopt;
+        std::string name = encoder_->modelName();
+        if (name.empty() || isUnknownModel(name)) return std::nullopt;
+        return name;
+    }
+
+    /**
+     * Refs whose stored vector does not belong to the current encoder, sorted.
+     *
+     * A vector is stale when its recorded model differs from `model` (default:
+     * the encoder's modelName) or its length differs from `dimension` (default:
+     * the encoder's dimension). Vectors whose model is "unknown"/"provided"
+     * cannot be judged by model and are skipped unless `includeUnknown` (a
+     * dimension mismatch still counts). With no encoder and no arguments
+     * nothing can be judged and the result is empty.
+     */
+    std::vector<NodeRef> stale(std::optional<std::string> model = std::nullopt,
+                               std::optional<size_t> dimension = std::nullopt,
+                               bool includeUnknown = false) const {
+        if (!model.has_value()) model = currentModel();
+        if (!dimension.has_value() && encoder_) dimension = encoder_->dimension();
+
+        std::vector<NodeRef> out;
+        Stmt stmt(db_, std::string("SELECT node_type, node_id, ") + MODEL_EXPR +
+                           ", LENGTH(vector) FROM embeddings");
+        while (stmt.step()) {
+            std::string recorded = stmt.columnText(2);
+            size_t width = static_cast<size_t>(stmt.columnInt(3)) / sizeof(float);
+            bool byModel = model.has_value() && recorded != *model &&
+                           (includeUnknown || !isUnknownModel(recorded));
+            bool byDim = dimension.has_value() && width != *dimension;
+            if (byModel || byDim) out.emplace_back(stmt.columnText(0), stmt.columnText(1));
+        }
+        std::sort(out.begin(), out.end());
+        return out;
+    }
+
+    /**
+     * Encode a text query, first checking that the encoder's model is the one
+     * that made the stored vectors (per the store's ModelMismatchMode).
+     * Only text queries go through here; vector queries are never checked.
+     *
+     * @throws NoEncoderError with no encoder
+     * @throws ModelMismatchError with ModelMismatchMode::Error on a mismatch
+     */
+    std::vector<float> encodeQuery(const std::string& query) const {
+        if (!encoder_) throw NoEncoderError("No encoder provided for text query");
+        checkModelCompat();
+        return encoder_->encode(query);
+    }
+
+    // -- writes ------------------------------------------------------------
+
     std::string add(const NodeRef& ref, const std::string& text,
                     const std::vector<float>& vector = {}) {
         std::vector<float> vec = vector;
@@ -517,8 +725,11 @@ public:
             if (!encoder_) throw NoEncoderError("No encoder provided and no vector given");
             vec = encoder_->encode(text);
         }
-        checkDimension(vec, "vector");
-        return writeRow(ref, vec, text, modelName());
+        std::string model = currentModelStamp();
+        return transact([&]() {
+            checkDimension(vec, "vector");
+            return writeRow(ref, vec, text, model);
+        });
     }
 
     /// Add many embeddings in one transaction, encoding their texts together.
@@ -535,57 +746,55 @@ public:
             throw EmbeddingError("encoder returned " + std::to_string(vectors.size()) +
                                  " vectors for " + std::to_string(entries.size()) + " texts");
         }
-        for (const auto& vector : vectors) checkDimension(vector, "vector");
 
-        std::string model = modelName();
-        exec("BEGIN");
-        try {
+        std::string model = currentModelStamp();
+        transact([&]() {
+            for (const auto& vector : vectors) checkDimension(vector, "vector");
             for (size_t i = 0; i < entries.size(); ++i) {
                 writeRow(entries[i].first, vectors[i], entries[i].second, model);
             }
-            exec("COMMIT");
-        } catch (...) {
-            exec("ROLLBACK");
-            throw;
-        }
+        });
         return entries.size();
     }
 
     std::optional<EmbeddingRecord> get(const NodeRef& ref) const {
         Stmt stmt(db_,
-                  "SELECT id, node_type, node_id, vector, text FROM embeddings "
-                  "WHERE node_type = ? AND node_id = ?");
+                  std::string("SELECT id, node_type, node_id, vector, text, ") + MODEL_EXPR +
+                      " FROM embeddings WHERE node_type = ? AND node_id = ?");
         stmt.bindText(1, ref.type);
         stmt.bindText(2, ref.id);
         if (!stmt.step()) return std::nullopt;
 
         return EmbeddingRecord{stmt.columnText(0),
                                NodeRef(stmt.columnText(1), stmt.columnText(2)),
-                               stmt.columnVector(3), stmt.columnText(4)};
+                               stmt.columnVector(3), stmt.columnText(4), stmt.columnText(5)};
     }
 
     bool remove(const NodeRef& ref) {
-        if (sqlite_vec_ && vec_ready_) {
-            sqlite3_int64 rowid = -1;
-            {
-                Stmt find(db_,
-                          "SELECT rowid FROM embeddings WHERE node_type = ? AND node_id = ?");
-                find.bindText(1, ref.type);
-                find.bindText(2, ref.id);
-                if (find.step()) rowid = find.columnInt(0);
+        return transact([&]() {
+            modelsCache_.reset();
+            if (sqlite_vec_ && vec_ready_) {
+                sqlite3_int64 rowid = -1;
+                {
+                    Stmt find(db_,
+                              "SELECT rowid FROM embeddings WHERE node_type = ? AND node_id = ?");
+                    find.bindText(1, ref.type);
+                    find.bindText(2, ref.id);
+                    if (find.step()) rowid = find.columnInt(0);
+                }
+                if (rowid >= 0) {
+                    Stmt drop(db_, std::string("DELETE FROM ") + VEC_TABLE + " WHERE rowid = ?");
+                    drop.bindInt(1, rowid);
+                    drop.step();
+                }
             }
-            if (rowid >= 0) {
-                Stmt drop(db_, std::string("DELETE FROM ") + VEC_TABLE + " WHERE rowid = ?");
-                drop.bindInt(1, rowid);
-                drop.step();
-            }
-        }
 
-        Stmt stmt(db_, "DELETE FROM embeddings WHERE node_type = ? AND node_id = ?");
-        stmt.bindText(1, ref.type);
-        stmt.bindText(2, ref.id);
-        stmt.step();
-        return sqlite3_changes(db_) > 0;
+            Stmt stmt(db_, "DELETE FROM embeddings WHERE node_type = ? AND node_id = ?");
+            stmt.bindText(1, ref.type);
+            stmt.bindText(2, ref.id);
+            stmt.step();
+            return sqlite3_changes(db_) > 0;
+        });
     }
 
     size_t count() const {
@@ -593,17 +802,35 @@ public:
         return stmt.step() ? static_cast<size_t>(stmt.columnInt(0)) : 0;
     }
 
-    void clear() {
-        exec("DELETE FROM embeddings");
-        if (sqlite_vec_ && vec_ready_) exec(std::string("DELETE FROM ") + VEC_TABLE);
-        dimension_.reset();
+    /**
+     * Clear all embeddings.
+     *
+     * @param resetDimension also forget the pinned vector length (and drop the
+     *        sqlite-vec index, whose width is fixed), so the next vector may
+     *        have a different one - switching to an encoder of a different
+     *        dimension. Off by default: a store normally refuses vectors of the
+     *        wrong length even when empty. (Before this parameter existed,
+     *        clear() always reset it.)
+     */
+    void clear(bool resetDimension = false) {
+        transact([&]() {
+            modelsCache_.reset();
+            exec("DELETE FROM embeddings");
+            if (resetDimension) {
+                dropVecTable();
+                dimension_.reset();
+            } else if (sqlite_vec_ && vec_ready_) {
+                exec(std::string("DELETE FROM ") + VEC_TABLE);
+            }
+        });
     }
+
+    // -- search --------------------------------------------------------------
 
     std::vector<SimilarityResult> similaritySearch(const std::string& query, size_t topK = 10,
                                                    const std::string& nodeType = "",
                                                    float threshold = 0.0f) {
-        if (!encoder_) throw NoEncoderError("No encoder provided for text query");
-        return similaritySearchVector(encoder_->encode(query), topK, nodeType, threshold);
+        return similaritySearchVector(encodeQuery(query), topK, nodeType, threshold);
     }
 
     std::vector<SimilarityResult> similaritySearchVector(const std::vector<float>& queryVector,
@@ -655,24 +882,45 @@ public:
         return scores;
     }
 
-    /// Serialize every embedding into the portable cross-language payload.
-    ExportedEmbeddings exportEmbeddings() const {
+    // -- portability ---------------------------------------------------------
+
+    /**
+     * Serialize every embedding into the portable cross-language payload.
+     *
+     * Besides the embeddings (each with its recorded model) it carries the
+     * optional metadata: the encoder's model and the store's version when
+     * known, and `graphDigest` (with its basis) when given - see graphDigest().
+     */
+    ExportedEmbeddings exportEmbeddings(
+        const std::optional<std::string>& graphDigest = std::nullopt) const {
         ExportedEmbeddings payload;
         payload.dimension = dimension_;
 
         Stmt stmt(db_,
-                  "SELECT node_type, node_id, node_id_type, vector, text FROM embeddings "
-                  "ORDER BY node_type, node_id");
+                  std::string("SELECT node_type, node_id, node_id_type, vector, text, ") +
+                      MODEL_EXPR + " FROM embeddings ORDER BY node_type, node_id");
         while (stmt.step()) {
             payload.embeddings.push_back(ExportedEmbedding{
                 stmt.columnText(0), stmt.columnText(1), stmt.columnText(2),
-                stmt.columnText(4), stmt.columnVector(3)});
+                stmt.columnText(4), stmt.columnVector(3), stmt.columnText(5)});
         }
         payload.count = payload.embeddings.size();
+
+        payload.meta.encoderModel = currentModel();
+        payload.meta.encoderVersion = version();
+        if (graphDigest.has_value()) {
+            payload.meta.graphDigest = graphDigest;
+            payload.meta.graphDigestBasis = GRAPH_DIGEST_BASIS;
+        }
         return payload;
     }
 
-    /// Load a payload produced by exportEmbeddings in any language port.
+    /**
+     * Load a payload produced by exportEmbeddings in any language port. Each
+     * entry keeps the model it was exported with ("unknown" when the source
+     * records none). All-or-nothing: a payload that fails part way (a vector of
+     * the wrong width) changes nothing, with `replace` as well.
+     */
     size_t importEmbeddings(const ExportedEmbeddings& payload, bool replace = false) {
         if (payload.format != std::string(EMBEDDING_FORMAT)) {
             throw EmbeddingError(std::string("not an ") + EMBEDDING_FORMAT +
@@ -680,25 +928,61 @@ public:
         }
         if (payload.version != EMBEDDING_FORMAT_VERSION) {
             throw EmbeddingError(std::string("unsupported ") + EMBEDDING_FORMAT + " version " +
-                                 std::to_string(payload.version));
+                                 std::to_string(payload.version) + " (this build reads version " +
+                                 std::to_string(EMBEDDING_FORMAT_VERSION) + ")");
         }
-        if (replace) clear();
 
-        exec("BEGIN");
-        size_t written = 0;
-        try {
+        lastImportMeta_ = payload.meta;
+        return transact([&]() {
+            if (replace) {
+                modelsCache_.reset();
+                exec("DELETE FROM embeddings");
+                dropVecTable();
+                dimension_.reset();
+                if (payload.dimension.has_value() && *payload.dimension > 0) {
+                    dimension_ = payload.dimension;
+                }
+            }
+
+            size_t written = 0;
             for (const auto& item : payload.embeddings) {
                 std::vector<float> vector = item.vector;
-                checkDimension(vector, "vector");
-                writeRow(NodeRef(item.type, item.id), vector, item.text, "unknown", item.id_type);
+                checkDimension(vector, "embedding for :" + item.type + ":" + item.id);
+                writeRow(NodeRef(item.type, item.id), vector, item.text,
+                         item.model.empty() ? "unknown" : item.model, item.id_type);
                 ++written;
             }
-            exec("COMMIT");
-        } catch (...) {
-            exec("ROLLBACK");
-            throw;
-        }
-        return written;
+            return written;
+        });
+    }
+
+    /** Serialize the portable payload to a JSON string (see EmbeddingStore::toJson). */
+    std::string toJson(const std::optional<std::string>& graphDigest = std::nullopt) const {
+        return EmbeddingStore::serializePayload(exportEmbeddings(graphDigest));
+    }
+
+    /** Load a JSON payload written by any language port (see EmbeddingStore::fromJson). */
+    size_t fromJson(const std::string& json, bool replace = false) {
+        return importEmbeddings(EmbeddingStore::parseJson(json), replace);
+    }
+
+    /**
+     * Write the portable payload to `path` (the file EmbeddingStore::saveEmbeddings
+     * and Python's save_embeddings write), atomically: a temp file is written
+     * and renamed into place, so a crash never leaves a half-written sidecar.
+     * `graphDigest` ties the sidecar to one particular graph (see graphDigest()).
+     * Returns the number of embeddings written.
+     */
+    size_t saveEmbeddings(const std::string& path,
+                          const std::optional<std::string>& graphDigest = std::nullopt) const {
+        ExportedEmbeddings payload = exportEmbeddings(graphDigest);
+        detail::atomicWriteText<EmbeddingError>(path, EmbeddingStore::serializePayload(payload));
+        return payload.count;
+    }
+
+    /** Read a payload file written by saveEmbeddings (or any port's equivalent). */
+    size_t loadEmbeddings(const std::string& path, bool replace = false) {
+        return importEmbeddings(EmbeddingStore::parseJson(EmbeddingStore::readFile(path)), replace);
     }
 };
 

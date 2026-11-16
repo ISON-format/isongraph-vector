@@ -638,3 +638,116 @@ describe('top-k selection', () => {
     expect(store.similaritySearch('anything', 0, undefined, -1.0)).toEqual([]);
   });
 });
+
+describe('updateNode keeps the embedding in step', () => {
+  const enc = () => new MockEncoder(16);
+
+  it('re-embeds when an embed field changes', () => {
+    const graph = new SemanticGraph({ encoder: enc() });
+    graph.addNode('person', 1, { name: 'Alice', age: 30 });
+    const before = graph.getEmbedding(['person', 1])!;
+    expect(before.text).toBe('Alice');
+
+    graph.updateNode('person', 1, { name: 'Zed' });
+    const after = graph.getEmbedding(['person', 1])!;
+    expect(after.text).toBe('Zed');
+    expect(after.vector).not.toEqual(before.vector);
+    // the search ranks it by the new text
+    const top = graph.similaritySearch('Zed', 1)[0];
+    expect(top.nodeRef).toEqual(['person', 1]);
+    expect(top.score).toBeCloseTo(1, 5);
+  });
+
+  it('re-embeds from all embed fields, not just the changed one', () => {
+    const graph = new SemanticGraph({ encoder: enc() });
+    graph.addNode('doc', 1, { name: 'N', description: 'D' });
+    graph.updateNode('doc', 1, { description: 'E' });
+    expect(graph.getEmbedding(['doc', 1])!.text).toBe('N E');
+  });
+
+  it('drops the vector when nothing is left to embed', () => {
+    const graph = new SemanticGraph({ encoder: enc() });
+    graph.addNode('person', 1, { name: 'Alice' });
+    graph.updateNode('person', 1, { name: '' });
+    expect(graph.getEmbedding(['person', 1])).toBeNull();
+  });
+
+  it('leaves the embedding alone when no embed field changed', () => {
+    const graph = new SemanticGraph({ encoder: enc() });
+    graph.addNode('person', 1, { name: 'Alice', age: 30 });
+    const before = graph.getEmbedding(['person', 1])!;
+    const node = graph.updateNode('person', 1, { age: 31 });
+    expect(node.properties.age).toBe(31);
+    expect(graph.getEmbedding(['person', 1])).toEqual(before);
+  });
+
+  it('leaves the embedding alone when autoEmbed is off', () => {
+    const graph = new SemanticGraph({ encoder: enc(), autoEmbed: false });
+    graph.addNode('person', 1, { name: 'Alice' });
+    graph.embeddingStore.add(['person', 1], 'custom', enc().encode('custom'));
+    graph.updateNode('person', 1, { name: 'Zed' });
+    expect(graph.getEmbedding(['person', 1])!.text).toBe('custom');
+  });
+});
+
+describe('semanticPath picks the best seed', () => {
+  // Seeds: a (score 1.0) is 3 hops from the target, b (score 0.9) is 1 hop.
+  function pathGraph(): SemanticGraph {
+    const graph = new SemanticGraph({ encoder: new MockEncoder(4), autoEmbed: false });
+    for (const id of ['a', 'x', 'y', 'b', 't']) graph.addNode('n', id, { name: id });
+    graph.addEdge('R', ['n', 'a'], ['n', 'x']);
+    graph.addEdge('R', ['n', 'x'], ['n', 'y']);
+    graph.addEdge('R', ['n', 'y'], ['n', 't']);
+    graph.addEdge('R', ['n', 'b'], ['n', 't']);
+    graph.embeddingStore.add(['n', 'a'], 'a', [1, 0, 0, 0]);
+    graph.embeddingStore.add(['n', 'b'], 'b', [0.9, Math.sqrt(0.19), 0, 0]);
+    return graph;
+  }
+
+  it('prefers a closer, slightly less similar seed over a better distant one', () => {
+    const graph = pathGraph();
+    const result = graph.semanticPath([1, 0, 0, 0], ['n', 't'], 'R', 5, 3, 0.0, 0.5)!;
+    // a: 1.0 * 0.5^3 = 0.125; b: 0.9 * 0.5^1 = 0.45
+    expect(result.hopCount).toBe(1);
+    expect(result.path[0]).toEqual(['n', 'b']);
+    expect(result.score).toBeCloseTo(0.45, 6);
+  });
+
+  it('still returns the best seed when it is also the nearest', () => {
+    const graph = pathGraph();
+    graph.addEdge('R', ['n', 'a'], ['n', 't']);
+    const result = graph.semanticPath([1, 0, 0, 0], ['n', 't'], 'R', 5, 3, 0.0, 0.5)!;
+    expect(result.path[0]).toEqual(['n', 'a']);
+    expect(result.score).toBeCloseTo(0.5, 6);
+  });
+
+  it('breaks ties toward the more similar seed', () => {
+    const graph = new SemanticGraph({ encoder: new MockEncoder(4), autoEmbed: false });
+    for (const id of ['a', 'b', 't']) graph.addNode('n', id, {});
+    graph.addEdge('R', ['n', 'a'], ['n', 't']);
+    graph.addEdge('R', ['n', 'b'], ['n', 't']);
+    // Both seeds score below zero, so both clamp to 0 and tie; a is the less negative.
+    graph.embeddingStore.add(['n', 'a'], 'a', [-0.5, Math.sqrt(0.75), 0, 0]);
+    graph.embeddingStore.add(['n', 'b'], 'b', [-0.9, Math.sqrt(0.19), 0, 0]);
+    const result = graph.semanticPath([1, 0, 0, 0], ['n', 't'], 'R', 5, 3, -1.0)!;
+    expect(result.score).toBe(0);
+    expect(result.path[0]).toEqual(['n', 'a']);
+  });
+
+  it('clamps a negative seed score to zero', () => {
+    const graph = new SemanticGraph({ encoder: new MockEncoder(4), autoEmbed: false });
+    for (const id of ['a', 't']) graph.addNode('n', id, {});
+    graph.addEdge('R', ['n', 'a'], ['n', 't']);
+    graph.embeddingStore.add(['n', 'a'], 'a', [-1, 0, 0, 0]);
+    const result = graph.semanticPath([1, 0, 0, 0], ['n', 't'], 'R', 5, 3, -1.0, 0.9)!;
+    // Unclamped this is -1 * 0.9 = -0.9, and it rises toward zero with every
+    // extra hop, so a longer path would outscore a shorter one.
+    expect(result.score).toBe(0);
+  });
+
+  it('returns null when no seed reaches the target', () => {
+    const graph = pathGraph();
+    graph.addNode('n', 'island', {});
+    expect(graph.semanticPath([1, 0, 0, 0], ['n', 'island'], 'R')).toBeNull();
+  });
+});

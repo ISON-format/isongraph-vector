@@ -101,10 +101,74 @@ the results.
 
 Alongside those: `semanticPath` to reach a specific target from a
 semantically-relevant start, and `embedAllNodes` to backfill an existing graph
-in one batched encoder call.
+in one batched encoder call. `semanticPath` evaluates every seed that reaches
+the target and returns the highest-scoring path (`max(seed, 0) * decay^hops`),
+so a slightly less similar seed one hop away beats a better seed five hops away.
+
+**Updates keep the vector honest.** With `autoEmbed` on, `updateNode` re-embeds
+a node when one of the `embedFields` changes, and drops its vector if nothing
+is left to embed. Updates that touch no embed field, and graphs with
+`autoEmbed: false`, leave the embedding alone.
 
 Both the options-object and the original positional form of `semanticMultiHop`
-are accepted, so older call sites keep working.
+are accepted, so older call sites keep working. `semanticPath` takes an options
+object in place of `relType` too (and has `direction`).
+
+**Filtering by node.** `nodeFilter` (a predicate on the node), `nodeTypes` (a
+type, or an array; an empty array passes nothing) and `strictFilter` work on
+`similaritySearch`, `semanticMultiHop`, `semanticPath` and `semanticSubgraph`
+(`similaritySearch` has no `strictFilter`; it does not traverse):
+
+```javascript
+graph.similaritySearch(query, 5, undefined, 0.0, n => n.properties.active, ['person']);
+graph.semanticMultiHop(query, { nodeTypes: ['person'], strictFilter: true });
+```
+
+Both filters combine with AND. The top `topKSeeds` are chosen *among* passing
+nodes, so a filtered-out best match never takes a seed slot, and only passing
+nodes are returned. By default a failing node can still be walked *through*
+(it costs a hop and its decay, and may appear in a returned `path`);
+`strictFilter` never enters one. `semanticPath` returns `null` when the target
+fails. A ref with no node in the graph fails whenever `nodeFilter` is set.
+
+**Weighting edges.** `weightField: 'confidence'` multiplies each hop's decay by
+that numeric edge property, clamped to [0, 1]; a missing, non-numeric, boolean
+or NaN value counts as 1. A weight of 0 gives a score of 0 but the node stays
+reachable. A node is scored by its best route, which may be longer than the
+fewest-hops route. Without `weightField`, scores are unchanged to the bit.
+
+**Keeping the slice connected.** `semanticSubgraph(query, { connect: true })`
+adds connector nodes (greedily, shortest route first, at most `connectMaxHops`
+edges per join, default 2) so the selected nodes fall into as few components as
+possible. The result can hold more than `topKResults` nodes; connectors may
+fail the node filter unless `strictFilter` is set.
+
+**Model changes.** Each vector records the model that made it (the encoder's
+`modelName`; `MockEncoder` is `mock-<dim>`), and an encoder may carry a
+`version`. `store.models()` counts vectors per model;
+`graph.staleEmbeddings(includeUnknown?)` lists nodes whose vector is from
+another model or dimension, and `graph.reembedStale(includeUnknown?,
+batchSize?)` rebuilds them from their original text. Vectors recorded as
+`unknown`/`provided` are never stale unless you pass `includeUnknown`.
+A *text* query against vectors from a different model warns once per pair
+(`onModelMismatch: 'warn'`, the default), throws `ModelMismatchError`
+(`'error'`) or stays quiet (`'ignore'`); vector queries are never checked.
+`store.clear(true)` also forgets the pinned dimension.
+
+`SqliteEmbeddingStore` has the same model lifecycle as the in-memory store:
+`models()`, `stale(model?, dimension?, includeUnknown?)` (or an options
+object), `clear(resetDimension?)`, `onModelMismatch` and `version` (as
+constructor options `new SqliteEmbeddingStore(path, encoder, sqliteVec,
+{ version, onModelMismatch })` or properties), `exportEmbeddings(graphDigest?)`
+with the same `encoder_model` / `encoder_version` / `graph_digest` fields,
+`lastImportMeta`, and the per-vector `model` on export and import. The model is
+kept in the `model` column the shared SQLite schema already has; a database
+whose table lacks it gets `ALTER TABLE ... ADD COLUMN model TEXT DEFAULT
+'unknown'`, and databases written by the other ports open unchanged. There is
+no `reembedStale` on the bare store - re-`add` the refs `stale()` returns.
+`saveEmbeddings` / `loadEmbeddings` from the `/node` entry accept this store
+too. Unlike before, `clear()` no longer forgets the pinned dimension unless you
+pass `true`.
 
 ## Storing the vectors
 
@@ -154,6 +218,99 @@ which is where a third of the query time used to go. Filtering by node type
 stays exact too: the type is a `vec0` metadata column, so it narrows the
 search rather than filtering its results.
 
+## Saving and loading a graph
+
+The ISON graph format carries nodes and edges only, so embeddings travel in a
+JSON sidecar next to the graph file: `<path>.embeddings.json`, the same
+`ison-embeddings` payload described below. File access lives in the `/node`
+entry point, which keeps the main entry browser-safe:
+
+```javascript
+import { saveGraph, loadGraph } from 'isongraph-vector-js/node';
+
+saveGraph(graph, 'people.ison');            // people.ison + people.ison.embeddings.json
+saveGraph(graph, 'people.ison', { embeddings: false });   // graph only
+
+const loaded = loadGraph('people.ison', { encoder });
+```
+
+`loadGraph(path, { encoder, format, embeddings, autoEmbed, embedFields, name })`
+restores the sidecar when it exists and never re-embeds, so what was saved is
+what you get back. The format is picked from the extension (`.isonl` is ISONL,
+anything else ISON) unless you pass `format`. Also exported: `saveEmbeddings`,
+`loadEmbeddings`, `embeddingsPathFor` and `EMBEDDING_SIDECAR_SUFFIX`.
+
+A graph and sidecar saved by the Python port load here, and the other way
+round. Files Python wrote on Windows have CRLF line endings; `loadGraph`
+accepts them. Unlike `/sqlite`, `/node` needs no native module and runs on
+Node 18 and up.
+
+Both files are written atomically (temp file, fsync, rename). Because the pair
+cannot be replaced as one unit, the sidecar also records `graph_digest` (plus
+`graph_digest_basis`, `encoder_model` and `encoder_version`), a SHA-256 of the
+graph *as read back from the text just written*, computed by `graphDigest(graph)`
+exactly as the Python port does (a golden fixture in `tests/fixtures` pins it).
+`loadGraph` checks it: `onMismatch: 'error'` (default) throws
+`GraphEmbeddingMismatchError`, `'warn'` loads the vectors anyway, `'reembed'`
+discards them and re-embeds with your encoder. A sidecar with no digest, or a
+digest over a basis this build does not know, is loaded unchecked. Older
+readers ignore the extra fields, and `store.lastImportMeta` exposes them.
+
+One limit: a JS number cannot tell `1` from `1.0`, so a Python-saved file with
+an integral float (`1.0`) or an integer beyond 2^53 may digest differently here.
+When a mismatch is found and the file holds such literals, `loadGraph` warns
+and uses the vectors instead of throwing.
+
+## Embeddings from an HTTP endpoint
+
+`HttpEncoder` is an `EmbeddingEncoder` that calls an OpenAI-compatible
+`/v1/embeddings` endpoint or Ollama's `/api/embed`. It uses the platform
+`fetch` - no dependency, no `node:` import, so it lives in the main entry and
+runs on Node 18+ and in a browser.
+
+**Every text you embed is sent to the endpoint you configure** - node texts and
+search queries alike. Point it at a service you are willing to send that data
+to (a local Ollama keeps it on your machine).
+
+```javascript
+import { HttpEncoder, EmbeddingStore } from 'isongraph-vector-js';
+
+const encoder = new HttpEncoder({
+  url: 'https://api.openai.com/v1/embeddings',   // or http://localhost:11434/api/embed
+  model: 'text-embedding-3-small',
+  api: 'openai',                                  // or 'ollama'
+  apiKey: process.env.OPENAI_API_KEY,             // sent as a Bearer token
+});
+
+const texts = ['Alice is an engineer', 'Bob plans roadmaps'];
+await encoder.prefetch([...texts, 'engineering']);   // the network calls happen here
+
+const store = new EmbeddingStore(encoder);
+store.addBatch([[['person', 1], texts[0]], [['person', 2], texts[1]]]);
+store.similaritySearch('engineering', 1);            // served from the prefetched vectors
+```
+
+Options: `url`, `model` (also the `modelName` recorded on every vector),
+`api` (`'openai'` default, or `'ollama'`), `apiKey`, `dimension` (otherwise
+learned from the first response; `NaN` until then), `batchSize` (64),
+`timeoutMs` (30000), `headers`, `version`, `maxRetries` (2), `retryDelayMs`
+(500), `maxCacheEntries` (100000) and `fetch` (a replacement for the global).
+429 and 5xx answers, timeouts and network errors are retried a bounded number
+of times with backoff (a `Retry-After` header is honoured, up to 30 s); other
+errors throw an `HttpEncoderError` carrying the HTTP `status`. Errors name the
+endpoint's origin and path, never the API key or the query string.
+
+**It is not synchronous, and `EmbeddingEncoder` is.** The stores call
+`encode` / `encodeBatch` and expect a vector back, so `HttpEncoder` serves those
+from a cache and throws an `HttpEncoderError` for a text it has not fetched.
+Fetch first with `await encoder.prefetch(texts)` (or `encodeAsync` /
+`encodeBatchAsync`, which also return the vectors). In practice that means
+`SemanticGraph` auto-embedding does not work with it - the graph builds the
+text itself and asks for the vector at once - so use it with the stores and
+`autoEmbed: false`, prefetching the texts you pass, or embed with
+`encodeBatchAsync` and hand the vectors in. A bounded cache (`maxCacheEntries`)
+evicts the oldest vectors, so prefetch no more than you are about to use.
+
 ## One format, six languages
 
 The SQLite schema and the portable JSON payload are shared by every port —
@@ -176,8 +333,12 @@ store.importEmbeddings(payload);
 - **One embedding per node**, from one text field or a concatenation. No
   multi-vector nodes, no edge embeddings.
 - **`MockEncoder` has no semantic structure.** Use it to test plumbing, never
-  to judge relevance quality. This port ships no real encoder — implement
-  `EmbeddingEncoder` over the model of your choice.
+  to judge relevance quality. For real vectors use `HttpEncoder` (below,
+  prefetch-then-search) or implement `EmbeddingEncoder` over the model of your
+  choice.
+- **`HttpEncoder` sends your texts to the endpoint you configure**, and its
+  `encode` only serves texts fetched beforehand - see *Embeddings from an HTTP
+  endpoint*.
 - **Auto-embed renders typed properties.** Since ISONGraph 1.4.0 a property can
   be a number, a bool or null. Nulls are skipped and booleans render as `true`
   and `false`, so the same graph produces the same text in every port.
@@ -188,8 +349,8 @@ store.importEmbeddings(payload);
 ## Tests
 
 ```bash
-npm test             # 67 tests, needs Node 24 for the SQLite half
-npm run test:core    # 51 tests, main entry only, Node 18 and up
+npm test             # 193 tests, needs Node 24 for the SQLite half
+npm run test:core    # 68 tests, main entry only, Node 18 and up
 ```
 
 ## Links

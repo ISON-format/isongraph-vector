@@ -12,8 +12,8 @@ graph traversal in one call (`semantic_multi_hop`) — find the most
 relevant seed nodes by meaning, then walk the graph from there with the
 relevance score decaying per hop.
 
-It's deliberately lightweight — brute-force cosine similarity (no ANN
-index), one embedding per node. That's a real scoping choice, not an
+It's deliberately lightweight — exact cosine similarity (an opt-in
+IVF index exists in Python only), one embedding per node. That's a real scoping choice, not an
 oversight: this is meant to sit on top of `ison-graph` for
 small-to-medium graphs where "traverse from what's semantically
 relevant" matters more than sub-millisecond search over millions of
@@ -267,43 +267,54 @@ the default `threshold` of 0.3, so she never seeds the search either.
 
 ## Limitations
 
-- Similarity search is brute force in every backend, including
-  sqlite-vec: `vec0` is a fast exact KNN, not an approximate index. All
-  three are linear in the number of nodes, so this stays an
-  application's own knowledge graph rather than a vector-database
-  replacement. If sqlite-vec grows real ANN indexes, this is where they
-  would land.
-- The numpy fast path caches a decoded matrix of every vector and
-  rebuilds it after each write. That is the right trade for
-  read-mostly graphs and the wrong one for a write-heavy stream. The
-  sqlite-vec backend has the same shape of cost, paid on insert
-  instead.
-- One embedding per node, generated from a single text field/concat —
+- Similarity search is exact (brute force) in every backend, including
+  sqlite-vec: `vec0` is a fast exact KNN, not an approximate index. Cost is
+  linear in the number of nodes. In Python the numpy path is vectorised and
+  patches its cache on writes, which moved the point where a search passes
+  50 ms from roughly 90,000 vectors to (extrapolated) around a million;
+  see `benchmarks/`. Python has an opt-in IVF approximate index
+  (`ann="ivf"`) that pays off from about a million vectors; the other ports are
+  exact only. This stays an application's
+  own knowledge graph rather than a vector-database replacement.
+- One embedding per node, generated from a single text field/concat -
   no multi-vector-per-node, no edge embeddings (that's RudraDB's domain,
   not this package's).
-- Only the Python port saves and loads an ISON *graph* file. The others
-  persist embeddings to SQLite and exchange the portable payload, but
-  the graph itself stays in memory there.
-- `SemanticGraph.load()` reaches into `ISONGraph`'s private attributes
-  (`_nodes`, `_edges`, `_out_edges`, `_in_edges`, `_edge_set`) to copy
-  loaded state across — fragile if `ison-graph`'s internal
-  representation changes. Verified working against `ison-graph` 1.3.0,
-  including properties and traversal after a round trip, but it is still
-  a private-API dependency.
-- Every port now builds on ISONGraph 1.4.0, including the C++ one,
-  whose vendored header had been a stale 1.0.0 backup and is now a copy
-  of the canonical `ison-graph-cpp` 1.4.0 alongside the `ison-cpp` 1.2.0
-  parser header it requires. C++ remains the one port where the base
-  library is vendored rather than declared as a dependency, because
-  there is no package registry to declare it in.
+- Only Python ships a model (`SentenceTransformerEncoder`). Every port has an
+  `HttpEncoder` for an OpenAI- or Ollama-style endpoint (texts are sent to it);
+  otherwise bring your own `EmbeddingEncoder` over a local model.
+- Graph persistence (`save` / `load` of the graph file plus the
+  `<path>.embeddings.json` sidecar) exists in every port. The sidecar carries a
+  digest of the graph, verified on load, so a graph and embeddings from
+  different saves are caught instead of silently mixed. The ISON file cannot
+  store the graph name or directedness: after `load` the name comes from the
+  file name and the graph is directed.
+- `update_node` re-embeds an edited node, and the underlying graph is
+  read-only in C#, C++ and Rust, so node edits cannot skip it. In C# the view
+  returns copies, so editing one does nothing.
+- Subgraph extraction keeps the top-k nodes and induced edges; pass
+  `connect=True` to add the connector nodes needed to join them. The
+  connection is greedy within a hop budget, not a minimum Steiner tree, and it
+  can exceed `top_k_results`.
+- Traversal direction matters more than decay or blend. The default follows
+  edges outward, which answers "what does this depend on" but not "what
+  depends on this"; for the latter pass `Direction.IN` or `BOTH`
+  (`benchmarks/README.md` has the numbers).
+- Vectors from different encoders are not comparable. Each stored vector
+  records its model, and a text query against vectors from another model warns
+  (or errors). Use `stale_embeddings()` and `reembed_stale()` to refresh them.
+  An encoder `version` is recorded in the sidecar and warns on a change, but a
+  version-only change is not treated as stale.
+- Distributed or multi-tenant retrieval, access control and any server layer
+  are out of scope for an embedded library.
+- C++ remains the one port where the base graph library is vendored rather
+  than declared as a dependency, because there is no package registry to
+  declare it in.
 - `MockEncoder` vectors are near-orthogonal noise by design. Cosine
   similarity is signed, so mock scores straddle zero and a `threshold` of
   0.0 will reject perfectly good matches. Tests that want everything pass
   `threshold=-1.0`.
 - ISONGraph 1.4.0 made property values typed, so auto-embedding has to
-  turn a value into text. Nulls are skipped and booleans render as ISON
-  spells them (`true`/`false`) in every port, and a golden test in all
-  six asserts the same property bag yields the same string. Floats are
-  the loose end: `1.5` renders identically everywhere, but a whole
-  number like `1.0` renders as `"1.0"` from Python and `"1"` from the
-  others. Pass `_embed_text` explicitly when the exact text matters.
+  turn a value into text. Nulls are skipped, booleans render as ISON spells
+  them (`true`/`false`) and a whole-number float renders without a trailing
+  `.0`, in every port; a golden test in all six asserts the same property bag
+  yields the same string.

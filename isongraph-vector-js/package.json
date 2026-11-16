@@ -5,18 +5,20 @@
   "main": "src/index.js",
   "exports": {
     ".": "./src/index.js",
-    "./sqlite": "./src/sqlite-store.js"
+    "./sqlite": "./src/sqlite-store.js",
+    "./node": "./src/node.js"
   },
   "type": "module",
   "files": [
     "src/index.js",
     "src/sqlite-store.js",
+    "src/node.js",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "test": "vitest run",
-    "test:core": "vitest run src/index.test.js"
+    "test:core": "vitest run src/index.test.js src/http-encoder.test.js"
   },
   "keywords": [
     "ison",

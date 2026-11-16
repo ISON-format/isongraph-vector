@@ -81,6 +81,20 @@ if(ISONGRAPH_VECTOR_SQLITE)
 
 endif()
 
+# Optional libcurl transport for HttpEncoder (include/isongraph_vector_http.hpp).
+# Off by default: the encoder itself is header-only and takes any transport as a
+# std::function, so libcurl is only needed for the ready-made one. When on, link
+# isongraph_vector_curl, which defines ISONGRAPH_VECTOR_CURL and pulls in libcurl.
+option(ISONGRAPH_VECTOR_CURL "Build the libcurl transport for HttpEncoder (needs libcurl)" OFF)
+
+if(ISONGRAPH_VECTOR_CURL)
+    find_package(CURL REQUIRED)
+
+    add_library(isongraph_vector_curl INTERFACE)
+    target_link_libraries(isongraph_vector_curl INTERFACE isongraph_vector CURL::libcurl)
+    target_compile_definitions(isongraph_vector_curl INTERFACE ISONGRAPH_VECTOR_CURL=1)
+endif()
+
 # Tests. Skipped when this project is consumed via add_subdirectory.
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 enable_testing()
@@ -92,5 +106,11 @@ if(ISONGRAPH_VECTOR_SQLITE)
     add_executable(test_isongraph_vector_sqlite tests/test_isongraph_vector_sqlite.cpp)
     target_link_libraries(test_isongraph_vector_sqlite PRIVATE isongraph_vector_sqlite)
     add_test(NAME test_isongraph_vector_sqlite COMMAND test_isongraph_vector_sqlite)
+endif()
+
+if(ISONGRAPH_VECTOR_CURL)
+    add_executable(test_isongraph_vector_curl tests/test_isongraph_vector_curl.cpp)
+    target_link_libraries(test_isongraph_vector_curl PRIVATE isongraph_vector_curl)
+    add_test(NAME test_isongraph_vector_curl COMMAND test_isongraph_vector_curl)
 endif()
 endif()

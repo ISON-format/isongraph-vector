@@ -8,7 +8,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Nothing yet.
 
-## [1.0.0] - 2026-09-08
+## [1.0.0] - 2026-11-15
 
 First public release, across six language ports: Python, C#, TypeScript,
 JavaScript, Rust and C++.
@@ -108,6 +108,90 @@ JavaScript, Rust and C++.
   24, because it imports `node:sqlite`. The main entry point stays
   runtime-agnostic and runs on Node 18 and up, or in a browser; `npm run
   test:core` covers that half alone.
+- **Node filtering** - `node_filter` / `node_types` (and `strict_filter` for
+  traversal) on `similarity_search`, `semantic_multi_hop`, `semantic_path` and
+  `semantic_subgraph`. Seeds and results must pass; by default a node that
+  fails may still be traversed, with `strict_filter` it is never entered.
+- **Edge weighting** - `weight_field` on `semantic_multi_hop` and
+  `semantic_subgraph`: an edge's numeric property (clamped to 0..1) scales that
+  hop's decay. Unset keeps scores bit-identical.
+- **Connected subgraphs** - `connect` / `connect_max_hops` on
+  `semantic_subgraph` add the shortest connector nodes needed to join the
+  selected nodes, so a subgraph no longer silently splits when a bridging
+  node scored below the cut. Greedy, not a minimum Steiner tree.
+- **Encoder and model lifecycle** - encoders expose `model_name` and
+  `version`; every stored vector records its model. New `models()`, `stale()`,
+  `stale_embeddings()` and `reembed_stale()` find and refresh vectors from a
+  different model or dimension, and a text query against vectors from another
+  model warns (or errors, per `on_model_mismatch`).
+- **Graph/vector consistency** - `save` writes the graph file and the
+  embeddings sidecar atomically (temp file, flush, rename) and records a
+  SHA-256 digest of the graph in the sidecar; `load` verifies it and, on a
+  mismatch, errors, warns or re-embeds (`on_mismatch`). The digest is defined
+  once (`nodes-edges-json-v1`) and checked in every port against a shared
+  golden fixture, `tests/fixtures/graph_digest_golden.json`. Sidecars without
+  a digest, and unknown extra fields, load as before.
+- **Graph save/load in every port** - previously Python only. Rust, C#, C++,
+  and TypeScript / JavaScript (under the new Node-only `/node` entry, so the
+  browser-safe core stays free of `fs`) read and write the same graph file and
+  `<path>.embeddings.json` sidecar as Python, in both directions.
+- `benchmarks/` - a retrieval-quality benchmark (vector-only versus
+  graph-aware, against structural ground truth) and a scale benchmark
+  (latency, ingestion, memory, concurrency), with results and findings.
+- `ROADMAP.md`.
+- `update_node` re-embeds a node when one of `embed_fields` changes (and drops
+  the vector if no text is left), so an edited node is never searched by its
+  old text. Graphs with `auto_embed=False` are left alone.
+- `semantic_path` compares every candidate seed and returns the best-scoring
+  path, clamping a negative seed score to zero as `semantic_multi_hop` does.
+- Python: the exact numpy search is vectorised and writes patch the cached
+  matrix instead of discarding it (at 100k vectors a search takes about 5.6 ms
+  and the search right after a write about the same).
+- **Approximate search (Python, opt-in)** - `ann="ivf"` on `EmbeddingStore` /
+  `SemanticGraph` builds a numpy IVF-flat index lazily, keeps it current under
+  writes and deletes, applies `node_type` / `threshold` / `node_filter` to the
+  probed rows (widening, then falling back to exact, when too few survive), and
+  offers `recall_check()` to measure recall against the exact scan. Off by
+  default; `exact=True` forces the full scan. At 1M clustered vectors it is
+  20-160x faster than exact search; on hard, diffuse data only 2-3x, and it
+  does not pay at or below 100k (see `benchmarks/`).
+- **`HttpEncoder`** - embeds through an OpenAI-style (`data[].embedding`) or
+  Ollama (`/api/embed`) endpoint in Python, JavaScript, TypeScript, C#, C++
+  and Rust (Rust behind the `http-encoder` feature, C++ with a pluggable
+  transport and an optional libcurl one). API keys are redacted from errors,
+  redirects are refused, and every embedded text is sent to the configured
+  endpoint. The JavaScript ports serve the synchronous encoder interface from
+  a `prefetch` cache.
+- **Model lifecycle for the standalone `SqliteEmbeddingStore`** in
+  TypeScript, JavaScript, Rust and C++, matching the in-memory store. Existing
+  databases gain a `model` column on open, and databases stay readable across
+  ports.
+- **Node edits cannot bypass re-embedding** in C#, C++ and Rust: C# `Graph` is
+  a read-only view, C++ `graph()` is const and Rust has no `graph_mut()`;
+  `AddEdge` / `RemoveEdge` live on `SemanticGraph`. C++ `addNode` and
+  `updateNode` also undo themselves if embedding throws.
+- A cross-port CI check (`scripts/cross_port/graph_files.py`) of graph files,
+  sidecars and the graph digest: every port writes, every port reads, and a
+  tampered file must raise each reader's mismatch error (72 checks).
+
+### Known limits
+
+- `C#` copies: nodes and edges read from the C# read-only graph view are
+  copies, so editing one's `Properties` silently changes nothing.
+- The JavaScript / TypeScript encoder interface is synchronous, so an
+  `HttpEncoder` only serves texts that were prefetched; auto-embedding in
+  `SemanticGraph` needs a `prefetch` first.
+- The libcurl transport for the C++ `HttpEncoder` has not been built against a
+  real libcurl; it is off by default.
+- Approximate search is Python-only, uses a numpy IVF index rather than HNSW,
+  and recall was measured on synthetic data, not real embeddings.
+- The digest cannot tell `1` from `1.0` in JavaScript / TypeScript, and
+  integers beyond 64 bits are not supported in C# / C++ / Rust. Where a graph
+  contains such values the loader warns instead of raising a false mismatch.
+- C# cannot load an undirected graph file written by Python: the published
+  IsonGraph 1.4.0 package rejects its `meta.graph` block.
+- Only Python records the encoder version beyond the sidecar; a version-only
+  change warns on load but is not treated as stale.
 
 ### Notes
 
