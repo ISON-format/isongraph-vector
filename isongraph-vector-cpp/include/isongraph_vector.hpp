@@ -1429,7 +1429,15 @@ public:
      * `version`, `dimension`, `count`, `embeddings`. Absent values are omitted.
      */
     std::string toJson(const std::optional<std::string>& graphDigest = std::nullopt) const {
-        auto payload = exportEmbeddings(graphDigest);
+        return serializePayload(exportEmbeddings(graphDigest));
+    }
+
+    /**
+     * Serialize an already-built payload to the portable JSON text (what
+     * toJson writes). Shared with the SQLite-backed store, so both emit
+     * byte-identical documents.
+     */
+    static std::string serializePayload(const ExportedEmbeddings& payload) {
         std::ostringstream out;
         out.precision(9);
         out << "{\"format\":\"" << EMBEDDING_FORMAT << "\",\"version\":" << EMBEDDING_FORMAT_VERSION
@@ -1898,8 +1906,40 @@ public:
         if (version.has_value()) embedding_store_.setVersion(std::move(version));
     }
 
-    ISONGraph& graph() { return graph_; }
+    /**
+     * Read-only view of the underlying graph: counts, lookups, neighbours,
+     * paths, queries, serialization.
+     *
+     * Deliberately const. Every way of changing a node - adding, updating,
+     * removing - has to go through this class, because each one must keep the
+     * node's embedding in step; a mutable graph() let
+     * graph().updateNode(...) and graph().removeNode(...) leave vectors for
+     * text the node no longer carries. Edges carry no embedding, so
+     * addEdge/removeEdge below forward to the graph.
+     */
     const ISONGraph& graph() const { return graph_; }
+
+    /**
+     * Add an edge between two existing nodes.
+     *
+     * @throws NodeNotFoundError if either endpoint is missing
+     * @throws DuplicateEdgeError if the edge already exists
+     * @return the forward edge (source -> target), by value
+     */
+    Edge addEdge(const std::string& relType, const NodeRef& source, const NodeRef& target,
+                 const Properties& properties = {}) {
+        return graph_.addEdge(relType, source, target, properties);
+    }
+
+    /**
+     * Remove an edge (both directions on an undirected graph).
+     *
+     * @throws EdgeNotFoundError if there is no such edge
+     */
+    void removeEdge(const std::string& relType, const NodeRef& source, const NodeRef& target) {
+        graph_.removeEdge(relType, source, target);
+    }
+
     EmbeddingStore& embeddingStore() { return embedding_store_; }
     const EmbeddingStore& embeddingStore() const { return embedding_store_; }
 
@@ -1957,24 +1997,35 @@ public:
      *
      * Previously only addNodeWithEmbed considered autoEmbed, so a node added
      * through the plain graph API came back unembedded and unsearchable.
+     *
+     * All-or-nothing: if embedding fails (an encoder that throws, a vector of
+     * the wrong width), the node is taken out of the graph again and the
+     * error propagates, so a failed add leaves nothing half-done. The node is
+     * returned read-only - changing it goes through updateNode, which keeps
+     * the embedding in step.
      */
-    Node& addNode(
+    const Node& addNode(
         const std::string& nodeType,
         const std::string& nodeId,
         const Properties& properties = {}
     ) {
-        Node& node = graph_.addNode(nodeType, nodeId, properties);
+        const Node& node = graph_.addNode(nodeType, nodeId, properties);
         if (auto_embed_ && embedding_store_.encoder()) {
             std::string text = embedTextFor(properties);
             if (!text.empty()) {
-                embedNode(NodeRef(nodeType, nodeId), text);
+                try {
+                    embedNode(NodeRef(nodeType, nodeId), text);
+                } catch (...) {
+                    graph_.removeNode(nodeType, nodeId);
+                    throw;
+                }
             }
         }
         return node;
     }
 
-    /** Add a node with an explicit embedding text. */
-    Node& addNodeWithEmbed(
+    /** Add a node with an explicit embedding text (all-or-nothing, like addNode). */
+    const Node& addNodeWithEmbed(
         const std::string& nodeType,
         const std::string& nodeId,
         const Properties& properties = {},
@@ -1983,8 +2034,13 @@ public:
         if (embedText.empty()) {
             return addNode(nodeType, nodeId, properties);
         }
-        Node& node = graph_.addNode(nodeType, nodeId, properties);
-        embedNode(NodeRef(nodeType, nodeId), embedText);
+        const Node& node = graph_.addNode(nodeType, nodeId, properties);
+        try {
+            embedNode(NodeRef(nodeType, nodeId), embedText);
+        } catch (...) {
+            graph_.removeNode(nodeType, nodeId);
+            throw;
+        }
         return node;
     }
 
@@ -2001,6 +2057,11 @@ public:
         return embedding_store_.get(nodeRef);
     }
 
+    /**
+     * Remove a node, its edges and its embedding.
+     *
+     * @throws NodeNotFoundError if the node does not exist
+     */
     void removeNode(const std::string& nodeType, const std::string& nodeId) {
         embedding_store_.remove(NodeRef(nodeType, nodeId));
         graph_.removeNode(nodeType, nodeId);
@@ -2017,21 +2078,24 @@ public:
      * embedding alone. As in addNode, a graph with no encoder cannot embed, so
      * a changed node keeps whatever vector it had unless its text is now empty.
      *
-     * This is the method to call. SemanticGraph wraps an ISONGraph rather than
-     * deriving from it, so graph().updateNode(...) is still reachable and
-     * updates the properties without touching the embedding; that cannot be
-     * prevented without hiding graph(). Use it only when the vector is
-     * deliberately managed by hand.
+     * This is the only way to change a node's properties: graph() is a const
+     * view, so there is no route that updates them without the embedding.
+     * To manage a vector by hand, construct the graph with autoEmbed off and
+     * use embeddingStore().
+     *
+     * If re-embedding fails (encoder error, wrong vector width) the node's
+     * properties are restored and the error propagates.
      *
      * @throws NodeNotFoundError if the node does not exist
      */
-    Node& updateNode(
+    const Node& updateNode(
         const std::string& nodeType,
         const std::string& nodeId,
         const Properties& properties
     ) {
-        graph_.updateNode(nodeType, nodeId, properties);
         Node& node = graph_.getNode(nodeType, nodeId);
+        const Properties previous = node.properties;
+        graph_.updateNode(nodeType, nodeId, properties);
 
         if (auto_embed_) {
             bool touchesEmbedField = false;
@@ -2048,7 +2112,12 @@ public:
                 if (text.empty()) {
                     embedding_store_.remove(ref);
                 } else if (embedding_store_.encoder()) {
-                    embedNode(ref, text);
+                    try {
+                        embedNode(ref, text);
+                    } catch (...) {
+                        node.properties = previous;
+                        throw;
+                    }
                 }
             }
         }

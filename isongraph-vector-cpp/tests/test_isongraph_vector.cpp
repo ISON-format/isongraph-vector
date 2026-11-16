@@ -13,7 +13,12 @@
 #include <algorithm>
 #include <random>
 #include <set>
+#include <sstream>
+#include <functional>
+#include <map>
+#include <type_traits>
 #include "../include/isongraph_vector.hpp"
+#include "../include/isongraph_vector_http.hpp"
 
 using namespace isongraph_vector;
 
@@ -324,8 +329,8 @@ TEST(semantic_graph_multi_hop) {
     graph.addNodeWithEmbed("person", "2", {{"name", "Bob"}}, "manager Bob");
     graph.addNodeWithEmbed("person", "3", {{"name", "Carol"}}, "designer Carol");
 
-    graph.graph().addEdge("KNOWS", NodeRef("person", "1"), NodeRef("person", "2"));
-    graph.graph().addEdge("KNOWS", NodeRef("person", "2"), NodeRef("person", "3"));
+    graph.addEdge("KNOWS", NodeRef("person", "1"), NodeRef("person", "2"));
+    graph.addEdge("KNOWS", NodeRef("person", "2"), NodeRef("person", "3"));
 
     auto results = graph.semanticMultiHop(
         "software",  // query
@@ -348,7 +353,7 @@ TEST(semantic_graph_multi_hop_decay) {
     graph.addNodeWithEmbed("person", "1", {}, "engineer");
     graph.addNodeWithEmbed("person", "2", {}, "manager");
 
-    graph.graph().addEdge("KNOWS", NodeRef("person", "1"), NodeRef("person", "2"));
+    graph.addEdge("KNOWS", NodeRef("person", "1"), NodeRef("person", "2"));
 
     auto results = graph.semanticMultiHop("engineer", "KNOWS", 1);
 
@@ -368,10 +373,11 @@ TEST(semantic_graph_multi_hop_decay) {
 
 TEST(semantic_graph_embed_all_nodes) {
     auto encoder = std::make_shared<MockEncoder>();
-    SemanticGraph graph("test", encoder);
+    // autoEmbed off: nodes go in without vectors, embedAllNodes backfills them
+    SemanticGraph graph("test", encoder, false);
 
-    graph.graph().addNode("person", "1", {{"name", "Alice"}});
-    graph.graph().addNode("person", "2", {{"name", "Bob"}});
+    graph.addNode("person", "1", {{"name", "Alice"}});
+    graph.addNode("person", "2", {{"name", "Bob"}});
 
     size_t count = graph.embedAllNodes();
 
@@ -385,7 +391,7 @@ TEST(semantic_graph_preserve_traversal) {
 
     graph.addNodeWithEmbed("person", "1", {}, "Alice");
     graph.addNodeWithEmbed("person", "2", {}, "Bob");
-    graph.graph().addEdge("KNOWS", NodeRef("person", "1"), NodeRef("person", "2"));
+    graph.addEdge("KNOWS", NodeRef("person", "1"), NodeRef("person", "2"));
 
     auto neighbors = graph.graph().neighbors(NodeRef("person", "1"), "KNOWS");
     ASSERT_EQ(neighbors.size(), 1);
@@ -418,11 +424,11 @@ TEST(integration_full_workflow) {
     graph.addNodeWithEmbed("project", "2", {{"name", "Web App"}}, "Frontend web application");
 
     // Add edges
-    graph.graph().addEdge("WORKS_ON", NodeRef("user", "1"), NodeRef("project", "1"));
-    graph.graph().addEdge("WORKS_ON", NodeRef("user", "2"), NodeRef("project", "1"));
-    graph.graph().addEdge("WORKS_ON", NodeRef("user", "3"), NodeRef("project", "2"));
-    graph.graph().addEdge("KNOWS", NodeRef("user", "1"), NodeRef("user", "2"));
-    graph.graph().addEdge("KNOWS", NodeRef("user", "2"), NodeRef("user", "3"));
+    graph.addEdge("WORKS_ON", NodeRef("user", "1"), NodeRef("project", "1"));
+    graph.addEdge("WORKS_ON", NodeRef("user", "2"), NodeRef("project", "1"));
+    graph.addEdge("WORKS_ON", NodeRef("user", "3"), NodeRef("project", "2"));
+    graph.addEdge("KNOWS", NodeRef("user", "1"), NodeRef("user", "2"));
+    graph.addEdge("KNOWS", NodeRef("user", "2"), NodeRef("user", "3"));
 
     // Similarity search - use exact text for reliable match with mock encoder
     auto similar = graph.similaritySearch("Machine learning infrastructure", 5);
@@ -490,7 +496,7 @@ SemanticGraph seededGraph() {
     SemanticGraph graph("seeds", std::make_shared<FixedEncoder>(), false, {});
     graph.addNode("person", "1");
     graph.addNode("person", "2");
-    graph.graph().addEdge("KNOWS", NodeRef("person", "1"), NodeRef("person", "2"));
+    graph.addEdge("KNOWS", NodeRef("person", "1"), NodeRef("person", "2"));
     // person:1 matches the query perfectly, person:2 slightly less well.
     graph.embeddingStore().add(NodeRef("person", "1"), "a", {1.0f, 0.0f, 0.0f, 0.0f});
     graph.embeddingStore().add(NodeRef("person", "2"), "b", {0.9f, std::sqrt(0.19f), 0.0f, 0.0f});
@@ -532,7 +538,7 @@ TEST(seed_keeps_its_own_score) {
 TEST(traversal_still_reaches_non_seeds) {
     SemanticGraph graph = seededGraph();
     graph.addNode("person", "3");
-    graph.graph().addEdge("KNOWS", NodeRef("person", "2"), NodeRef("person", "3"));
+    graph.addEdge("KNOWS", NodeRef("person", "2"), NodeRef("person", "3"));
     graph.embeddingStore().add(NodeRef("person", "3"), "c", {0.0f, 0.0f, 1.0f, 0.0f});
 
     MultiHopOptions options;
@@ -550,7 +556,7 @@ TEST(negative_seed_does_not_grow_with_distance) {
     SemanticGraph graph("neg", std::make_shared<FixedEncoder>(), false, {});
     graph.addNode("person", "1");
     graph.addNode("person", "2");
-    graph.graph().addEdge("KNOWS", NodeRef("person", "1"), NodeRef("person", "2"));
+    graph.addEdge("KNOWS", NodeRef("person", "1"), NodeRef("person", "2"));
     graph.embeddingStore().add(NodeRef("person", "1"), "a", {-1.0f, 0.0f, 0.0f, 0.0f});
     graph.embeddingStore().add(NodeRef("person", "2"), "b", {0.0f, 0.0f, 1.0f, 0.0f});
 
@@ -570,8 +576,8 @@ TEST(blend_lifts_a_relevant_distant_node) {
     graph.addNode("person", "1");
     graph.addNode("person", "2");
     graph.addNode("person", "3");
-    graph.graph().addEdge("KNOWS", NodeRef("person", "1"), NodeRef("person", "2"));
-    graph.graph().addEdge("KNOWS", NodeRef("person", "1"), NodeRef("person", "3"));
+    graph.addEdge("KNOWS", NodeRef("person", "1"), NodeRef("person", "2"));
+    graph.addEdge("KNOWS", NodeRef("person", "1"), NodeRef("person", "3"));
     graph.embeddingStore().add(NodeRef("person", "1"), "seed", {1.0f, 0.0f, 0.0f, 0.0f});
     graph.embeddingStore().add(NodeRef("person", "2"), "off", {0.0f, 1.0f, 0.0f, 0.0f});
     graph.embeddingStore().add(NodeRef("person", "3"), "on", {0.8f, 0.6f, 0.0f, 0.0f});
@@ -679,8 +685,8 @@ TEST(semantic_path_finds_a_route) {
     graph.addNode("person", "1");
     graph.addNode("person", "2");
     graph.addNode("person", "3");
-    graph.graph().addEdge("KNOWS", NodeRef("person", "1"), NodeRef("person", "2"));
-    graph.graph().addEdge("KNOWS", NodeRef("person", "2"), NodeRef("person", "3"));
+    graph.addEdge("KNOWS", NodeRef("person", "1"), NodeRef("person", "2"));
+    graph.addEdge("KNOWS", NodeRef("person", "2"), NodeRef("person", "3"));
     graph.embeddingStore().add(NodeRef("person", "1"), "a", {1.0f, 0.0f, 0.0f, 0.0f});
     graph.embeddingStore().add(NodeRef("person", "2"), "b", {0.0f, 1.0f, 0.0f, 0.0f});
     graph.embeddingStore().add(NodeRef("person", "3"), "c", {0.0f, 0.0f, 1.0f, 0.0f});
@@ -731,8 +737,8 @@ TEST(semantic_subgraph_is_a_working_graph) {
     graph.addNode("person", "1", {{"name", "Alice"}});
     graph.addNode("person", "2", {{"name", "Bob"}});
     graph.addNode("person", "3", {{"name", "Carol"}});
-    graph.graph().addEdge("KNOWS", NodeRef("person", "1"), NodeRef("person", "2"));
-    graph.graph().addEdge("KNOWS", NodeRef("person", "2"), NodeRef("person", "3"));
+    graph.addEdge("KNOWS", NodeRef("person", "1"), NodeRef("person", "2"));
+    graph.addEdge("KNOWS", NodeRef("person", "2"), NodeRef("person", "3"));
 
     MultiHopOptions options;
     options.relType = "KNOWS";
@@ -868,10 +874,10 @@ namespace {
 SemanticGraph twoSeedPathGraph() {
     SemanticGraph graph("paths2", std::make_shared<FixedEncoder>(), false, {});
     for (const char* id : {"A", "x", "y", "B", "T"}) graph.addNode("n", id);
-    graph.graph().addEdge("R", NodeRef("n", "A"), NodeRef("n", "x"));
-    graph.graph().addEdge("R", NodeRef("n", "x"), NodeRef("n", "y"));
-    graph.graph().addEdge("R", NodeRef("n", "y"), NodeRef("n", "T"));
-    graph.graph().addEdge("R", NodeRef("n", "B"), NodeRef("n", "T"));
+    graph.addEdge("R", NodeRef("n", "A"), NodeRef("n", "x"));
+    graph.addEdge("R", NodeRef("n", "x"), NodeRef("n", "y"));
+    graph.addEdge("R", NodeRef("n", "y"), NodeRef("n", "T"));
+    graph.addEdge("R", NodeRef("n", "B"), NodeRef("n", "T"));
     graph.embeddingStore().add(NodeRef("n", "A"), "a", {1.0f, 0.0f, 0.0f, 0.0f});
     graph.embeddingStore().add(NodeRef("n", "B"), "b", {0.9f, std::sqrt(0.19f), 0.0f, 0.0f});
     return graph;
@@ -894,7 +900,7 @@ TEST(semantic_path_clamps_a_negative_seed_to_zero) {
     SemanticGraph graph("neg", std::make_shared<FixedEncoder>(), false, {});
     graph.addNode("n", "S");
     graph.addNode("n", "T");
-    graph.graph().addEdge("R", NodeRef("n", "S"), NodeRef("n", "T"));
+    graph.addEdge("R", NodeRef("n", "S"), NodeRef("n", "T"));
     // cosine(query, S) = -1: decaying it would give -0.9, which outranks -1.
     graph.embeddingStore().add(NodeRef("n", "S"), "s", {-1.0f, 0.0f, 0.0f, 0.0f});
 
@@ -907,8 +913,8 @@ TEST(semantic_path_clamps_a_negative_seed_to_zero) {
 TEST(semantic_path_breaks_ties_toward_the_more_similar_seed) {
     SemanticGraph graph("ties", std::make_shared<FixedEncoder>(), false, {});
     for (const char* id : {"S1", "S2", "T"}) graph.addNode("n", id);
-    graph.graph().addEdge("R", NodeRef("n", "S1"), NodeRef("n", "T"));
-    graph.graph().addEdge("R", NodeRef("n", "S2"), NodeRef("n", "T"));
+    graph.addEdge("R", NodeRef("n", "S1"), NodeRef("n", "T"));
+    graph.addEdge("R", NodeRef("n", "S2"), NodeRef("n", "T"));
     // Both clamp to 0, so the scores tie; S2 (-0.5) is the more similar seed.
     graph.embeddingStore().add(NodeRef("n", "S1"), "s1", {-1.0f, 0.0f, 0.0f, 0.0f});
     graph.embeddingStore().add(NodeRef("n", "S2"), "s2", {-0.5f, 0.5f, 0.0f, 0.0f});
@@ -928,7 +934,7 @@ TEST(update_node_re_embeds_when_an_embed_field_changes) {
     graph.addNode("person", "1", {{"name", "Alice"}});
     auto before = graph.getEmbedding(NodeRef("person", "1"))->vector;
 
-    Node& node = graph.updateNode("person", "1", {{"name", "Bob"}});
+    const Node& node = graph.updateNode("person", "1", {{"name", "Bob"}});
     ASSERT_EQ(node.properties.at("name").as_string(), "Bob");
 
     const auto* record = graph.getEmbedding(NodeRef("person", "1"));
@@ -1020,7 +1026,7 @@ TEST(save_writes_the_graph_and_an_embeddings_sidecar) {
     SemanticGraph graph("persist", std::make_shared<MockEncoder>(8));
     graph.addNode("person", "1", {{"name", "Alice"}});
     graph.addNode("person", "2", {{"name", "Bob"}});
-    graph.graph().addEdge("KNOWS", NodeRef("person", "1"), NodeRef("person", "2"));
+    graph.addEdge("KNOWS", NodeRef("person", "1"), NodeRef("person", "2"));
     graph.save(file.path());
 
     ASSERT_TRUE(std::filesystem::exists(file.path()));
@@ -1038,7 +1044,7 @@ TEST(save_then_load_round_trips_graph_and_embeddings) {
         SemanticGraph graph("persist", encoder);
         graph.addNode("person", "1", {{"name", "Alice"}, {"description", "engineer"}});
         graph.addNode("person", "2", {{"name", "Bob"}});
-        graph.graph().addEdge("KNOWS", NodeRef("person", "1"), NodeRef("person", "2"));
+        graph.addEdge("KNOWS", NodeRef("person", "1"), NodeRef("person", "2"));
         graph.save(file.path());
     }
 
@@ -1249,7 +1255,7 @@ SemanticGraph namedGraph(std::shared_ptr<EmbeddingEncoder> encoder,
     for (size_t i = 0; i < names.size(); ++i) {
         graph.addNode("person", std::to_string(i + 1), {{"name", names[i]}});
     }
-    graph.graph().addEdge("KNOWS", NodeRef("person", "1"), NodeRef("person", "2"));
+    graph.addEdge("KNOWS", NodeRef("person", "1"), NodeRef("person", "2"));
     return graph;
 }
 
@@ -1271,8 +1277,8 @@ SemanticGraph vectorGraph() {
     graph.addNode("person", "2", {{"name", "P2"}, {"active", false}});
     graph.addNode("person", "3", {{"name", "P3"}, {"active", true}});
     graph.addNode("company", "100", {{"name", "C"}});
-    graph.graph().addEdge("KNOWS", NodeRef("person", "1"), NodeRef("company", "100"));
-    graph.graph().addEdge("KNOWS", NodeRef("company", "100"), NodeRef("person", "3"));
+    graph.addEdge("KNOWS", NodeRef("person", "1"), NodeRef("company", "100"));
+    graph.addEdge("KNOWS", NodeRef("company", "100"), NodeRef("person", "3"));
     auto& store = graph.embeddingStore();
     store.add(NodeRef("company", "100"), "c", {1.0f, 0.0f, 0.0f, 0.0f});
     store.add(NodeRef("person", "1"), "p1", {0.9f, 0.1f, 0.0f, 0.0f});
@@ -1411,10 +1417,10 @@ TEST(filter_strict_semantic_path_finds_an_all_passing_route) {
     for (const char* id : {"A", "B", "C"}) graph.addNode("n", id, {{"ok", true}});
     graph.addNode("n", "X", {{"ok", false}});
     // short route A -> X -> C (through the failing X), long route A -> B -> C
-    graph.graph().addEdge("R", NodeRef("n", "A"), NodeRef("n", "X"));
-    graph.graph().addEdge("R", NodeRef("n", "X"), NodeRef("n", "C"));
-    graph.graph().addEdge("R", NodeRef("n", "A"), NodeRef("n", "B"));
-    graph.graph().addEdge("R", NodeRef("n", "B"), NodeRef("n", "C"));
+    graph.addEdge("R", NodeRef("n", "A"), NodeRef("n", "X"));
+    graph.addEdge("R", NodeRef("n", "X"), NodeRef("n", "C"));
+    graph.addEdge("R", NodeRef("n", "A"), NodeRef("n", "B"));
+    graph.addEdge("R", NodeRef("n", "B"), NodeRef("n", "C"));
     graph.embeddingStore().add(NodeRef("n", "A"), "a", {1.0f, 0.0f, 0.0f, 0.0f});
 
     NodeFilterOptions filter;
@@ -1469,8 +1475,8 @@ SemanticGraph fan(const std::optional<ison::Value>& pWeight,
     Properties p, q;
     if (pWeight) p["w"] = *pWeight;
     if (qWeight) q["w"] = *qWeight;
-    graph.graph().addEdge("R", NodeRef("n", "S"), NodeRef("n", "P"), p);
-    graph.graph().addEdge("R", NodeRef("n", "S"), NodeRef("n", "Q"), q);
+    graph.addEdge("R", NodeRef("n", "S"), NodeRef("n", "P"), p);
+    graph.addEdge("R", NodeRef("n", "S"), NodeRef("n", "Q"), q);
     graph.embeddingStore().add(NodeRef("n", "S"), "s", {1.0f, 0.0f, 0.0f, 0.0f});
     return graph;
 }
@@ -1517,9 +1523,9 @@ TEST(weights_a_zero_weight_scores_zero_but_stays_reachable) {
 TEST(weights_best_route_can_be_longer_than_the_shortest) {
     SemanticGraph graph("w", std::make_shared<FixedEncoder>(), false);
     for (const char* id : {"S", "M", "T"}) graph.addNode("n", id);
-    graph.graph().addEdge("R", NodeRef("n", "S"), NodeRef("n", "T"), {{"w", 0.1}});  // direct but weak
-    graph.graph().addEdge("R", NodeRef("n", "S"), NodeRef("n", "M"), {{"w", 1.0}});
-    graph.graph().addEdge("R", NodeRef("n", "M"), NodeRef("n", "T"), {{"w", 1.0}});  // 2 hops, strong
+    graph.addEdge("R", NodeRef("n", "S"), NodeRef("n", "T"), {{"w", 0.1}});  // direct but weak
+    graph.addEdge("R", NodeRef("n", "S"), NodeRef("n", "M"), {{"w", 1.0}});
+    graph.addEdge("R", NodeRef("n", "M"), NodeRef("n", "T"), {{"w", 1.0}});  // 2 hops, strong
     graph.embeddingStore().add(NodeRef("n", "S"), "s", {1.0f, 0.0f, 0.0f, 0.0f});
 
     auto plain = graph.semanticMultiHop("q", wideOptions(2, 1));
@@ -1539,9 +1545,9 @@ TEST(weights_best_route_can_be_longer_than_the_shortest) {
 TEST(weights_hop_budget_still_applies_to_the_better_route) {
     SemanticGraph graph("w", std::make_shared<FixedEncoder>(), false);
     for (const char* id : {"S", "M", "T"}) graph.addNode("n", id);
-    graph.graph().addEdge("R", NodeRef("n", "S"), NodeRef("n", "T"), {{"w", 0.1}});
-    graph.graph().addEdge("R", NodeRef("n", "S"), NodeRef("n", "M"), {{"w", 1.0}});
-    graph.graph().addEdge("R", NodeRef("n", "M"), NodeRef("n", "T"), {{"w", 1.0}});
+    graph.addEdge("R", NodeRef("n", "S"), NodeRef("n", "T"), {{"w", 0.1}});
+    graph.addEdge("R", NodeRef("n", "S"), NodeRef("n", "M"), {{"w", 1.0}});
+    graph.addEdge("R", NodeRef("n", "M"), NodeRef("n", "T"), {{"w", 1.0}});
     graph.embeddingStore().add(NodeRef("n", "S"), "s", {1.0f, 0.0f, 0.0f, 0.0f});
     MultiHopOptions options = wideOptions(1, 1);
     options.weightField = "w";
@@ -1585,11 +1591,10 @@ SemanticGraph bridge(const std::string& relAX = "R", const std::string& relXB = 
     for (const char* id : {"A", "B", "X"}) {
         graph.addNode("n", id, {{"kind", std::string(id) == "X" ? "hub" : "leaf"}});
     }
-    auto& g = graph.graph();
-    if (aToX) g.addEdge(relAX, NodeRef("n", "A"), NodeRef("n", "X"));
-    else      g.addEdge(relAX, NodeRef("n", "X"), NodeRef("n", "A"));
-    if (bToX) g.addEdge(relXB, NodeRef("n", "B"), NodeRef("n", "X"));
-    else      g.addEdge(relXB, NodeRef("n", "X"), NodeRef("n", "B"));
+    if (aToX) graph.addEdge(relAX, NodeRef("n", "A"), NodeRef("n", "X"));
+    else      graph.addEdge(relAX, NodeRef("n", "X"), NodeRef("n", "A"));
+    if (bToX) graph.addEdge(relXB, NodeRef("n", "B"), NodeRef("n", "X"));
+    else      graph.addEdge(relXB, NodeRef("n", "X"), NodeRef("n", "B"));
     graph.embeddingStore().add(NodeRef("n", "A"), "a", {1.0f, 0.0f, 0.0f, 0.0f});
     graph.embeddingStore().add(NodeRef("n", "B"), "b", {0.9f, 0.1f, 0.0f, 0.0f});
     return graph;
@@ -1641,9 +1646,9 @@ TEST(connect_hop_budget_limits_the_search) {
 TEST(connect_longer_budget_adds_a_chain_of_connectors) {
     SemanticGraph graph("c", std::make_shared<FixedEncoder>(), false);
     for (const char* id : {"A", "M1", "M2", "B"}) graph.addNode("n", id);
-    graph.graph().addEdge("R", NodeRef("n", "A"), NodeRef("n", "M1"));
-    graph.graph().addEdge("R", NodeRef("n", "M1"), NodeRef("n", "M2"));
-    graph.graph().addEdge("R", NodeRef("n", "M2"), NodeRef("n", "B"));
+    graph.addEdge("R", NodeRef("n", "A"), NodeRef("n", "M1"));
+    graph.addEdge("R", NodeRef("n", "M1"), NodeRef("n", "M2"));
+    graph.addEdge("R", NodeRef("n", "M2"), NodeRef("n", "B"));
     graph.embeddingStore().add(NodeRef("n", "A"), "a", {1.0f, 0.0f, 0.0f, 0.0f});
     graph.embeddingStore().add(NodeRef("n", "B"), "b", {0.9f, 0.1f, 0.0f, 0.0f});
     MultiHopOptions options = pickTwo();
@@ -1679,7 +1684,7 @@ TEST(connect_one_hub_joins_three_components) {
     float i = 0;
     for (const char* id : {"A", "B", "C"}) {
         graph.addNode("n", id);
-        graph.graph().addEdge("R", NodeRef("n", id), NodeRef("n", "HUB"));
+        graph.addEdge("R", NodeRef("n", id), NodeRef("n", "HUB"));
         graph.embeddingStore().add(NodeRef("n", id), id, {1.0f - i * 0.05f, 0.1f * i, 0.0f, 0.0f});
         i += 1;
     }
@@ -1979,7 +1984,7 @@ TEST(consistency_matching_pair_loads_clean_with_typed_values) {
                                   {"note", ison::Value(nullptr)}, {"tiny", 1e-9}, {"big", 1e22}});
     graph.addNode("account", "007", {{"name", "Bond"}});
     graph.addNode("account", "42", {{"name", "Answer"}});
-    graph.graph().addEdge("KNOWS", NodeRef("person", "1"), NodeRef("account", "007"),
+    graph.addEdge("KNOWS", NodeRef("person", "1"), NodeRef("account", "007"),
                           {{"w", 0.5}, {"n", 2}});
     graph.embedNode(NodeRef("person", "1"), "a");
     std::string path = dir.file("t.ison");
@@ -2266,6 +2271,619 @@ TEST(consistency_digest_from_ison_text_tags_ids_by_how_the_text_wrote_them) {
     ASSERT_EQ(detail::digestOfDocument(asStr), graphDigest(g));
     ASSERT_EQ(detail::digestOfDocument(asInt),
               graphDigest(g, [](const NodeRef&) { return true; }));
+}
+
+// =============================================================================
+// SemanticGraph: node mutation cannot bypass the embedding
+// =============================================================================
+
+namespace {
+
+/// Encoder that fails on any text containing "boom".
+class FlakyEncoder : public MockEncoder {
+public:
+    explicit FlakyEncoder(size_t dim = 8) : MockEncoder(dim) {}
+    std::vector<float> encode(const std::string& text) const override {
+        if (text.find("boom") != std::string::npos) throw EmbeddingError("encoder exploded");
+        return MockEncoder::encode(text);
+    }
+};
+
+}  // namespace
+
+TEST(graph_view_is_read_only) {
+    // The type is the guarantee: there is no way to reach a mutating ISONGraph method.
+    static_assert(std::is_same_v<decltype(std::declval<SemanticGraph&>().graph()),
+                                 const ISONGraph&>);
+    static_assert(std::is_same_v<decltype(std::declval<const SemanticGraph&>().graph()),
+                                 const ISONGraph&>);
+    static_assert(std::is_same_v<decltype(std::declval<SemanticGraph&>().addNode("t", "i")),
+                                 const Node&>);
+    static_assert(std::is_same_v<decltype(std::declval<SemanticGraph&>().updateNode("t", "i", {})),
+                                 const Node&>);
+
+    SemanticGraph graph("view", std::make_shared<MockEncoder>(8));
+    graph.addNode("person", "1", {{"name", "Alice"}});
+    const ISONGraph& view = graph.graph();
+    ASSERT_EQ(view.nodeCount(), 1u);
+    ASSERT_TRUE(view.hasNode(NodeRef("person", "1")));
+    ASSERT_EQ(view.getNode("person", "1").properties.at("name").as_string(), "Alice");
+}
+
+TEST(edges_go_through_the_semantic_graph) {
+    SemanticGraph graph("edges", std::make_shared<MockEncoder>(8));
+    graph.addNode("person", "1", {{"name", "Alice"}});
+    graph.addNode("person", "2", {{"name", "Bob"}});
+
+    Edge edge = graph.addEdge("KNOWS", NodeRef("person", "1"), NodeRef("person", "2"),
+                              {{"since", int64_t(2020)}});
+    ASSERT_EQ(edge.relType, "KNOWS");
+    ASSERT_TRUE(graph.graph().hasEdge("KNOWS", NodeRef("person", "1"), NodeRef("person", "2")));
+    ASSERT_EQ(graph.graph().edgeCount(), 1u);
+
+    ASSERT_THROWS(graph.addEdge("KNOWS", NodeRef("person", "1"), NodeRef("person", "2")),
+                  DuplicateEdgeError);
+    ASSERT_THROWS(graph.addEdge("KNOWS", NodeRef("person", "1"), NodeRef("person", "9")),
+                  NodeNotFoundError);
+
+    graph.removeEdge("KNOWS", NodeRef("person", "1"), NodeRef("person", "2"));
+    ASSERT_EQ(graph.graph().edgeCount(), 0u);
+    ASSERT_THROWS(graph.removeEdge("KNOWS", NodeRef("person", "1"), NodeRef("person", "2")),
+                  EdgeNotFoundError);
+}
+
+TEST(removing_a_node_takes_its_edges_and_vector_with_it) {
+    SemanticGraph graph("rm", std::make_shared<MockEncoder>(8));
+    graph.addNode("person", "1", {{"name", "Alice"}});
+    graph.addNode("person", "2", {{"name", "Bob"}});
+    graph.addEdge("KNOWS", NodeRef("person", "1"), NodeRef("person", "2"));
+
+    graph.removeNode("person", "2");
+    ASSERT_EQ(graph.graph().edgeCount(), 0u);
+    ASSERT_NULL(graph.getEmbedding(NodeRef("person", "2")));
+    ASSERT_EQ(graph.embeddingStore().count(), 1u);
+    ASSERT_THROWS(graph.removeNode("person", "2"), NodeNotFoundError);
+}
+
+TEST(a_node_that_fails_to_embed_is_not_left_half_added) {
+    SemanticGraph graph("flaky", std::make_shared<FlakyEncoder>());
+    graph.addNode("person", "1", {{"name", "Alice"}});
+
+    ASSERT_THROWS(graph.addNode("person", "2", {{"name", "boom"}}), EmbeddingError);
+    ASSERT_FALSE(graph.graph().hasNode(NodeRef("person", "2")));
+    ASSERT_THROWS(graph.addNodeWithEmbed("person", "3", {}, "boom"), EmbeddingError);
+    ASSERT_FALSE(graph.graph().hasNode(NodeRef("person", "3")));
+    ASSERT_EQ(graph.graph().nodeCount(), 1u);
+    ASSERT_EQ(graph.embeddingStore().count(), 1u);
+
+    // the id is free again
+    graph.addNode("person", "2", {{"name", "Bob"}});
+    ASSERT_EQ(graph.graph().nodeCount(), 2u);
+}
+
+TEST(an_update_that_fails_to_embed_keeps_the_old_properties_and_vector) {
+    SemanticGraph graph("flaky", std::make_shared<FlakyEncoder>());
+    graph.addNode("person", "1", {{"name", "Alice"}, {"role", "engineer"}});
+    auto before = graph.getEmbedding(NodeRef("person", "1"))->vector;
+
+    ASSERT_THROWS(graph.updateNode("person", "1", {{"name", "boom"}, {"role", "pilot"}}),
+                  EmbeddingError);
+    const Node& node = graph.graph().getNode("person", "1");
+    ASSERT_EQ(node.properties.at("name").as_string(), "Alice");
+    ASSERT_EQ(node.properties.at("role").as_string(), "engineer");
+    ASSERT_TRUE(graph.getEmbedding(NodeRef("person", "1"))->vector == before);
+}
+
+// =============================================================================
+// HttpEncoder (fake transport, no network)
+// =============================================================================
+
+namespace {
+
+std::string numberList(const std::vector<float>& vector) {
+    std::ostringstream out;
+    out.precision(9);
+    out << "[";
+    for (size_t i = 0; i < vector.size(); ++i) out << (i ? "," : "") << vector[i];
+    out << "]";
+    return out.str();
+}
+
+/// OpenAI-shaped body; `order` lists which input goes at each position of `data`.
+std::string openAiBody(const std::vector<std::vector<float>>& vectors,
+                       const std::vector<size_t>& order) {
+    std::string body = "{\"object\":\"list\",\"data\":[";
+    for (size_t position = 0; position < order.size(); ++position) {
+        if (position) body += ",";
+        body += "{\"object\":\"embedding\",\"index\":" + std::to_string(order[position]) +
+                ",\"embedding\":" + numberList(vectors[order[position]]) + "}";
+    }
+    return body + "],\"model\":\"m\",\"usage\":{\"prompt_tokens\":3,\"total_tokens\":3}}";
+}
+
+std::string ollamaBody(const std::vector<std::vector<float>>& vectors) {
+    std::string body = "{\"model\":\"m\",\"embeddings\":[";
+    for (size_t i = 0; i < vectors.size(); ++i) body += (i ? "," : "") + numberList(vectors[i]);
+    return body + "],\"total_duration\":1}";
+}
+
+/// Texts of a request body's "input" array.
+std::vector<std::string> inputsOf(const HttpRequest& request) {
+    detail::JsonValue root = detail::JsonParser(request.body).parse();
+    std::vector<std::string> texts;
+    for (const auto& item : root.find("input")->items) texts.push_back(item.text);
+    return texts;
+}
+
+/// A scripted endpoint. Each call takes the next scripted reply; with the
+/// script exhausted it answers like a healthy OpenAI server using MockEncoder.
+struct FakeServer {
+    std::vector<HttpRequest> requests;
+    std::vector<std::function<HttpResponse(const HttpRequest&)>> script;
+    size_t dimension = 8;
+    bool ollama = false;
+    bool reversed = false;
+
+    HttpTransport transport() {
+        return [this](const HttpRequest& request) -> HttpResponse {
+            size_t call = requests.size();
+            requests.push_back(request);
+            if (call < script.size()) return script[call](request);
+            return healthy(request);
+        };
+    }
+
+    HttpResponse healthy(const HttpRequest& request) const {
+        MockEncoder mock(dimension);
+        std::vector<std::vector<float>> vectors;
+        for (const std::string& text : inputsOf(request)) vectors.push_back(mock.encode(text));
+        HttpResponse response;
+        response.status = 200;
+        if (ollama) {
+            response.body = ollamaBody(vectors);
+        } else {
+            std::vector<size_t> order;
+            for (size_t i = 0; i < vectors.size(); ++i) order.push_back(i);
+            if (reversed) std::reverse(order.begin(), order.end());
+            response.body = openAiBody(vectors, order);
+        }
+        return response;
+    }
+};
+
+HttpResponse reply(int status, const std::string& body,
+                   std::map<std::string, std::string> headers = {}) {
+    HttpResponse response;
+    response.status = status;
+    response.body = body;
+    response.headers = std::move(headers);
+    return response;
+}
+
+HttpEncoderOptions httpOptions() {
+    HttpEncoderOptions options;
+    options.url = "https://embeddings.example.test/v1/embeddings";
+    options.model = "test-embed";
+    options.sleeper = [](std::chrono::milliseconds) {};
+    return options;
+}
+
+}  // namespace
+
+TEST(http_encoder_reads_an_openai_response_in_index_order) {
+    FakeServer server;
+    server.reversed = true;  // `data` arrives back to front; `index` says where each belongs
+    HttpEncoder encoder(httpOptions(), server.transport());
+
+    auto vectors = encoder.encodeBatch({"alpha", "beta", "gamma"});
+    MockEncoder mock(8);
+    ASSERT_EQ(vectors.size(), 3u);
+    ASSERT_TRUE(vectors[0] == mock.encode("alpha"));
+    ASSERT_TRUE(vectors[1] == mock.encode("beta"));
+    ASSERT_TRUE(vectors[2] == mock.encode("gamma"));
+    ASSERT_EQ(server.requests.size(), 1u);
+}
+
+TEST(http_encoder_reads_an_ollama_response) {
+    FakeServer server;
+    server.ollama = true;
+    HttpEncoder encoder(httpOptions(), server.transport());
+
+    auto vectors = encoder.encodeBatch({"alpha", "beta"});
+    MockEncoder mock(8);
+    ASSERT_TRUE(vectors[0] == mock.encode("alpha"));
+    ASSERT_TRUE(vectors[1] == mock.encode("beta"));
+    ASSERT_TRUE(encoder.encode("gamma") == mock.encode("gamma"));
+}
+
+TEST(http_encoder_sends_the_documented_request) {
+    FakeServer server;
+    auto options = httpOptions();
+    options.apiKey = "sk-test-1234";
+    options.headers["X-Team"] = "graphs";
+    options.headers["content-type"] = "application/json; charset=utf-8";  // replaces the default
+    options.timeoutMs = 4321;
+    HttpEncoder encoder(options, server.transport());
+
+    encoder.encode("hello");
+    const HttpRequest& request = server.requests.at(0);
+    ASSERT_EQ(request.method, "POST");
+    ASSERT_EQ(request.url, "https://embeddings.example.test/v1/embeddings");
+    ASSERT_EQ(request.timeoutMs, 4321);
+    ASSERT_EQ(request.headers.at("Authorization"), "Bearer sk-test-1234");
+    ASSERT_EQ(request.headers.at("X-Team"), "graphs");
+    ASSERT_EQ(request.headers.count("Content-Type"), 0u);
+    ASSERT_EQ(request.headers.at("content-type"), "application/json; charset=utf-8");
+
+    detail::JsonValue body = detail::JsonParser(request.body).parse();
+    ASSERT_EQ(body.find("model")->text, "test-embed");
+    ASSERT_EQ(body.find("input")->items.size(), 1u);
+    ASSERT_EQ(body.find("input")->items[0].text, "hello");
+}
+
+TEST(http_encoder_api_key_header_is_configurable) {
+    FakeServer server;
+    auto options = httpOptions();
+    options.apiKey = "azure-key";
+    options.apiKeyHeader = "api-key";
+    options.apiKeyPrefix = "";
+    HttpEncoder encoder(options, server.transport());
+    encoder.encode("x");
+    ASSERT_EQ(server.requests.at(0).headers.at("api-key"), "azure-key");
+    ASSERT_EQ(server.requests.at(0).headers.count("Authorization"), 0u);
+
+    // no key configured: no credential header at all
+    FakeServer local;
+    HttpEncoder keyless(httpOptions(), local.transport());
+    keyless.encode("x");
+    ASSERT_EQ(local.requests.at(0).headers.count("Authorization"), 0u);
+}
+
+TEST(http_encoder_splits_a_batch_by_batch_size_and_keeps_the_order) {
+    FakeServer server;
+    auto options = httpOptions();
+    options.batchSize = 3;
+    HttpEncoder encoder(options, server.transport());
+
+    std::vector<std::string> texts;
+    for (int i = 0; i < 7; ++i) texts.push_back("text " + std::to_string(i));
+    auto vectors = encoder.encodeBatch(texts);
+
+    ASSERT_EQ(server.requests.size(), 3u);
+    ASSERT_EQ(inputsOf(server.requests[0]).size(), 3u);
+    ASSERT_EQ(inputsOf(server.requests[1]).size(), 3u);
+    ASSERT_EQ(inputsOf(server.requests[2]).size(), 1u);
+    MockEncoder mock(8);
+    ASSERT_EQ(vectors.size(), 7u);
+    for (size_t i = 0; i < texts.size(); ++i) ASSERT_TRUE(vectors[i] == mock.encode(texts[i]));
+
+    ASSERT_TRUE(encoder.encodeBatch({}).empty());
+    ASSERT_EQ(server.requests.size(), 3u);  // an empty batch sends nothing
+}
+
+TEST(http_encoder_escapes_texts_as_json) {
+    FakeServer server;
+    HttpEncoder encoder(httpOptions(), server.transport());
+    std::string nasty = "quote \" backslash \\ newline \n tab \t bell \x07 caf\xc3\xa9 \xf0\x9f\x98\x80 }";
+    encoder.encode(nasty);
+    ASSERT_EQ(inputsOf(server.requests.at(0)).at(0), nasty);
+}
+
+TEST(http_encoder_retries_429_and_5xx_with_growing_waits) {
+    FakeServer server;
+    server.script.push_back([](const HttpRequest&) { return reply(429, "{}"); });
+    server.script.push_back([](const HttpRequest&) { return reply(503, "busy"); });
+    auto options = httpOptions();
+    std::vector<long long> waits;
+    options.sleeper = [&](std::chrono::milliseconds d) { waits.push_back(d.count()); };
+    HttpEncoder encoder(options, server.transport());
+
+    ASSERT_EQ(encoder.encode("x").size(), 8u);
+    ASSERT_EQ(server.requests.size(), 3u);
+    ASSERT_EQ(waits.size(), 2u);
+    ASSERT_EQ(waits[0], 500);
+    ASSERT_EQ(waits[1], 1000);
+}
+
+TEST(http_encoder_honours_retry_after_up_to_the_ceiling) {
+    FakeServer server;
+    server.script.push_back([](const HttpRequest&) { return reply(429, "{}", {{"Retry-After", "2"}}); });
+    server.script.push_back([](const HttpRequest&) { return reply(429, "{}", {{"retry-after", "600"}}); });
+    auto options = httpOptions();
+    options.maxBackoffMs = 5000;
+    std::vector<long long> waits;
+    options.sleeper = [&](std::chrono::milliseconds d) { waits.push_back(d.count()); };
+    HttpEncoder encoder(options, server.transport());
+
+    encoder.encode("x");
+    ASSERT_EQ(waits.size(), 2u);
+    ASSERT_EQ(waits[0], 2000);
+    ASSERT_EQ(waits[1], 5000);
+}
+
+TEST(http_encoder_gives_up_after_the_retry_budget) {
+    FakeServer server;
+    for (int i = 0; i < 10; ++i) {
+        server.script.push_back([](const HttpRequest&) {
+            return reply(503, "{\"error\":{\"message\":\"overloaded\"}}");
+        });
+    }
+    auto options = httpOptions();
+    options.maxRetries = 2;
+    HttpEncoder encoder(options, server.transport());
+
+    try {
+        encoder.encode("x");
+        throw std::runtime_error("should have thrown");
+    } catch (const HttpError& error) {
+        ASSERT_EQ(error.status(), 503);
+        ASSERT_TRUE(std::string(error.what()).find("overloaded") != std::string::npos);
+    }
+    ASSERT_EQ(server.requests.size(), 3u);  // the first attempt and two retries
+
+    FakeServer none;
+    none.script.push_back([](const HttpRequest&) { return reply(500, "{}"); });
+    auto noRetry = httpOptions();
+    noRetry.maxRetries = 0;
+    HttpEncoder single(noRetry, none.transport());
+    ASSERT_THROWS(single.encode("x"), HttpError);
+    ASSERT_EQ(none.requests.size(), 1u);
+}
+
+TEST(http_encoder_does_not_retry_a_client_error) {
+    FakeServer server;
+    server.script.push_back([](const HttpRequest&) {
+        return reply(401, "{\"error\":{\"message\":\"Incorrect API key provided\",\"type\":\"auth\"}}");
+    });
+    HttpEncoder encoder(httpOptions(), server.transport());
+    try {
+        encoder.encode("x");
+        throw std::runtime_error("should have thrown");
+    } catch (const HttpError& error) {
+        ASSERT_EQ(error.status(), 401);
+        ASSERT_TRUE(std::string(error.what()).find("401") != std::string::npos);
+        ASSERT_TRUE(std::string(error.what()).find("Incorrect API key provided") != std::string::npos);
+    }
+    ASSERT_EQ(server.requests.size(), 1u);
+}
+
+TEST(http_encoder_retries_a_transport_failure) {
+    FakeServer server;
+    server.script.push_back([](const HttpRequest&) -> HttpResponse {
+        throw HttpError("connection reset");
+    });
+    HttpEncoder encoder(httpOptions(), server.transport());
+    ASSERT_EQ(encoder.encode("x").size(), 8u);
+    ASSERT_EQ(server.requests.size(), 2u);
+
+    // any other exception from a transport is wrapped and not retried
+    FakeServer broken;
+    broken.script.push_back([](const HttpRequest&) -> HttpResponse {
+        throw std::logic_error("transport bug");
+    });
+    HttpEncoder other(httpOptions(), broken.transport());
+    ASSERT_THROWS(other.encode("x"), EmbeddingError);
+    ASSERT_EQ(broken.requests.size(), 1u);
+}
+
+TEST(http_encoder_never_puts_the_api_key_in_an_error) {
+    const std::string key = "sk-very-secret-key-9876";
+    auto options = httpOptions();
+    options.apiKey = key;
+    options.maxRetries = 1;
+
+    auto message = [&](std::function<HttpResponse(const HttpRequest&)> behaviour) {
+        FakeServer server;
+        for (int i = 0; i < 4; ++i) server.script.push_back(behaviour);
+        HttpEncoder encoder(options, server.transport());
+        try {
+            encoder.encode("x");
+        } catch (const std::exception& error) {
+            return std::string(error.what());
+        }
+        return std::string("no error");
+    };
+
+    // an error page that echoes the credential
+    std::string echoed = message([&](const HttpRequest&) {
+        return reply(401, "{\"error\":{\"message\":\"bad key " + key + " rejected\"}}");
+    });
+    ASSERT_TRUE(echoed.find("rejected") != std::string::npos);
+    ASSERT_TRUE(echoed.find(key) == std::string::npos);
+    ASSERT_TRUE(echoed.find("[redacted]") != std::string::npos);
+
+    // a non-JSON body that echoes it
+    std::string plain = message([&](const HttpRequest&) { return reply(403, "Forbidden: " + key); });
+    ASSERT_TRUE(plain.find(key) == std::string::npos);
+
+    // a transport that puts the request headers in its own error
+    std::string thrown = message([&](const HttpRequest& request) -> HttpResponse {
+        throw HttpError("failed sending " + request.headers.at("Authorization"));
+    });
+    ASSERT_TRUE(thrown.find(key) == std::string::npos);
+    std::string other = message([&](const HttpRequest& request) -> HttpResponse {
+        throw std::runtime_error("failed sending " + request.headers.at("Authorization"));
+    });
+    ASSERT_TRUE(other.find(key) == std::string::npos);
+}
+
+TEST(http_encoder_dimension_comes_from_the_options_a_response_or_a_probe) {
+    {   // declared: no request, and a response of another width is rejected
+        FakeServer server;
+        server.dimension = 6;
+        auto options = httpOptions();
+        options.dimension = 8;
+        HttpEncoder encoder(options, server.transport());
+        ASSERT_EQ(encoder.dimension(), 8u);
+        ASSERT_EQ(server.requests.size(), 0u);
+        ASSERT_THROWS(encoder.encode("x"), DimensionMismatchError);
+    }
+    {   // learned from the first response
+        FakeServer server;
+        HttpEncoder encoder(httpOptions(), server.transport());
+        encoder.encode("x");
+        ASSERT_EQ(encoder.dimension(), 8u);
+        ASSERT_EQ(server.requests.size(), 1u);
+    }
+    {   // asked first: one probe request carrying none of the caller's text, then cached
+        FakeServer server;
+        HttpEncoder encoder(httpOptions(), server.transport());
+        ASSERT_EQ(encoder.dimension(), 8u);
+        ASSERT_EQ(encoder.dimension(), 8u);
+        ASSERT_EQ(server.requests.size(), 1u);
+        ASSERT_EQ(inputsOf(server.requests[0]).at(0), "dimension probe");
+    }
+}
+
+TEST(http_encoder_rejects_malformed_responses) {
+    auto failsWith = [](const std::string& body, int status = 200) {
+        FakeServer server;
+        server.script.push_back([=](const HttpRequest&) { return reply(status, body); });
+        HttpEncoder encoder(httpOptions(), server.transport());
+        try {
+            encoder.encodeBatch({"a", "b"});
+        } catch (const EmbeddingError&) {
+            return true;
+        }
+        return false;
+    };
+    ASSERT_TRUE(failsWith("not json at all"));
+    ASSERT_TRUE(failsWith("[]"));
+    ASSERT_TRUE(failsWith("{\"hello\":1}"));
+    ASSERT_TRUE(failsWith("{\"error\":{\"message\":\"model not found\"}}"));
+    // wrong number of vectors
+    ASSERT_TRUE(failsWith("{\"data\":[{\"index\":0,\"embedding\":[1,2]}]}"));
+    ASSERT_TRUE(failsWith("{\"embeddings\":[[1,2]]}"));
+    // duplicate / out-of-range / non-integer index
+    ASSERT_TRUE(failsWith("{\"data\":[{\"index\":0,\"embedding\":[1,2]},{\"index\":0,\"embedding\":[1,2]}]}"));
+    ASSERT_TRUE(failsWith("{\"data\":[{\"index\":0,\"embedding\":[1,2]},{\"index\":5,\"embedding\":[1,2]}]}"));
+    ASSERT_TRUE(failsWith("{\"data\":[{\"index\":0,\"embedding\":[1,2]},{\"index\":1.5,\"embedding\":[1,2]}]}"));
+    // missing, empty or non-numeric embedding
+    ASSERT_TRUE(failsWith("{\"data\":[{\"index\":0,\"embedding\":[1,2]},{\"index\":1}]}"));
+    ASSERT_TRUE(failsWith("{\"embeddings\":[[1,2],[]]}"));
+    ASSERT_TRUE(failsWith("{\"embeddings\":[[1,2],\"AAAA\"]}"));
+    ASSERT_TRUE(failsWith("{\"embeddings\":[[1,2],[1,\"x\"]]}"));
+    // vectors of different widths in one response
+    ASSERT_TRUE(failsWith("{\"embeddings\":[[1,2],[1,2,3]]}"));
+    // an error status with a non-JSON body
+    ASSERT_TRUE(failsWith("<html>bad gateway</html>", 400));
+    // control: the same shapes, well formed, succeed
+    FakeServer ok;
+    ok.script.push_back([](const HttpRequest&) {
+        return reply(200, "{\"data\":[{\"embedding\":[1,2]},{\"embedding\":[3,4]}]}");  // index optional
+    });
+    HttpEncoder encoder(httpOptions(), ok.transport());
+    auto vectors = encoder.encodeBatch({"a", "b"});
+    ASSERT_EQ(vectors[1][0], 3.0f);
+}
+
+TEST(http_encoder_validates_its_options) {
+    FakeServer server;
+    auto make = [&](std::function<void(HttpEncoderOptions&)> tweak) {
+        auto options = httpOptions();
+        tweak(options);
+        return HttpEncoder(options, server.transport());
+    };
+    ASSERT_THROWS(make([](HttpEncoderOptions& o) { o.url = ""; }), EmbeddingError);
+    ASSERT_THROWS(make([](HttpEncoderOptions& o) { o.model = ""; }), EmbeddingError);
+    ASSERT_THROWS(make([](HttpEncoderOptions& o) { o.url = "ftp://host/x"; }), EmbeddingError);
+    ASSERT_THROWS(make([](HttpEncoderOptions& o) { o.url = "file:///etc/passwd"; }), EmbeddingError);
+    ASSERT_THROWS(make([](HttpEncoderOptions& o) { o.batchSize = 0; }), EmbeddingError);
+    ASSERT_THROWS(make([](HttpEncoderOptions& o) { o.dimension = 0; }), EmbeddingError);
+    // header injection
+    ASSERT_THROWS(make([](HttpEncoderOptions& o) { o.headers["X"] = "a\r\nInjected: 1"; }),
+                  EmbeddingError);
+    ASSERT_THROWS(make([](HttpEncoderOptions& o) { o.apiKey = "key\nInjected: 1"; }),
+                  EmbeddingError);
+    make([](HttpEncoderOptions& o) { o.url = "HTTP://localhost:11434/api/embed"; });  // fine
+}
+
+#ifndef ISONGRAPH_VECTOR_CURL
+TEST(http_encoder_without_curl_needs_a_transport) {
+    ASSERT_THROWS((HttpEncoder{httpOptions()}), EmbeddingError);
+}
+#endif
+
+TEST(http_encoder_warns_before_sending_a_key_in_clear_text) {
+    FakeServer server;
+    {
+        WarningCapture warnings;
+        auto options = httpOptions();
+        options.apiKey = "sk-warn-secret";
+        options.url = "http://api.example.test/v1/embeddings";
+        HttpEncoder remote(options, server.transport());
+        ASSERT_EQ(warnings.messages.size(), 1u);
+        ASSERT_TRUE(warnings.messages[0].find("plain http") != std::string::npos);
+        ASSERT_TRUE(warnings.messages[0].find("sk-warn-secret") == std::string::npos);
+    }
+    {
+        WarningCapture warnings;
+        auto options = httpOptions();
+        options.apiKey = "sk-warn-secret";
+        for (const char* url : {"http://localhost:11434/api/embed", "http://127.0.0.1:8080/v1/embeddings",
+                                "http://[::1]:8080/e", "https://api.example.test/v1/embeddings"}) {
+            options.url = url;
+            HttpEncoder safe(options, server.transport());
+        }
+        auto keyless = httpOptions();
+        keyless.url = "http://api.example.test/v1/embeddings";
+        HttpEncoder noKey(keyless, server.transport());
+        ASSERT_TRUE(warnings.messages.empty());
+    }
+}
+
+TEST(http_encoder_names_its_model_and_version) {
+    FakeServer server;
+    auto options = httpOptions();
+    options.version = std::string("2024-02");
+    HttpEncoder encoder(options, server.transport());
+    ASSERT_EQ(encoder.modelName(), "test-embed");
+    ASSERT_TRUE(encoder.version().has_value());
+    ASSERT_EQ(*encoder.version(), "2024-02");
+
+    HttpEncoder bare(httpOptions(), server.transport());
+    ASSERT_FALSE(bare.version().has_value());
+}
+
+TEST(http_encoder_drives_a_semantic_graph_and_stamps_its_model) {
+    FakeServer server;
+    auto options = httpOptions();
+    options.dimension = 8;
+    auto encoder = std::make_shared<HttpEncoder>(options, server.transport());
+    SemanticGraph graph("remote", encoder);
+
+    graph.addNode("person", "1", {{"name", "Alice"}});
+    graph.addNode("person", "2", {{"name", "Bob"}});
+    ASSERT_EQ(graph.getEmbedding(NodeRef("person", "1"))->model, "test-embed");
+    ASSERT_TRUE(graph.staleEmbeddings().empty());
+    ASSERT_EQ(graph.embeddingStore().models().at("test-embed"), 2u);
+
+    auto hits = graph.similaritySearch("Alice", 1, "", -1.0f);
+    ASSERT_EQ(hits[0].node_ref.id, "1");
+
+    // moving to another model marks everything stale, and re-embedding fixes it
+    FakeServer other;
+    auto next = httpOptions();
+    next.model = "other-embed";
+    next.dimension = 8;
+    graph.setEncoder(std::make_shared<HttpEncoder>(next, other.transport()));
+    ASSERT_EQ(graph.staleEmbeddings().size(), 2u);
+    ASSERT_EQ(graph.reembedStale(), 2u);
+    ASSERT_EQ(graph.getEmbedding(NodeRef("person", "1"))->model, "other-embed");
+}
+
+TEST(a_node_added_while_the_endpoint_is_down_is_rolled_back) {
+    FakeServer server;
+    server.script.push_back([](const HttpRequest&) { return reply(500, "{}"); });
+    auto options = httpOptions();
+    options.maxRetries = 0;
+    options.dimension = 8;
+    SemanticGraph graph("remote", std::make_shared<HttpEncoder>(options, server.transport()));
+
+    ASSERT_THROWS(graph.addNode("person", "1", {{"name", "Alice"}}), HttpError);
+    ASSERT_EQ(graph.graph().nodeCount(), 0u);
+    graph.addNode("person", "1", {{"name", "Alice"}});  // the endpoint is back
+    ASSERT_EQ(graph.embeddingStore().count(), 1u);
 }
 
 // =============================================================================

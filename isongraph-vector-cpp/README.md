@@ -64,8 +64,8 @@ SemanticGraph graph("social", std::make_shared<MockEncoder>(384));
 graph.addNode("person", "1", {{"name", "Alice"}, {"description", "software engineer"}});
 graph.addNode("person", "2", {{"name", "Bob"}, {"description", "data scientist"}});
 graph.addNode("person", "3", {{"name", "Carol"}, {"description", "product manager"}});
-graph.graph().addEdge("KNOWS", NodeRef("person", "1"), NodeRef("person", "2"));
-graph.graph().addEdge("KNOWS", NodeRef("person", "2"), NodeRef("person", "3"));
+graph.addEdge("KNOWS", NodeRef("person", "1"), NodeRef("person", "2"));
+graph.addEdge("KNOWS", NodeRef("person", "2"), NodeRef("person", "3"));
 
 MultiHopOptions options;
 options.relType = "KNOWS";
@@ -96,8 +96,11 @@ near-orthogonal and cosine similarity is signed, mock scores straddle zero, and
 the default threshold of 0.3 would reject every seed. Subclass
 `EmbeddingEncoder` over a real model and the default is sensible again.
 
-`SemanticGraph` wraps `ISONGraph` by composition, so the underlying graph stays
-available through `graph()` — which is where the edges above are added.
+`SemanticGraph` wraps `ISONGraph` by composition. `graph()` is a **read-only**
+view (`const ISONGraph&`) for counts, lookups, neighbours, paths and
+serialization; everything that changes the graph goes through `SemanticGraph`
+itself — `addNode`, `updateNode`, `removeNode`, `addEdge`, `removeEdge` — so a
+node can never be changed without its embedding following.
 Property values are `ison::Value`, typed since ISONGraph 1.4.0, but a string
 literal converts implicitly, so the brace-initialised map above reads the same
 as it always did.
@@ -135,13 +138,16 @@ score is `max(seed, 0) * decay^hops`: a negative seed passes no relevance along,
 exactly as in `semanticMultiHop`. `embedAllNodes` backfills an existing graph in
 one batched encoder call.
 
-**Updating a node.** Call `SemanticGraph::updateNode`, not `graph().updateNode`.
-With auto-embed on, a change to any embed field re-embeds the node from its new
+**Updating a node.** `SemanticGraph::updateNode` is the only way to change a
+node's properties (there is no mutable `graph()` to go around it). With
+auto-embed on, a change to any embed field re-embeds the node from its new
 properties (and drops the vector if no text is left); an update that touches no
-embed field, or a graph with auto-embed off, leaves the embedding alone.
-`SemanticGraph` wraps an `ISONGraph` rather than deriving from it, so
-`graph().updateNode(...)` stays reachable and bypasses re-embedding — use it
-only when you manage the vector by hand.
+embed field, or a graph with auto-embed off, leaves the embedding alone. To
+manage vectors by hand, construct the graph with auto-embed off and use
+`embeddingStore()`. `addNode`, `addNodeWithEmbed` and `updateNode` are
+all-or-nothing: if the encoder fails (a remote endpoint that is down, say), the
+node is taken back out of the graph — or its old properties restored — and the
+error propagates. They return `const Node&`.
 
 **Filtering.** `nodeFilter` (a `std::function<bool(const Node&)>`) and
 `nodeTypes` restrict which nodes a search may return; they combine by AND.
@@ -189,7 +195,8 @@ A *text* query against vectors from a different model warns once per pair
 (`Error`) or says nothing (`Ignore`); pass the mode to the `SemanticGraph` or
 `EmbeddingStore` constructor. Warnings go to stderr unless you install a
 callback with `setWarningHandler`. `EmbeddingStore::clear(resetDimension)` now
-keeps the pinned dimension by default.
+keeps the pinned dimension by default. The SQLite store has the same
+lifecycle, see below.
 
 ## Saving and loading
 
@@ -261,9 +268,96 @@ which is where a third of the query time used to go. Filtering by node type
 stays exact too: the type is a `vec0` metadata column, so it narrows the
 search rather than filtering its results.
 
+**Model lifecycle, same as the in-memory store.** `SqliteEmbeddingStore` stamps
+each row's `model` column with the encoder's `modelName()` (`"provided"` with no
+encoder), keeps `models()`, `stale(model, dimension, includeUnknown)`,
+`setVersion`/`version()`, `clear(resetDimension)` and `lastImportMeta()`, and
+checks a *text* query against the stored models (`ModelMismatchMode`, the
+fourth constructor argument, plus `setWarningHandler`). `exportEmbeddings`,
+`toJson`, `fromJson`, `saveEmbeddings` (atomic) and `loadEmbeddings` produce and
+read the same payload, sidecar metadata included — `toJson` is byte-identical to
+`EmbeddingStore::toJson` — and an import keeps each entry's own model. Writes
+and imports are transactional: a failure part way changes nothing, and
+`clear(true)` / `importEmbeddings(payload, true)` drop and rebuild the
+sqlite-vec index so the width can change. The `models()` counts are cached and
+refreshed by every write made through the store; a change made through another
+connection is not seen until the next write.
+
+The schema is the one every port writes. The `model` column already existed
+(default `'all-MiniLM-L6-v2'`) and is now written with the real model; a
+database from an older release that lacks `model` (or `node_id_type`) gets it
+added on open with the default `'unknown'`, and nothing else about the tables
+changes, so Python, Rust, C#, TypeScript and JavaScript keep opening what this
+writes. A row another port wrote carries whatever model name that port stored,
+and `'all-MiniLM-L6-v2'` is an ordinary model name to this store.
+
 The fetched SQLite targets are build-tree only and are not installed. A
 consumer who wants the store either builds with the option on, or links their
 own SQLite and includes `isongraph_vector_sqlite.hpp` directly.
+
+## Embedding over HTTP
+
+`HttpEncoder` (`isongraph_vector_http.hpp`) is an `EmbeddingEncoder` that gets
+its vectors from an HTTP endpoint. It POSTs `{"model": ..., "input": [texts]}`
+and reads either an OpenAI-style response (`data[i].embedding`, ordered by
+`index`; OpenAI and the many servers that copy it) or an Ollama `/api/embed` one
+(`embeddings`); the shape is detected, not configured.
+
+```cpp
+#include "isongraph_vector_http.hpp"
+
+HttpEncoderOptions options;
+options.url = "https://api.openai.com/v1/embeddings";
+options.model = "text-embedding-3-small";      // sent as `model`, reported as modelName()
+options.apiKey = std::getenv("OPENAI_API_KEY");
+options.dimension = 1536;                      // optional, see below
+
+auto encoder = std::make_shared<HttpEncoder>(options);
+SemanticGraph graph("kb", encoder);            // texts are embedded over HTTP
+```
+
+**Every text you embed is sent to the endpoint you configure.** With a hosted
+service the contents of your nodes leave the machine; point `url` at a local
+server (Ollama on `http://localhost:11434/api/embed`) if they must not. The API
+key goes in the `Authorization: Bearer` header by default (`apiKeyHeader` /
+`apiKeyPrefix` change that, e.g. `api-key` for Azure). It is never put in an
+exception message — it is also scrubbed from the server's own error text, in
+case an error page echoes it — and constructing an encoder with a key and a
+plain `http://` URL to a non-local host emits a warning.
+
+Options: `batchSize` (texts per request, default 64; `encodeBatch` splits
+larger batches), `timeoutMs`, extra `headers`, `version`, and a bounded retry
+(`maxRetries` 3, `retryBackoffMs` 500 doubling up to `maxBackoffMs`, honouring a
+`Retry-After` in seconds) on HTTP 429, 5xx and transport failures. Other
+statuses throw `HttpError` (an `EmbeddingError` carrying `status()`) with the
+server's message; a malformed or mis-sized response throws `EmbeddingError`, a
+vector of the wrong width `DimensionMismatchError`. `dimension()` is the
+`dimension` option, or what the first response had; asked before anything has
+been encoded it sends one request with the fixed text `dimension probe`. Set
+`dimension` to avoid that. Texts must be UTF-8. Not safe to call from several
+threads at once.
+
+**The header has no dependencies: the transport is yours.** `HttpEncoder` takes
+a `std::function<HttpResponse(const HttpRequest&)>`, so it works with whatever
+HTTP library the application already links — and with a fake in tests, which is
+how this port tests it (no network):
+
+```cpp
+HttpEncoder encoder(options, [](const HttpRequest& request) {
+    HttpResponse response;
+    response.status = ...;   // from your HTTP stack
+    response.body = ...;     // request.url, .headers, .body, .timeoutMs
+    return response;         // throw HttpError when no response could be obtained
+});
+```
+
+A ready-made libcurl transport, `CurlTransport`, is compiled in when
+`ISONGRAPH_VECTOR_CURL` is defined, and then `HttpEncoder(options)` uses it by
+default. With CMake, `-DISONGRAPH_VECTOR_CURL=ON` finds libcurl and gives you an
+`isongraph_vector_curl` target to link (it defines the macro). It does not
+follow redirects (so the key is never forwarded), allows only http and https,
+and caps a response at 64 MiB. It is off by default and nothing else needs
+libcurl.
 
 ## One format, six languages
 
@@ -282,8 +376,9 @@ row written by Python byte for byte.
 - **One embedding per node**, from one text field or a concatenation. No
   multi-vector nodes, no edge embeddings.
 - **`MockEncoder` has no semantic structure.** Use it to test plumbing, never
-  to judge relevance quality. This port ships no real encoder — subclass
-  `EmbeddingEncoder` over the model of your choice.
+  to judge relevance quality. For real embeddings use `HttpEncoder` against an
+  embeddings endpoint (texts leave the process, see above) or subclass
+  `EmbeddingEncoder` over a model you run in-process.
 - **The base library is vendored, not versioned.** There is no upgrade
   notification, so re-copy the headers when ISONGraph moves on. A test asserts
   the vendored versions against
@@ -310,14 +405,34 @@ row written by Python byte for byte.
 
 ```bash
 cmake -S . -B build && cmake --build build
-./build/test_isongraph_vector                 # 142 tests
+./build/test_isongraph_vector                 # 167 tests
 
 cmake -S . -B build -DISONGRAPH_VECTOR_SQLITE=ON && cmake --build build
-./build/test_isongraph_vector_sqlite          # + 16 SQLite tests
+./build/test_isongraph_vector_sqlite          # + 37 SQLite tests
+
+cmake -S . -B build -DISONGRAPH_VECTOR_CURL=ON && cmake --build build
+./build/test_isongraph_vector_curl            # + 3 libcurl smoke tests (loopback only)
 ```
 
 On a multi-config generator such as Visual Studio the binaries land in
 `build/Debug/`.
+
+## Changes to the API since the last snapshot
+
+Nothing from 1.0.0 has shipped, so these are breaking changes made in place:
+
+- `SemanticGraph::graph()` is `const ISONGraph&` only. Replace
+  `graph.graph().addEdge(...)` / `removeEdge(...)` with `graph.addEdge(...)` /
+  `graph.removeEdge(...)`; `graph().addNode/updateNode/removeNode` are gone
+  (use the `SemanticGraph` methods — for a node without a vector, construct the
+  graph with auto-embed off).
+- `SemanticGraph::addNode`, `addNodeWithEmbed` and `updateNode` return
+  `const Node&` instead of `Node&`, and now undo themselves if embedding fails.
+- `SqliteEmbeddingStore::clear()` keeps the pinned dimension by default (it
+  always reset it); pass `true` to reset. `importEmbeddings(payload, true)`
+  adopts the payload's dimension, as the in-memory store does.
+- `SqliteEmbeddingStore` stamps the encoder's `modelName()` in the `model`
+  column instead of `'unknown'`, and an import keeps each entry's own model.
 
 ## Links
 
