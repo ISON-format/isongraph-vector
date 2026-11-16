@@ -272,10 +272,16 @@ the default `threshold` of 0.3, so she never seeds the search either.
   linear in the number of nodes. In Python the numpy path is vectorised and
   patches its cache on writes, which moved the point where a search passes
   50 ms from roughly 90,000 vectors to (extrapolated) around a million;
-  see `benchmarks/`. Python has an opt-in IVF approximate index
-  (`ann="ivf"`) that pays off from about a million vectors; the other ports are
-  exact only. This stays an application's
-  own knowledge graph rather than a vector-database replacement.
+  see `benchmarks/`. Every in-memory store has an opt-in IVF approximate index
+  (`ann="ivf"` in Python; `set_ann`, `enableAnn`, `AnnMode.Ivf`, `ann: 'ivf'`
+  elsewhere) that pays off from roughly a million vectors; the standalone
+  SQLite stores have none. Measured against faiss, hnswlib and usearch
+  (`benchmarks/competitive/`), the ports are 2-4x slower per query at 100k and
+  about 14x slower at 1M vectors at equal recall, have no batched or
+  concurrent search, and persist vectors as JSON only. This stays an
+  application's own knowledge graph rather than a vector-database replacement;
+  its measured strength is graph-aware retrieval on multi-hop questions
+  (`benchmarks/multihop/`).
 - One embedding per node, generated from a single text field/concat -
   no multi-vector-per-node, no edge embeddings (that's RudraDB's domain,
   not this package's).
@@ -304,8 +310,10 @@ the default `threshold` of 0.3, so she never seeds the search either.
   (or errors). Use `stale_embeddings()` and `reembed_stale()` to refresh them.
   An encoder `version` is recorded in the sidecar and warns on a change, but a
   version-only change is not treated as stale.
-- Distributed or multi-tenant retrieval, access control and any server layer
-  are out of scope for an embedded library.
+- The library itself stays embedded. A separate package,
+  `isongraph-vector-server` (alpha), adds multi-tenant access control, quotas,
+  a router that shards tenants across nodes and snapshot-based read replicas;
+  it has no automatic failover, no resharding and no TLS.
 - C++ remains the one port where the base graph library is vendored rather
   than declared as a dependency, because there is no package registry to
   declare it in.

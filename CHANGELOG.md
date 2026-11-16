@@ -173,18 +173,59 @@ JavaScript, Rust and C++.
 - A cross-port CI check (`scripts/cross_port/graph_files.py`) of graph files,
   sidecars and the graph digest: every port writes, every port reads, and a
   tampered file must raise each reader's mismatch error (72 checks).
+- **Approximate search in every port (opt-in)** - the same lazily built,
+  never-persisted IVF-flat index (seeded k-means, nlist about 4*sqrt(N), nprobe
+  about 5%, minimum size 50,000, exact override, `recall_check`) in Rust
+  (`set_ann`), C++ (`enableAnn`), C# (`AnnMode.Ivf`) and TypeScript /
+  JavaScript (`ann: 'ivf'`). Graph files, sidecars and the digest are
+  unchanged. Seeds do not reproduce across ports (each uses its own generator),
+  so indexes differ while recall is comparable. The standalone SQLite stores
+  have no index. See `benchmarks/competitive/` for measured speed and recall.
+- **Rust exact search** scans a contiguous `f32` cache with AVX2/FMA kernels
+  and threads, and equal scores no longer depend on `HashMap` order.
+- **Async encoders in TypeScript / JavaScript** - `AsyncEncoder` and
+  `...Async` methods (`addNodeAsync`, `updateNodeAsync`, `embedAllNodesAsync`,
+  `reembedStaleAsync`, `similaritySearchAsync`, `semanticMultiHopAsync`, ...)
+  let `HttpEncoder` auto-embed without a prefetch. Failures are atomic. The
+  synchronous interface and `prefetch` still work.
+- **C++ libcurl transport is built and tested against real libcurl** (8.11.1,
+  loopback server, no internet). Two bugs fixed: `Expect: 100-continue`
+  stalling large bodies, and a misleading error for over-cap responses. A new
+  `cpp-curl.yml` workflow runs it on Linux and macOS.
+- **`isongraph-vector-server` (alpha)** - a separate package that serves the
+  library over HTTP: per-tenant API keys (salted hashes), isolated graphs,
+  quotas and rate limits, search / multi-hop / path / subgraph / similar,
+  atomic checksummed snapshots with digest verification, a tenant-sharding
+  router and digest-verified read replicas. Not provided: TLS, failover,
+  resharding, a write-ahead log, cross-tenant queries.
+- **Real-data benchmarks** - `benchmarks/multihop/` (HotpotQA, 2Wiki,
+  MuSiQue; two encoders; graphs built without the gold annotations; negative
+  controls; BM25, hybrid, cross-encoder and personalised-PageRank baselines)
+  and `benchmarks/competitive/` (faiss, hnswlib, usearch, chromadb, lancedb,
+  sqlite-vec, numpy on text, GloVe and SIFT vectors at 100k and 1M).
 
 ### Known limits
 
 - `C#` copies: nodes and edges read from the C# read-only graph view are
   copies, so editing one's `Properties` silently changes nothing.
-- The JavaScript / TypeScript encoder interface is synchronous, so an
-  `HttpEncoder` only serves texts that were prefetched; auto-embedding in
-  `SemanticGraph` needs a `prefetch` first.
-- The libcurl transport for the C++ `HttpEncoder` has not been built against a
-  real libcurl; it is off by default.
-- Approximate search is Python-only, uses a numpy IVF index rather than HNSW,
-  and recall was measured on synthetic data, not real embeddings.
+- The synchronous JavaScript / TypeScript encoder interface still only serves
+  prefetched texts; use the `...Async` methods to embed through a network
+  encoder. `loadGraph({onMismatch: 'reembed'})` has no async form.
+- Approximate search is IVF-flat only, not HNSW. Recall on real embeddings was
+  measured at 100k and 1M (`benchmarks/competitive/`); the index is not
+  persisted and is rebuilt after load. JavaScript builds are slow (about 8
+  minutes at 1M vectors).
+- **Not a vector-database replacement.** Against faiss, hnswlib and usearch
+  the ports are 2-4x slower per query at 100k and about 14x slower at 1M text
+  vectors at equal recall; there is no batched or concurrent search; vectors
+  persist as JSON only; and memory is 2-4x higher. Graph-aware retrieval
+  beating plain vector search on multi-hop questions is the supported claim,
+  and it depends on the graph carrying real structure
+  (`benchmarks/multihop/README.md`).
+- Fast filtered search was only measured for node-type filters, and only Rust
+  is fast there (Python's filtered search is no faster than its unfiltered
+  scan). The C++ exact scan is scalar and about 6x slower than numpy; the C#
+  and JS exact scans are also slower than numpy.
 - The digest cannot tell `1` from `1.0` in JavaScript / TypeScript, and
   integers beyond 64 bits are not supported in C# / C++ / Rust. Where a graph
   contains such values the loader warns instead of raising a false mismatch.
@@ -212,8 +253,9 @@ JavaScript, Rust and C++.
   prerelease dependency (NU5104), so a stable 1.0.0 was not possible against
   it. The redistribution carries the same upstream C at the version the Rust,
   Node and C++ ports already use.
-- Similarity search is brute force. There is no ANN index: this is built for an
-  application's own knowledge graph, not as a vector-database replacement.
+- Similarity search is exact (brute force) by default, with an opt-in IVF
+  index; this is built for an application's own knowledge graph, not as a
+  vector-database replacement.
 - Payload vectors are float32 in every port, but the JSON text differs: Rust
   writes the shortest form that round-trips as f32 (`0.33590567`), Python
   widens to float64 first (`0.33590567111968994`). Same number, and importing
