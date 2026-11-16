@@ -48,7 +48,9 @@
 #include <chrono>
 #include <random>
 #include <cstdio>
+#include <mutex>
 #include "ison_graph.hpp"
+#include "isongraph_vector_ivf.hpp"
 
 namespace isongraph_vector {
 
@@ -306,6 +308,12 @@ struct EmbeddingRecord {
     std::string text;
     /** Model that produced the vector: the encoder's modelName(), "provided" or "unknown". */
     std::string model = "unknown";
+    /**
+     * Internal: this record's row in the approximate index, valid only while
+     * an index exists (see EmbeddingStore::enableAnn). Not part of the data;
+     * never saved, copied between stores or compared.
+     */
+    mutable uint32_t ann_slot = detail::IvfIndex::kNoSlot;
 };
 
 // =============================================================================
@@ -1017,6 +1025,143 @@ inline std::string graphDigest(
 }
 
 // =============================================================================
+// Approximate search (opt-in)
+// =============================================================================
+
+/**
+ * Configuration of the opt-in IVF-flat approximate index (see
+ * EmbeddingStore::enableAnn). Defaults match the Python port.
+ */
+struct AnnOptions {
+    /** Cells in the index; 0 = automatic, about 4 * sqrt(N) (see autoNlist) when the index is built. */
+    size_t nlist = 0;
+    /** Cells scanned per query; 0 = automatic, about 5% of nlist. >= nlist is the exact scan. */
+    size_t nprobe = 0;
+    /** Below this many vectors the index is not used and search stays exact. */
+    size_t minSize = 50000;
+    /** Seed of the k-means initialisation: the same data gives the same index. */
+    uint64_t seed = 0;
+    /**
+     * Threads used to train and fill the index (0 = hardware concurrency, 1 =
+     * none). Queries are always single-threaded. The thread count never
+     * changes the resulting index.
+     */
+    size_t threads = 0;
+
+    /** The automatic nlist for a store of n vectors: round(4 * sqrt(n)) clamped to [16, 65536]. */
+    static size_t autoNlist(size_t n) {
+        double wanted = std::nearbyint(4.0 * std::sqrt(static_cast<double>(n)));
+        return static_cast<size_t>(std::min(std::max(wanted, 16.0), 65536.0));
+    }
+};
+
+/** What the approximate index looks like right now (EmbeddingStore::annStats). Never builds anything. */
+struct AnnStats {
+    bool enabled = false;
+    /** An index exists and will answer searches. */
+    bool active = false;
+    size_t nlist = 0;
+    size_t nprobe = 0;
+    /** Vectors present when the centroids were trained. */
+    size_t trainedN = 0;
+    /** Rows scored exactly on every query until folded into a cell. */
+    size_t pending = 0;
+    /** Writes + deletes since training. */
+    size_t churn = 0;
+    double buildSeconds = 0.0;
+    /** Memory held by the index on top of the vectors it scans. */
+    size_t indexBytes = 0;
+    /** Memory of the contiguous copy of the vectors the index scans. */
+    size_t vectorBytes = 0;
+    size_t minSize = 0;
+    /** Searches answered from the index, from a widened probe, by the full scan, and index builds, since enableAnn. */
+    size_t approximateSearches = 0;
+    size_t widenedSearches = 0;
+    size_t exactSearches = 0;
+    size_t builds = 0;
+};
+
+/**
+ * Recall of the approximate index against the exact scan, over some queries
+ * (EmbeddingStore::recallCheck). `recall` is the mean over queries of
+ * |approximate top-k & exact top-k| / |exact top-k|; `minRecall` the worst
+ * query. `approximate` is false when the index was never consulted (it is
+ * off, the store is under minSize, or nprobe >= nlist), in which case recall
+ * is 1.0 by construction. Times are per-query medians in milliseconds.
+ */
+struct RecallReport {
+    double recall = 1.0;
+    double minRecall = 1.0;
+    size_t queries = 0;
+    size_t k = 0;
+    size_t nlist = 0;
+    size_t nprobe = 0;
+    bool approximate = false;
+    double annMs = 0.0;
+    double exactMs = 0.0;
+};
+
+namespace detail {
+
+/**
+ * Everything the store keeps for approximate search. Copying drops the index
+ * (its slot table points into the source's records) and the counters; moving
+ * carries the index along, since moving the record map keeps its nodes.
+ */
+struct AnnState {
+    mutable std::mutex mutex;
+    std::optional<AnnOptions> options;
+    std::unique_ptr<IvfIndex> index;
+    std::vector<const EmbeddingRecord*> recs;            // slot -> record, null once dropped
+    std::unordered_map<std::string, uint32_t> codes;     // node type -> small integer
+    std::vector<IvfHit> hits;                            // per-query scratch
+    size_t approximate = 0, widened = 0, exact = 0, builds = 0;
+
+    AnnState() = default;
+    AnnState(const AnnState& other) : options(other.options) {}
+    AnnState(AnnState&& other) noexcept { takeFrom(other); }
+    AnnState& operator=(const AnnState& other) {
+        if (this != &other) {
+            std::lock_guard<std::mutex> lock(mutex);
+            reset();
+            options = other.options;
+            approximate = widened = exact = builds = 0;
+        }
+        return *this;
+    }
+    AnnState& operator=(AnnState&& other) noexcept {
+        if (this != &other) {
+            std::lock_guard<std::mutex> lock(mutex);
+            takeFrom(other);
+        }
+        return *this;
+    }
+
+    void reset() {
+        index.reset();
+        recs.clear();
+        recs.shrink_to_fit();
+        codes.clear();
+        hits.clear();
+    }
+
+private:
+    void takeFrom(AnnState& other) {
+        options = std::move(other.options);
+        index = std::move(other.index);
+        recs = std::move(other.recs);
+        codes = std::move(other.codes);
+        hits = std::move(other.hits);
+        approximate = other.approximate; widened = other.widened;
+        exact = other.exact; builds = other.builds;
+        other.options.reset();
+        other.reset();
+    }
+};
+
+}  // namespace detail
+
+// =============================================================================
 // Embedding Store
 // =============================================================================
 
@@ -1029,6 +1174,7 @@ private:
     ModelMismatchMode onModelMismatch_ = ModelMismatchMode::Warn;
     mutable std::set<std::string> warnedMismatch_;
     EmbeddingMeta lastImportMeta_;
+    mutable detail::AnnState ann_;
 
     std::string nodeRefToKey(const NodeRef& ref) const {
         return ref.type + ":" + ref.id;
@@ -1113,6 +1259,205 @@ private:
 
         if (norm1 == 0.0f || norm2 == 0.0f) return 0.0f;
         return dot / (norm1 * norm2);
+    }
+
+    // -- approximate index upkeep (all of it under ann_.mutex) -----------------
+
+    using Ivf = detail::IvfIndex;
+
+    uint32_t annCodeLocked(const std::string& type) const {
+        auto it = ann_.codes.find(type);
+        if (it != ann_.codes.end()) return it->second;
+        uint32_t code = static_cast<uint32_t>(ann_.codes.size());
+        ann_.codes.emplace(type, code);
+        return code;
+    }
+
+    size_t annThreads() const { return ann_.options ? ann_.options->threads : 1; }
+
+    /** Cells probed at the configured nprobe. */
+    size_t annProbeLocked(const Ivf& ix) const {
+        size_t wanted = ann_.options->nprobe;
+        if (wanted == 0) {
+            wanted = std::max<size_t>(1, static_cast<size_t>(std::nearbyint(0.05 * static_cast<double>(ix.nlist))));
+        }
+        return std::min(wanted, ix.nlist);
+    }
+
+    /**
+     * Cells to probe at widening `scale`; 0 = widened enough that the full scan
+     * costs about the same. Scale 1 honours nprobe as configured (nprobe >=
+     * nlist is the exact scan); later steps multiply it by 4 and give up on the
+     * index once they would touch half the cells.
+     */
+    size_t annListsLocked(const Ivf& ix, size_t scale) const {
+        size_t lists = annProbeLocked(ix) * scale;
+        if (scale == 1) return lists >= ix.nlist ? 0 : lists;
+        return lists * 2 >= ix.nlist ? 0 : lists;
+    }
+
+    void annDropIndexLocked() const { ann_.reset(); }
+
+    void annBuildLocked() const {
+        std::vector<const EmbeddingRecord*> recs;
+        recs.reserve(embeddings_.size());
+        for (const auto& entry : embeddings_) recs.push_back(&entry.second);
+        // Slots are numbered by key, not by hash-table order, so the same data
+        // gives the same index however (and on whichever standard library) it
+        // was inserted.
+        std::sort(recs.begin(), recs.end(),
+                  [](const EmbeddingRecord* a, const EmbeddingRecord* b) { return a->id < b->id; });
+
+        const size_t n = recs.size();
+        const size_t dim = *dimension_;
+        std::vector<float> data(n * dim);
+        std::vector<uint32_t> codes(n);
+        ann_.codes.clear();
+        for (size_t i = 0; i < n; ++i) {
+            const EmbeddingRecord& r = *recs[i];
+            if (r.vector.size() != dim) {
+                throw EmbeddingError("cannot index " + r.id + ": it has " +
+                                     std::to_string(r.vector.size()) + " dimensions, store holds " +
+                                     std::to_string(dim));
+            }
+            std::copy(r.vector.begin(), r.vector.end(), data.begin() + static_cast<std::ptrdiff_t>(i * dim));
+            codes[i] = annCodeLocked(r.node_ref.type);
+            r.ann_slot = static_cast<uint32_t>(i);
+        }
+        size_t nlist = ann_.options->nlist ? ann_.options->nlist : AnnOptions::autoNlist(n);
+        ann_.index = std::make_unique<Ivf>(Ivf::build(dim, std::move(data), std::move(codes), nlist,
+                                                      ann_.options->seed, annThreads()));
+        ann_.recs = std::move(recs);
+        ++ann_.builds;
+    }
+
+    /**
+     * The index for the store as it is now, built or maintained as the policy
+     * says; null means "answer exactly". Policy (as in Python):
+     *  - built lazily by the first eligible search, never persisted;
+     *  - new and updated rows are scored exactly until max(512, 2%) of the
+     *    indexed rows are pending, then folded into their nearest cell;
+     *  - deletes tombstone; a quarter dead and the arrays are compacted;
+     *  - once writes + deletes since training exceed 50% of the trained size
+     *    the index is retrained from the current data;
+     *  - a store under minSize, a clear() or a dimension change drops it.
+     */
+    Ivf* annIndexLocked() const {
+        if (!ann_.options) return nullptr;
+        const size_t live = embeddings_.size();
+        if (live < std::max<size_t>(2, ann_.options->minSize) || !dimension_.has_value()) {
+            annDropIndexLocked();
+            return nullptr;
+        }
+        if (ann_.index && static_cast<double>(ann_.index->churn) > 0.5 * static_cast<double>(ann_.index->trainedN)) {
+            annDropIndexLocked();
+        }
+        if (!ann_.index) {
+            annBuildLocked();
+        } else if (static_cast<double>(ann_.index->pendingLive) >=
+                   std::max(512.0, 0.02 * static_cast<double>(ann_.index->trainedN))) {
+            ann_.index->fold(annThreads());
+        }
+        return ann_.index.get();
+    }
+
+    /** A record was written (inserted or replaced). */
+    void annAfterPut(const EmbeddingRecord& record) {
+        std::lock_guard<std::mutex> lock(ann_.mutex);
+        if (!ann_.index) return;
+        uint32_t code = annCodeLocked(record.node_ref.type);
+        if (record.ann_slot != Ivf::kNoSlot) {
+            ann_.index->overwrite(record.ann_slot, record.vector.data(), code);
+            ann_.recs[record.ann_slot] = &record;
+        } else {
+            record.ann_slot = ann_.index->append(record.vector.data(), code);
+            ann_.recs.push_back(&record);
+        }
+    }
+
+    /** A record is about to be erased. */
+    void annBeforeErase(const EmbeddingRecord& record) {
+        std::lock_guard<std::mutex> lock(ann_.mutex);
+        if (!ann_.index || record.ann_slot == Ivf::kNoSlot) return;
+        ann_.index->drop(record.ann_slot);
+        ann_.recs[record.ann_slot] = nullptr;
+        if (ann_.index->needsCompaction()) {
+            std::vector<uint32_t> remap = ann_.index->compact();
+            std::vector<const EmbeddingRecord*> kept(ann_.index->slots(), nullptr);
+            for (size_t old = 0; old < remap.size(); ++old) {
+                if (remap[old] == Ivf::kNoSlot) continue;
+                kept[remap[old]] = ann_.recs[old];
+                if (kept[remap[old]] != nullptr) kept[remap[old]]->ann_slot = remap[old];
+            }
+            ann_.recs = std::move(kept);
+        }
+    }
+
+    /** Insert or replace the record for `key`, keeping the approximate index in step. */
+    void putRecord(const std::string& key, EmbeddingRecord&& record) {
+        auto it = embeddings_.find(key);
+        uint32_t slot = Ivf::kNoSlot;
+        if (it == embeddings_.end()) {
+            it = embeddings_.emplace(key, std::move(record)).first;
+        } else {
+            slot = it->second.ann_slot;
+            it->second = std::move(record);
+        }
+        it->second.ann_slot = slot;
+        annAfterPut(it->second);
+    }
+
+    /**
+     * Top-k from the index, or nullopt to use the exact scan (counted as an
+     * exact search here). Filters (type, threshold) apply to the probed rows;
+     * if fewer than topK survive, the probe is widened 4x and tried again, and
+     * past half the cells the exact scan answers instead, so a rare type or a
+     * high threshold costs time rather than silently returning a short list.
+     * Scores in the result are recomputed with the exact cosine formula, so
+     * they equal the exact scan's bit for bit.
+     */
+    std::optional<std::vector<SimilarityResult>> annSearch(
+        const std::vector<float>& query, size_t topK, const std::string& nodeType,
+        float threshold) const {
+        std::lock_guard<std::mutex> lock(ann_.mutex);
+        auto fallBack = [&]() -> std::optional<std::vector<SimilarityResult>> {
+            ++ann_.exact;
+            return std::nullopt;
+        };
+        Ivf* ix = annIndexLocked();
+        if (ix == nullptr) return fallBack();
+        const float norm = std::sqrt(detail::simd::dot(query.data(), query.data(), query.size()));
+        if (!(norm > 0.0f)) return fallBack();      // a zero query has no direction to rank cells by
+        if (topK >= ix->live()) return fallBack();  // nothing to narrow down
+
+        uint32_t code = Ivf::kAnyCode;
+        if (!nodeType.empty()) {
+            auto found = ann_.codes.find(nodeType);
+            if (found == ann_.codes.end()) return std::vector<SimilarityResult>();  // no such type at all
+            code = found->second;
+        }
+        // The fast scores differ from the exact ones in the last bits: admit
+        // rows that close to the threshold and re-check them below.
+        const float slack = threshold - 1e-5f;
+        for (size_t scale = 1;; scale *= 4) {
+            size_t lists = annListsLocked(*ix, scale);
+            if (lists == 0) return fallBack();
+            ix->search(query.data(), 1.0f / norm, code, slack, lists, topK, ann_.hits);
+            if (ann_.hits.size() < topK) continue;
+            std::vector<SimilarityResult> results;
+            results.reserve(ann_.hits.size());
+            for (const detail::IvfHit& hit : ann_.hits) {
+                const EmbeddingRecord& r = *ann_.recs[hit.slot];
+                float score = cosineSimilarity(query, r.vector);
+                if (score >= threshold) results.push_back(SimilarityResult{r.node_ref, score, r.text});
+            }
+            if (results.size() >= topK) {
+                std::stable_sort(results.begin(), results.end());
+                ++ann_.approximate;
+                if (scale > 1) ++ann_.widened;
+                return results;
+            }
+        }
     }
 
 public:
@@ -1225,8 +1570,7 @@ public:
         checkDimension(vec, "vector");
 
         std::string key = nodeRefToKey(node_ref);
-        embeddings_[key] = EmbeddingRecord{key, node_ref, std::move(vec), text,
-                                           currentModelStamp()};
+        putRecord(key, EmbeddingRecord{key, node_ref, std::move(vec), text, currentModelStamp()});
         return key;
     }
 
@@ -1266,26 +1610,57 @@ public:
 
     bool remove(const NodeRef& node_ref) {
         std::string key = nodeRefToKey(node_ref);
-        return embeddings_.erase(key) > 0;
+        auto it = embeddings_.find(key);
+        if (it == embeddings_.end()) return false;
+        annBeforeErase(it->second);
+        embeddings_.erase(it);
+        return true;
     }
 
+    /**
+     * @param exact skip the approximate index and scan every vector (no effect
+     *              unless enableAnn() was called)
+     */
     std::vector<SimilarityResult> similaritySearch(
         const std::string& query,
         size_t topK = 10,
         const std::string& nodeType = "",
-        float threshold = 0.0f
+        float threshold = 0.0f,
+        bool exact = false
     ) const {
         auto queryVector = encodeQuery(query);
-        return similaritySearchVector(queryVector, topK, nodeType, threshold);
+        return similaritySearchVector(queryVector, topK, nodeType, threshold, exact);
     }
 
+    /**
+     * Cosine top-k of a query vector. With enableAnn() a bounded topK on a
+     * large enough store is answered from the approximate index (see there);
+     * `exact` forces the full scan.
+     */
     std::vector<SimilarityResult> similaritySearchVector(
         const std::vector<float>& queryVector,
         size_t topK = 10,
         const std::string& nodeType = "",
-        float threshold = 0.0f
+        float threshold = 0.0f,
+        bool exact = false
     ) const {
         checkQuery(queryVector);
+
+        if (topK > 0) {
+            // A store without enableAnn() only reads its (empty) options under a
+            // brief lock here; the scan below is what it always was.
+            bool enabled;
+            {
+                std::lock_guard<std::mutex> lock(ann_.mutex);
+                enabled = ann_.options.has_value();
+                if (enabled && exact) ++ann_.exact;
+            }
+            if (enabled && !exact) {
+                if (auto answer = annSearch(queryVector, topK, nodeType, threshold)) {
+                    return std::move(*answer);
+                }
+            }
+        }
 
         std::vector<SimilarityResult> results;
 
@@ -1331,6 +1706,209 @@ public:
         return scores;
     }
 
+    // -- approximate (IVF) search ------------------------------------------------
+
+    /**
+     * Opt in to approximate search. Off by default, and then search is the
+     * exact scan, unchanged.
+     *
+     * With it on, a bounded top-k search on a store of at least
+     * `options.minSize` vectors is answered from an in-memory IVF-flat index:
+     * the vectors are clustered into `nlist` cells and only the `nprobe` cells
+     * nearest the query are scored. It is approximate - a true neighbour in an
+     * unprobed cell is missed - so measure it with recallCheck() on your own
+     * queries before relying on a setting, and raise nprobe until the recall
+     * you need holds (nprobe >= nlist is the exact scan).
+     *
+     * The index is built lazily by the first eligible search (or by
+     * buildAnnIndex()), kept current through add/update/remove, and never
+     * written to disk: the graph file, the embeddings sidecar and the graph
+     * digest are exactly what they are without it. Scores are the same cosine
+     * values the exact scan computes. searches with `exact = true`, an
+     * unbounded topK (one that asks for every row), a zero query vector, or a
+     * store under minSize use the exact scan.
+     *
+     * The index keeps its own contiguous copy of the vectors (see
+     * AnnStats::vectorBytes), so an indexed store holds them twice.
+     * Concurrent searches are safe; they take turns on the index. Calling this
+     * again replaces the options and drops the current index.
+     */
+    void enableAnn(AnnOptions options = AnnOptions()) {
+        std::lock_guard<std::mutex> lock(ann_.mutex);
+        ann_.reset();
+        ann_.options = options;
+    }
+
+    /** Turn approximate search off and free the index. */
+    void disableAnn() {
+        std::lock_guard<std::mutex> lock(ann_.mutex);
+        ann_.reset();
+        ann_.options.reset();
+    }
+
+    bool annEnabled() const {
+        std::lock_guard<std::mutex> lock(ann_.mutex);
+        return ann_.options.has_value();
+    }
+
+    /** Cells scanned per query from now on (0 = automatic). Takes effect immediately; no rebuild. */
+    void setAnnNprobe(size_t nprobe) {
+        std::lock_guard<std::mutex> lock(ann_.mutex);
+        if (!ann_.options) throw EmbeddingError("this store has no approximate index; call enableAnn() first");
+        ann_.options->nprobe = nprobe;
+    }
+
+    /**
+     * Build the index now instead of on the first search; with `force`,
+     * retrain even if one exists. Does nothing (and says so in the stats) while
+     * the store is under minSize.
+     *
+     * @throws EmbeddingError when enableAnn() was not called
+     */
+    AnnStats buildAnnIndex(bool force = false) {
+        {
+            std::lock_guard<std::mutex> lock(ann_.mutex);
+            if (!ann_.options) throw EmbeddingError("this store has no approximate index; call enableAnn() first");
+            if (force) ann_.reset();
+            Ivf* ix = annIndexLocked();
+            if (ix != nullptr && ix->pendingLive > 0) ix->fold(annThreads());
+        }
+        return annStats();
+    }
+
+    /** What the approximate index looks like right now. Never builds anything. */
+    AnnStats annStats() const {
+        std::lock_guard<std::mutex> lock(ann_.mutex);
+        AnnStats stats;
+        stats.enabled = ann_.options.has_value();
+        stats.minSize = ann_.options ? ann_.options->minSize : 0;
+        stats.approximateSearches = ann_.approximate;
+        stats.widenedSearches = ann_.widened;
+        stats.exactSearches = ann_.exact;
+        stats.builds = ann_.builds;
+        const Ivf* ix = ann_.index.get();
+        stats.active = ix != nullptr;
+        if (ix != nullptr) {
+            stats.nlist = ix->nlist;
+            stats.nprobe = annProbeLocked(*ix);
+            stats.trainedN = ix->trainedN;
+            stats.pending = ix->pendingLive;
+            stats.churn = ix->churn;
+            stats.buildSeconds = ix->buildSeconds;
+            stats.indexBytes = ix->overheadBytes();
+            stats.vectorBytes = ix->vectorBytes();
+        } else if (ann_.options) {
+            stats.nprobe = ann_.options->nprobe;
+        }
+        return stats;
+    }
+
+    /**
+     * Recall@k of the approximate index against the exact scan: runs every
+     * query both ways and compares the sets of top-k nodes. Use real queries
+     * drawn from your own workload - recall depends on how the data clusters,
+     * and a score measured on unrelated queries or data does not transfer.
+     *
+     * Without an index in use (disabled, under minSize, or nprobe >= nlist)
+     * both answers are the exact scan, recall is 1.0 and `approximate` false.
+     *
+     * @throws EmbeddingError when k is 0
+     */
+    RecallReport recallCheck(const std::vector<std::vector<float>>& queries, size_t k = 10,
+                             const std::string& nodeType = "", float threshold = 0.0f) const {
+        if (k == 0) throw EmbeddingError("k must be positive");
+        using Clock = std::chrono::steady_clock;
+        std::vector<double> recalls, annTimes, exactTimes;
+        bool used = false;
+        for (const auto& query : queries) {
+            size_t before = annStats().approximateSearches;
+            auto t0 = Clock::now();
+            auto found = similaritySearchVector(query, k, nodeType, threshold);
+            auto t1 = Clock::now();
+            used = used || annStats().approximateSearches > before;
+            auto truth = similaritySearchVector(query, k, nodeType, threshold, /*exact=*/true);
+            auto t2 = Clock::now();
+            annTimes.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+            exactTimes.push_back(std::chrono::duration<double, std::milli>(t2 - t1).count());
+            if (truth.empty()) continue;
+            std::unordered_set<std::string> wanted;
+            for (const auto& r : truth) wanted.insert(nodeRefToKey(r.node_ref));
+            size_t hit = 0;
+            for (const auto& r : found) hit += wanted.count(nodeRefToKey(r.node_ref));
+            recalls.push_back(static_cast<double>(hit) / static_cast<double>(wanted.size()));
+        }
+        auto median = [](std::vector<double> v) {
+            if (v.empty()) return 0.0;
+            std::sort(v.begin(), v.end());
+            size_t mid = v.size() / 2;
+            return v.size() % 2 ? v[mid] : 0.5 * (v[mid - 1] + v[mid]);
+        };
+        RecallReport report;
+        report.queries = queries.size();
+        report.k = k;
+        report.approximate = used;
+        report.annMs = median(annTimes);
+        report.exactMs = median(exactTimes);
+        if (!recalls.empty()) {
+            report.recall = std::accumulate(recalls.begin(), recalls.end(), 0.0) / static_cast<double>(recalls.size());
+            report.minRecall = *std::min_element(recalls.begin(), recalls.end());
+        }
+        AnnStats stats = annStats();
+        report.nlist = stats.nlist;
+        report.nprobe = stats.nprobe;
+        return report;
+    }
+
+    /** recallCheck() with text queries (needs an encoder). */
+    RecallReport recallCheckTexts(const std::vector<std::string>& queries, size_t k = 10,
+                                  const std::string& nodeType = "", float threshold = 0.0f) const {
+        std::vector<std::vector<float>> vectors;
+        vectors.reserve(queries.size());
+        for (const auto& query : queries) vectors.push_back(encodeQuery(query));
+        return recallCheck(vectors, k, nodeType, threshold);
+    }
+
+    /**
+     * Visit the matches of the probed cells best first, for a caller that
+     * filters further (SemanticGraph's node filter). `visit` returns false to
+     * stop. Returns false, without visiting anything, when the index cannot
+     * answer at this widening `scale` (1, 4, 16, ...) and the caller should use
+     * the exact scan. Matches are ordered by the index's fast scores; the
+     * score handed to `visit` is the exact cosine.
+     */
+    bool annVisit(const std::vector<float>& query, const std::string& nodeType, float threshold,
+                  size_t scale, const std::function<bool(SimilarityResult&&)>& visit) const {
+        checkQuery(query);
+        std::vector<const EmbeddingRecord*> order;
+        {
+            std::lock_guard<std::mutex> lock(ann_.mutex);
+            Ivf* ix = annIndexLocked();
+            if (ix == nullptr) return false;
+            const float norm = std::sqrt(detail::simd::dot(query.data(), query.data(), query.size()));
+            if (!(norm > 0.0f)) return false;
+            uint32_t code = Ivf::kAnyCode;
+            if (!nodeType.empty()) {
+                auto found = ann_.codes.find(nodeType);
+                if (found == ann_.codes.end()) return true;  // nothing of that type exists
+                code = found->second;
+            }
+            size_t lists = annListsLocked(*ix, scale);
+            if (lists == 0) return false;
+            ix->candidates(query.data(), 1.0f / norm, code, threshold - 1e-5f, lists, ann_.hits);
+            order.reserve(ann_.hits.size());
+            for (const detail::IvfHit& hit : ann_.hits) order.push_back(ann_.recs[hit.slot]);
+            ++ann_.approximate;
+            if (scale > 1) ++ann_.widened;
+        }
+        // Outside the lock: `visit` is user code and may search this store again.
+        for (const EmbeddingRecord* r : order) {
+            float score = cosineSimilarity(query, r->vector);
+            if (!(score >= threshold)) continue;
+            if (!visit(SimilarityResult{r->node_ref, score, r->text})) break;
+        }
+        return true;
+    }
+
     size_t count() const {
         return embeddings_.size();
     }
@@ -1345,6 +1923,10 @@ public:
      *        parameter existed, clear() always reset it.)
      */
     void clear(bool resetDimension = false) {
+        {
+            std::lock_guard<std::mutex> lock(ann_.mutex);
+            ann_.reset();
+        }
         embeddings_.clear();
         if (resetDimension) dimension_.reset();
     }
@@ -1413,8 +1995,8 @@ public:
         for (const auto& item : payload.embeddings) {
             checkDimension(item.vector, "embedding for :" + item.type + ":" + item.id);
             std::string key = nodeRefToKey(NodeRef(item.type, item.id));
-            embeddings_[key] = EmbeddingRecord{key, NodeRef(item.type, item.id), item.vector,
-                                               item.text, item.model};
+            putRecord(key, EmbeddingRecord{key, NodeRef(item.type, item.id), item.vector,
+                                           item.text, item.model});
             ++written;
         }
         return written;
@@ -1865,16 +2447,33 @@ private:
      * With a gate the store cannot truncate first: the best k *unfiltered*
      * matches may all be filtered out, so every match is scored, filtered, and
      * only then cut to k.
+     *
+     * With the store's approximate index the candidates are the probed cells
+     * only. If fewer than k of them pass the gate, the probe is widened (4x
+     * each step) and the search retried, ending in the exact scan, so a
+     * selective filter costs time rather than results.
      */
     std::vector<SimilarityResult> seedSearchVector(
         const std::vector<float>& queryVector, size_t topK, const std::string& nodeType,
-        float threshold, const NodeGate& gate
+        float threshold, const NodeGate& gate, bool exact = false
     ) const {
         if (!gate) {
-            return embedding_store_.similaritySearchVector(queryVector, topK, nodeType, threshold);
+            return embedding_store_.similaritySearchVector(queryVector, topK, nodeType, threshold, exact);
+        }
+        if (!exact && topK > 0 && topK < embedding_store_.count() && embedding_store_.annEnabled()) {
+            for (size_t scale = 1;; scale *= 4) {
+                std::vector<SimilarityResult> kept;
+                bool answered = embedding_store_.annVisit(
+                    queryVector, nodeType, threshold, scale, [&](SimilarityResult&& result) {
+                        if (gate(result.node_ref)) kept.push_back(std::move(result));
+                        return kept.size() < topK;
+                    });
+                if (!answered) break;
+                if (kept.size() >= topK) return kept;
+            }
         }
         auto all = embedding_store_.similaritySearchVector(
-            queryVector, std::numeric_limits<size_t>::max(), nodeType, threshold);
+            queryVector, std::numeric_limits<size_t>::max(), nodeType, threshold, exact);
         std::vector<SimilarityResult> kept;
         for (auto& result : all) {
             if (kept.size() >= topK) break;
@@ -1889,6 +2488,9 @@ public:
      *        differs from the model that produced the stored vectors
      * @param version         encoder/model version recorded in the sidecar
      *        (default: the encoder's own version(), if any)
+     * @param ann             opt in to approximate search for the graph's
+     *        embedding store (see EmbeddingStore::enableAnn); nullopt (the
+     *        default) keeps search exact
      */
     SemanticGraph(
         const std::string& name = "semantic_graph",
@@ -1896,7 +2498,8 @@ public:
         bool autoEmbed = true,
         std::vector<std::string> embedFields = {"name", "description", "content", "text"},
         ModelMismatchMode onModelMismatch = ModelMismatchMode::Warn,
-        std::optional<std::string> version = std::nullopt
+        std::optional<std::string> version = std::nullopt,
+        std::optional<AnnOptions> ann = std::nullopt
     )
         : graph_(name)
         , embedding_store_(encoder, onModelMismatch)
@@ -1904,6 +2507,7 @@ public:
         , embed_fields_(std::move(embedFields))
     {
         if (version.has_value()) embedding_store_.setVersion(std::move(version));
+        if (ann.has_value()) embedding_store_.enableAnn(*ann);
     }
 
     /**
@@ -2132,20 +2736,51 @@ public:
      * applied *before* topK is taken, so you still get topK matching nodes when
      * that many exist. A text query is checked against the model that made the
      * stored vectors (see ModelMismatchMode).
+     *
+     * With approximate search enabled on the embedding store the candidates
+     * come from the probed cells; `exact` forces the full scan (no effect
+     * otherwise). A filter that few nodes pass widens the probe, ending in the
+     * full scan, so you still get topK matching nodes when that many exist.
      */
     std::vector<SimilarityResult> similaritySearch(
         const std::string& query,
         size_t topK = 10,
         const std::string& nodeType = "",
         float threshold = 0.0f,
-        const NodeFilterOptions& filter = NodeFilterOptions()
+        const NodeFilterOptions& filter = NodeFilterOptions(),
+        bool exact = false
     ) const {
         NodeGate gate = makeGate(filter);
         if (!gate) {
-            return embedding_store_.similaritySearch(query, topK, nodeType, threshold);
+            return embedding_store_.similaritySearch(query, topK, nodeType, threshold, exact);
         }
         return seedSearchVector(embedding_store_.encodeQuery(query), topK, nodeType,
-                                threshold, gate);
+                                threshold, gate, exact);
+    }
+
+    /** similaritySearch() with a ready-made query vector (never checked against the encoder's model). */
+    std::vector<SimilarityResult> similaritySearchVector(
+        const std::vector<float>& queryVector,
+        size_t topK = 10,
+        const std::string& nodeType = "",
+        float threshold = 0.0f,
+        const NodeFilterOptions& filter = NodeFilterOptions(),
+        bool exact = false
+    ) const {
+        NodeGate gate = makeGate(filter);
+        return seedSearchVector(queryVector, topK, nodeType, threshold, gate, exact);
+    }
+
+    /** Recall@k of the approximate index against the exact scan (see EmbeddingStore::recallCheck). */
+    RecallReport recallCheck(const std::vector<std::vector<float>>& queries, size_t k = 10,
+                             const std::string& nodeType = "", float threshold = 0.0f) const {
+        return embedding_store_.recallCheck(queries, k, nodeType, threshold);
+    }
+
+    /** recallCheck() with text queries (needs an encoder). */
+    RecallReport recallCheckTexts(const std::vector<std::string>& queries, size_t k = 10,
+                                  const std::string& nodeType = "", float threshold = 0.0f) const {
+        return embedding_store_.recallCheckTexts(queries, k, nodeType, threshold);
     }
 
     /**
@@ -2763,6 +3398,9 @@ public:
      *        sidecar's encoder_version are set and differ, a warning is issued.
      * @param onModelMismatch for text searches whose encoder model differs from
      *        the stored vectors' model (see EmbeddingStore)
+     * @param ann opt in to approximate search (see EmbeddingStore::enableAnn).
+     *        The index is never saved; it is rebuilt lazily from the loaded
+     *        vectors on the first search.
      */
     static SemanticGraph load(
         const std::string& path,
@@ -2773,7 +3411,8 @@ public:
         std::vector<std::string> embedFields = {"name", "description", "content", "text"},
         GraphMismatchMode onMismatch = GraphMismatchMode::Error,
         std::optional<std::string> version = std::nullopt,
-        ModelMismatchMode onModelMismatch = ModelMismatchMode::Warn
+        ModelMismatchMode onModelMismatch = ModelMismatchMode::Warn,
+        std::optional<AnnOptions> ann = std::nullopt
     ) {
         // Read and parse the text here rather than through ISONGraph::load: the
         // digest has to be taken from the document (it records which ids were
@@ -2806,7 +3445,7 @@ public:
         ISONGraph base = ISONGraph::buildFromDocument(doc, graphName);
 
         SemanticGraph result(base.name, std::move(encoder), autoEmbed, std::move(embedFields),
-                             onModelMismatch, std::move(version));
+                             onModelMismatch, std::move(version), std::move(ann));
         result.graph_ = std::move(base);
 
         if (embeddings) {

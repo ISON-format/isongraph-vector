@@ -22,6 +22,15 @@ target_include_directories(isongraph_vector INTERFACE
     $<INSTALL_INTERFACE:include>
 )
 
+# The approximate index (isongraph_vector_ivf.hpp) trains on several threads, so
+# link the platform thread library when building here. BUILD_INTERFACE only: an
+# installed consumer on a recent libc needs nothing, and where -pthread is
+# needed the header falls back to one thread instead of failing.
+find_package(Threads)
+if(Threads_FOUND)
+    target_link_libraries(isongraph_vector INTERFACE $<BUILD_INTERFACE:Threads::Threads>)
+endif()
+
 # Install rules. The interface above already declares an INSTALL_INTERFACE
 # include path; without these nothing was ever placed there, so a consumer
 # could not find_package() this library.
@@ -93,6 +102,24 @@ if(ISONGRAPH_VECTOR_CURL)
     add_library(isongraph_vector_curl INTERFACE)
     target_link_libraries(isongraph_vector_curl INTERFACE isongraph_vector CURL::libcurl)
     target_compile_definitions(isongraph_vector_curl INTERFACE ISONGRAPH_VECTOR_CURL=1)
+endif()
+
+# Optional benchmark of the approximate index (bench/ann_bench.cpp). Off by
+# default; it is an executable for people measuring, not part of the tests.
+option(ISONGRAPH_VECTOR_BENCH "Build the approximate-index benchmark (bench/ann_bench.cpp)" OFF)
+option(ISONGRAPH_VECTOR_BENCH_NATIVE
+       "Compile the benchmark for the build machine (AVX2/FMA or -march=native) instead of baseline SSE2" OFF)
+
+if(ISONGRAPH_VECTOR_BENCH)
+    add_executable(ann_bench bench/ann_bench.cpp)
+    target_link_libraries(ann_bench PRIVATE isongraph_vector)
+    if(ISONGRAPH_VECTOR_BENCH_NATIVE)
+        if(MSVC)
+            target_compile_options(ann_bench PRIVATE /arch:AVX2)
+        else()
+            target_compile_options(ann_bench PRIVATE -march=native)
+        endif()
+    endif()
 endif()
 
 # Tests. Skipped when this project is consumed via add_subdirectory.

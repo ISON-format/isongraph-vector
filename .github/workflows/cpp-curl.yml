@@ -1,0 +1,51 @@
+name: C++ libcurl transport
+
+# Builds the optional libcurl transport for HttpEncoder against a real libcurl
+# and runs its tests. ci.yml builds the C++ port without libcurl (the transport
+# is behind -DISONGRAPH_VECTOR_CURL=ON and needs the library installed), so
+# nothing there compiles or exercises include/isongraph_vector_http.hpp's
+# CurlTransport. The tests talk to a small HTTP server started inside the test
+# process on 127.0.0.1 - no internet is used.
+
+on:
+  push:
+    paths:
+      - 'isongraph-vector-cpp/**'
+      - '.github/workflows/cpp-curl.yml'
+  pull_request:
+    paths:
+      - 'isongraph-vector-cpp/**'
+      - '.github/workflows/cpp-curl.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  curl:
+    name: libcurl transport on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Ubuntu's runner image ships the curl command but not the development
+      # package (headers and libcurl.so for find_package(CURL)). macOS has
+      # libcurl and its headers in the SDK, so nothing to install there.
+      - name: Install libcurl headers (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcurl4-openssl-dev
+
+      - name: Configure
+        run: >
+          cmake -S isongraph-vector-cpp -B isongraph-vector-cpp/build-curl
+          -DISONGRAPH_VECTOR_CURL=ON -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build isongraph-vector-cpp/build-curl --config Release
+      - name: Test
+        run: ctest --test-dir isongraph-vector-cpp/build-curl -C Release --output-on-failure

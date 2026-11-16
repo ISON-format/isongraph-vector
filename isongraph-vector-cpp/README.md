@@ -295,6 +295,77 @@ The fetched SQLite targets are build-tree only and are not installed. A
 consumer who wants the store either builds with the option on, or links their
 own SQLite and includes `isongraph_vector_sqlite.hpp` directly.
 
+## Approximate search (opt-in)
+
+Search is an exact scan by default. For stores past a few hundred thousand
+vectors, `EmbeddingStore::enableAnn()` (or the `ann` argument of `SemanticGraph`'s
+constructor and `load`) answers bounded top-k searches from an in-memory
+IVF-flat index instead: the vectors are clustered into `nlist` cells and only
+the `nprobe` cells nearest the query are scored. It is the same index the
+Python port has, with the same policy.
+
+```cpp
+AnnOptions ann;
+ann.nprobe = 32;                       // nlist 0 = automatic: ~4*sqrt(N); nprobe 0 = ~5% of nlist
+store.enableAnn(ann);                  // off by default; nothing else changes
+
+auto hits  = store.similaritySearchVector(query, 10);                       // from the index
+auto truth = store.similaritySearchVector(query, 10, "", 0.0f, /*exact=*/true);
+RecallReport r = store.recallCheck(myQueries, 10);   // recall@10 against the exact scan
+store.setAnnNprobe(64);                              // trade speed for recall, no rebuild
+AnnStats stats = store.annStats();                   // nlist, pending, churn, memory, counters
+```
+
+It is **approximate**: a true neighbour in an unprobed cell is missed, and how
+often depends on how your data clusters. Measure with `recallCheck` on real
+queries before relying on a setting, and raise `nprobe` until the recall you
+need holds (`nprobe >= nlist` is the exact scan). What stays the same:
+
+- **Scores** are the exact cosine values (the top hits are re-scored with the
+  exact scan's own formula), so a hit scores the same float either way.
+- **`node_type`, `threshold` and `NodeFilterOptions`** apply to the probed
+  rows. If fewer than k survive, the probe is widened 4x and retried, ending in
+  the exact scan, so a rare type or a selective filter costs time, not results.
+- **Never exact-by-accident:** `exact = true`, a `topK` that asks for every row,
+  a zero query vector, a store under `minSize` (default 50,000) and
+  `nprobe >= nlist` all use the plain scan.
+- **Nothing is persisted.** The graph file, the embeddings sidecar and
+  `graphDigest()` are byte-for-byte what they are without it; the index is
+  rebuilt lazily from the loaded vectors on the first search.
+- **Writes** are visible immediately: a new or updated row is scored exactly
+  until enough have piled up to fold into their cells; a delete is skipped;
+  when writes and deletes since training pass half the trained size the index
+  retrains.
+
+The index keeps its own contiguous copy of the vectors (`AnnStats::vectorBytes`),
+so an indexed store holds them twice: 1.5 GB more at 1M x 384. It builds on all
+hardware threads by default (`AnnOptions::threads`; the result does not depend on
+the count) and is seeded, so the same data gives the same index however it was
+inserted. Searches on one store take turns on the index.
+
+Measured with `bench/ann_bench.cpp` (build with `-DISONGRAPH_VECTOR_BENCH=ON`;
+384-d synthetic clustered data, top-10, single-threaded queries, a 32-thread
+machine that was also busy with other work, so treat the absolute times as
+rough). "Flat SIMD scan" is a contiguous single-thread brute force over the same
+vectors - what an exact search costs when it is written for speed; the
+store's own exact scan walks a hash map and is several times slower:
+
+| data | N | nprobe (of nlist) | recall@10 | index | flat SIMD scan |
+|---|---|---|---|---|---|
+| clustered | 100k | 63 (auto, of 1265) | 1.000 | 1.9 ms | 22 ms |
+| clustered | 1M | 8 (of 4000) | 0.982 | 0.66 ms | 83 ms |
+| clustered | 1M | 200 (auto) | 0.995 | 8.9 ms | 83 ms |
+| diffuse (hard) | 1M | 128 | 0.927 | 8.2 ms | 81 ms |
+| diffuse (hard) | 1M | 200 (auto) | 0.984 | 10.2 ms | 81 ms |
+
+Building the index at 1M x 384 took 14-17 s on 32 threads (about 9 s with
+`-DISONGRAPH_VECTOR_BENCH_NATIVE=ON`'s AVX2 build, 186 s on one thread). On hard,
+diffuse data the speed-up shrinks to about 8x over a flat scan at good recall,
+and below ~100k vectors a flat scan is already a few milliseconds, which is why
+this is opt-in and `minSize` defaults to 50,000. Queries are memory-bound, so
+AVX2 barely changes them; it mainly speeds the build. The in-memory store only:
+`SqliteEmbeddingStore` has no approximate index (its `vec0` option is exact).
+
 ## Embedding over HTTP
 
 `HttpEncoder` (`isongraph_vector_http.hpp`) is an `EmbeddingEncoder` that gets
@@ -356,8 +427,15 @@ A ready-made libcurl transport, `CurlTransport`, is compiled in when
 default. With CMake, `-DISONGRAPH_VECTOR_CURL=ON` finds libcurl and gives you an
 `isongraph_vector_curl` target to link (it defines the macro). It does not
 follow redirects (so the key is never forwarded), allows only http and https,
-and caps a response at 64 MiB. It is off by default and nothing else needs
-libcurl.
+sends no `Expect: 100-continue` (a large batch would otherwise wait a second
+for a server that does not answer it), and caps a response at 64 MiB. It is off
+by default and nothing else needs libcurl. Its tests run against a small HTTP
+server inside the test process on 127.0.0.1 (OpenAI- and Ollama-shaped answers,
+error statuses, retries, a stall and timeout, a redirect that must not be
+followed, an oversized body, API-key redaction); no internet is used. On
+Windows, `#define NOMINMAX` before including `<windows.h>`, `<winsock2.h>` or
+`<curl/curl.h>` in your own code, as `windows.h`'s `min`/`max` macros break the
+library headers.
 
 ## One format, six languages
 
@@ -370,9 +448,11 @@ row written by Python byte for byte.
 
 ## Things that will bite you
 
-- **Search is brute force**, sqlite-vec included: linear in the number of
-  nodes. This is built for an application's own knowledge graph, not as a
-  vector-database replacement.
+- **Search is brute force by default**, sqlite-vec included: linear in the
+  number of nodes. `enableAnn()` adds an opt-in approximate index for large
+  in-memory stores (see above), at the price of recall you have to measure. This
+  is built for an application's own knowledge graph, not as a vector-database
+  replacement.
 - **One embedding per node**, from one text field or a concatenation. No
   multi-vector nodes, no edge embeddings.
 - **`MockEncoder` has no semantic structure.** Use it to test plumbing, never
@@ -405,13 +485,16 @@ row written by Python byte for byte.
 
 ```bash
 cmake -S . -B build && cmake --build build
-./build/test_isongraph_vector                 # 167 tests
+./build/test_isongraph_vector                 # 188 tests, 21 of them the approximate index
 
 cmake -S . -B build -DISONGRAPH_VECTOR_SQLITE=ON && cmake --build build
 ./build/test_isongraph_vector_sqlite          # + 37 SQLite tests
 
 cmake -S . -B build -DISONGRAPH_VECTOR_CURL=ON && cmake --build build
-./build/test_isongraph_vector_curl            # + 3 libcurl smoke tests (loopback only)
+./build/test_isongraph_vector_curl            # + 21 libcurl transport tests (loopback server, no internet)
+
+cmake -S . -B build -DISONGRAPH_VECTOR_BENCH=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build --config Release
+./build/ann_bench --sizes 10000,100000,1000000   # exact vs approximate latency and recall; --json out.jsonl
 ```
 
 On a multi-config generator such as Visual Studio the binaries land in
@@ -420,6 +503,13 @@ On a multi-config generator such as Visual Studio the binaries land in
 ## Changes to the API since the last snapshot
 
 Nothing from 1.0.0 has shipped, so these are breaking changes made in place:
+
+- New, opt-in and additive: `EmbeddingStore::enableAnn / disableAnn / annEnabled /
+  setAnnNprobe / buildAnnIndex / annStats / recallCheck / recallCheckTexts`,
+  the `AnnOptions`, `AnnStats` and `RecallReport` types, an `exact` flag on
+  `similaritySearch` / `similaritySearchVector`, and on `SemanticGraph` an
+  `ann` constructor / `load` argument, `similaritySearchVector`, an `exact` flag
+  and `recallCheck`. Existing calls behave exactly as before.
 
 - `SemanticGraph::graph()` is `const ISONGraph&` only. Replace
   `graph.graph().addEdge(...)` / `removeEdge(...)` with `graph.addEdge(...)` /
