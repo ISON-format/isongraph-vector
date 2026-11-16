@@ -170,6 +170,7 @@ export function loadGraph(path, options = {}) {
     const {
         format = 'auto', embeddings = true, encoder, autoEmbed, embedFields,
         version, onModelMismatch, onMismatch = 'error',
+        ann, annNlist, annNprobe, annMinSize, annSeed,
     } = options;
     if (onMismatch !== 'error' && onMismatch !== 'warn' && onMismatch !== 'reembed') {
         throw new EmbeddingError(`onMismatch must be 'error', 'warn' or 'reembed', got ${JSON.stringify(onMismatch)}`);
@@ -189,6 +190,11 @@ export function loadGraph(path, options = {}) {
         embedFields,
         version,
         onModelMismatch,
+        ann,
+        annNlist,
+        annNprobe,
+        annMinSize,
+        annSeed,
     });
     for (const node of base.nodes()) {
         ISONGraph.prototype.addNode.call(graph, node.type, node.id, node.properties);
