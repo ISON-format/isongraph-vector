@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=77.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "isongraph-vector-server"
+version = "0.1.0"
+description = "Multi-tenant HTTP service, tenant-sharding router and snapshot read replicas around isongraph-vector"
+readme = "README.md"
+license = "MIT"
+authors = [{name = "Mahesh Vaikri"}]
+requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+]
+# The only runtime dependency is the library itself (which brings ison-graph).
+# The HTTP server, router, replication and CLI are standard library only.
+dependencies = [
+    "isongraph-vector>=1.0.0",
+]
+
+[project.optional-dependencies]
+# Vectorised search (numpy) and the opt-in IVF approximate index.
+fast = ["numpy>=1.21.0"]
+dev = ["pytest>=7.0.0", "numpy>=1.21.0"]
+
+[project.scripts]
+igv-server = "isongraph_vector_server.cli:main"
+
+[tool.setuptools]
+packages = ["isongraph_vector_server"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --tb=short"
+markers = [
+    "slow: tests that take more than a few seconds (crash, load)",
+]

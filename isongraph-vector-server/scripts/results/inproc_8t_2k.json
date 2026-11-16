@@ -1,0 +1,39 @@
+{
+  "config": {
+    "tenants": 8,
+    "nodes": 2000,
+    "dim": 64,
+    "top_k": 10,
+    "clients": 16,
+    "duration": 8.0,
+    "warmup": 2.0,
+    "mode": "inproc",
+    "shards": 0,
+    "text": false,
+    "url": null,
+    "seed": 1
+  },
+  "environment": {
+    "python": "3.12.7",
+    "platform": "Windows-11-10.0.26300-SP0",
+    "cpu_count": 32,
+    "server_processes": 1
+  },
+  "result": {
+    "requests_ok": 11175,
+    "errors": {},
+    "throughput_rps": 1396.9,
+    "latency_ms": {
+      "mean": 11.444,
+      "p50": 10.131,
+      "p95": 22.711,
+      "p99": 29.8,
+      "max": 51.648
+    },
+    "per_tenant_requests": {
+      "min": 1325,
+      "max": 1452,
+      "tenants_hit": 8
+    }
+  }
+}
