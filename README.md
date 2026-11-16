@@ -63,13 +63,18 @@ Parity is deliberate but not total:
 | Graph save/load with embeddings | yes | - | - | - | - | - |
 | Extends the base graph | subclass | composition | subclass | subclass | composition | composition |
 
-Python is the reference implementation: the only port with a real transformer
-encoder and graph persistence. The other five are `MockEncoder`-only and expect
-you to supply an encoder over whatever model you already run.
+Python is the reference implementation and the only port that ships a
+transformer encoder. Every port can save and load a graph with its embeddings,
+and can embed through an OpenAI- or Ollama-style HTTP endpoint (Python, C#,
+Rust, C++ and the JavaScript ports each have an `HttpEncoder`; Rust's is behind
+the `http-encoder` feature). The others otherwise expect you to supply an
+encoder over whatever model you already run.
 
 C#, Rust and C++ wrap the base graph rather than subclassing it — `ISONGraph`
 is `sealed` in C#, and Rust and C++ have no inheritance to use here. The
-underlying graph stays reachable through `Graph`, `graph()` and `graph_mut()`.
+underlying graph is exposed read-only (`Graph` in C#, `graph()` in Rust and
+C++), and edges are added through `SemanticGraph` itself, so a node can never be
+edited behind the embedding store's back.
 
 ## Installation
 

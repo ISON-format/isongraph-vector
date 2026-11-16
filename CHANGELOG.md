@@ -147,17 +147,47 @@ JavaScript, Rust and C++.
 - Python: the exact numpy search is vectorised and writes patch the cached
   matrix instead of discarding it (at 100k vectors a search takes about 5.6 ms
   and the search right after a write about the same).
+- **Approximate search (Python, opt-in)** - `ann="ivf"` on `EmbeddingStore` /
+  `SemanticGraph` builds a numpy IVF-flat index lazily, keeps it current under
+  writes and deletes, applies `node_type` / `threshold` / `node_filter` to the
+  probed rows (widening, then falling back to exact, when too few survive), and
+  offers `recall_check()` to measure recall against the exact scan. Off by
+  default; `exact=True` forces the full scan. At 1M clustered vectors it is
+  20-160x faster than exact search; on hard, diffuse data only 2-3x, and it
+  does not pay at or below 100k (see `benchmarks/`).
+- **`HttpEncoder`** - embeds through an OpenAI-style (`data[].embedding`) or
+  Ollama (`/api/embed`) endpoint in Python, JavaScript, TypeScript, C#, C++
+  and Rust (Rust behind the `http-encoder` feature, C++ with a pluggable
+  transport and an optional libcurl one). API keys are redacted from errors,
+  redirects are refused, and every embedded text is sent to the configured
+  endpoint. The JavaScript ports serve the synchronous encoder interface from
+  a `prefetch` cache.
+- **Model lifecycle for the standalone `SqliteEmbeddingStore`** in
+  TypeScript, JavaScript, Rust and C++, matching the in-memory store. Existing
+  databases gain a `model` column on open, and databases stay readable across
+  ports.
+- **Node edits cannot bypass re-embedding** in C#, C++ and Rust: C# `Graph` is
+  a read-only view, C++ `graph()` is const and Rust has no `graph_mut()`;
+  `AddEdge` / `RemoveEdge` live on `SemanticGraph`. C++ `addNode` and
+  `updateNode` also undo themselves if embedding throws.
+- A cross-port CI check (`scripts/cross_port/graph_files.py`) of graph files,
+  sidecars and the graph digest: every port writes, every port reads, and a
+  tampered file must raise each reader's mismatch error (72 checks).
 
 ### Known limits
 
-- `update_node` can still be bypassed through the underlying graph object in
-  C#, C++ and Rust (`Graph`, `graph()`, `graph_mut()`), which leaves a stale
-  vector; this is documented on each.
+- `C#` copies: nodes and edges read from the C# read-only graph view are
+  copies, so editing one's `Properties` silently changes nothing.
+- The JavaScript / TypeScript encoder interface is synchronous, so an
+  `HttpEncoder` only serves texts that were prefetched; auto-embedding in
+  `SemanticGraph` needs a `prefetch` first.
+- The libcurl transport for the C++ `HttpEncoder` has not been built against a
+  real libcurl; it is off by default.
+- Approximate search is Python-only, uses a numpy IVF index rather than HNSW,
+  and recall was measured on synthetic data, not real embeddings.
 - The digest cannot tell `1` from `1.0` in JavaScript / TypeScript, and
   integers beyond 64 bits are not supported in C# / C++ / Rust. Where a graph
   contains such values the loader warns instead of raising a false mismatch.
-- The standalone `SqliteEmbeddingStore` in TypeScript, JavaScript, Rust and
-  C++ has no model lifecycle yet.
 - C# cannot load an undirected graph file written by Python: the published
   IsonGraph 1.4.0 package rejects its `meta.graph` block.
 - Only Python records the encoder version beyond the sidecar; a version-only
