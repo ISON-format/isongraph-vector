@@ -1,0 +1,38 @@
+{
+ "system": "usearch",
+ "ds": "text384",
+ "n": 100000,
+ "d": 384,
+ "k": 10,
+ "queries": 2000,
+ "all_threads": 32,
+ "exps": [
+  "filter"
+ ],
+ "started": "2026-11-16 08:38:15",
+ "filter": {
+  "build_with_metadata_s": 5.679011999978684,
+  "mem": {
+   "rss_mb": 220.6875,
+   "peak_mb": 251.28515625
+  },
+  "subsets": {
+   "f10": {
+    "unsupported": true
+   },
+   "f01": {
+    "unsupported": true
+   }
+  }
+ },
+ "mem_end": {
+  "rss_mb": 44.49609375,
+  "peak_mb": 251.28515625
+ },
+ "status": "ok",
+ "finished": "2026-11-16 08:38:21",
+ "load_before_pct": 5.878125000000004,
+ "load_contaminated": false,
+ "wall_s": 5.924612522125244,
+ "flag": null
+}

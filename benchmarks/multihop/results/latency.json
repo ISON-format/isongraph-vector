@@ -1,0 +1,248 @@
+{
+ "machine": {
+  "platform": "Windows-11-10.0.26300-SP0",
+  "processor": "Intel64 Family 6 Model 183 Stepping 1, GenuineIntel",
+  "threads": 1,
+  "note": "single-threaded, warm, query vectors precomputed; timed on a machine that may have had other light background processes (see README)"
+ },
+ "results": {
+  "hotpotqa/minilm": {
+   "vector (numpy brute force top-20)": {
+    "mean_ms": 0.48564050026470795,
+    "median_ms": 0.47075003385543823,
+    "p95_ms": 0.5728049960453063,
+    "n": 200
+   },
+   "ISONGraph similarity_search top-20 (plain vector via the library)": {
+    "mean_ms": 0.6935720011824742,
+    "median_ms": 0.6781999836675823,
+    "p95_ms": 0.8835000306135042,
+    "n": 200
+   },
+   "BM25 (scipy sparse)": {
+    "mean_ms": 0.1536945000407286,
+    "median_ms": 0.14625000767409801,
+    "p95_ms": 0.20997496903873974,
+    "n": 200
+   },
+   "Hybrid RRF (dense + BM25 + fusion)": {
+    "mean_ms": 5.391248998057563,
+    "median_ms": 5.384700023569167,
+    "p95_ms": 7.199424967984668,
+    "n": 200
+   },
+   "PPR re-rank, graph=mention": {
+    "mean_ms": 11.179658999026287,
+    "median_ms": 11.421350005548447,
+    "p95_ms": 13.548449991503729,
+    "n": 200
+   },
+   "_graph_build_seconds": {
+    "mention": 0.9577896000118926
+   },
+   "ISONGraph semantic_multi_hop (tuned), graph=mention": {
+    "mean_ms": 12.342348497768398,
+    "median_ms": 12.086300004739314,
+    "p95_ms": 13.929454979370346,
+    "n": 200
+   },
+   "ISONGraph semantic_subgraph(connect=True), graph=mention": {
+    "mean_ms": 20.597783994162455,
+    "median_ms": 20.786299981409684,
+    "p95_ms": 23.595270034275014,
+    "n": 100
+   },
+   "_selected_cfg": {
+    "variant": "mention",
+    "cfg": {
+     "hops": 2,
+     "seeds": 5,
+     "decay": 0.5,
+     "blend": 0.3,
+     "direction": "both",
+     "weight_field": null
+    }
+   },
+   "Vector top-30 + cross-encoder (CPU, 1 thread)": {
+    "mean_ms": 6843.021799999406,
+    "median_ms": 7238.126849988475,
+    "p95_ms": 7484.873605016037,
+    "n": 8
+   }
+  },
+  "2wiki/minilm": {
+   "vector (numpy brute force top-20)": {
+    "mean_ms": 0.7558300020173192,
+    "median_ms": 0.7286499603651464,
+    "p95_ms": 0.9162000438664106,
+    "n": 200
+   },
+   "ISONGraph similarity_search top-20 (plain vector via the library)": {
+    "mean_ms": 0.9439495002152398,
+    "median_ms": 0.8543499861843884,
+    "p95_ms": 1.5255200152751052,
+    "n": 200
+   },
+   "BM25 (scipy sparse)": {
+    "mean_ms": 0.45629350119270384,
+    "median_ms": 0.4443999787326902,
+    "p95_ms": 0.7269749941769982,
+    "n": 200
+   },
+   "Hybrid RRF (dense + BM25 + fusion)": {
+    "mean_ms": 3.873069500841666,
+    "median_ms": 3.7907000223640352,
+    "p95_ms": 5.11852501949761,
+    "n": 200
+   },
+   "PPR re-rank, graph=mention": {
+    "mean_ms": 6.827249999041669,
+    "median_ms": 6.732499983627349,
+    "p95_ms": 8.859889965970066,
+    "n": 200
+   },
+   "_graph_build_seconds": {
+    "mention+entity": 1.1235644000116736
+   },
+   "ISONGraph semantic_multi_hop (tuned), graph=mention+entity": {
+    "mean_ms": 3.4164134989259765,
+    "median_ms": 2.922200015746057,
+    "p95_ms": 7.105119986226778,
+    "n": 200
+   },
+   "ISONGraph semantic_subgraph(connect=True), graph=mention+entity": {
+    "mean_ms": 39.90853499970399,
+    "median_ms": 35.43980003450997,
+    "p95_ms": 61.64026499318424,
+    "n": 100
+   },
+   "_selected_cfg": {
+    "variant": "mention+entity",
+    "cfg": {
+     "hops": 2,
+     "seeds": 5,
+     "decay": 0.7,
+     "blend": 0.0,
+     "direction": "out",
+     "weight_field": "w"
+    }
+   }
+  },
+  "musique/minilm": {
+   "vector (numpy brute force top-20)": {
+    "mean_ms": 2.0554560009622946,
+    "median_ms": 1.9247499876655638,
+    "p95_ms": 3.100280024227686,
+    "n": 200
+   },
+   "ISONGraph similarity_search top-20 (plain vector via the library)": {
+    "mean_ms": 2.2241929985466413,
+    "median_ms": 2.1745999983977526,
+    "p95_ms": 3.0762100213905796,
+    "n": 200
+   },
+   "BM25 (scipy sparse)": {
+    "mean_ms": 0.4085455002496019,
+    "median_ms": 0.3771499905269593,
+    "p95_ms": 0.5929799750447272,
+    "n": 200
+   },
+   "Hybrid RRF (dense + BM25 + fusion)": {
+    "mean_ms": 6.215742999047507,
+    "median_ms": 6.086799985496327,
+    "p95_ms": 8.073384992894717,
+    "n": 200
+   },
+   "PPR re-rank, graph=mention": {
+    "mean_ms": 13.699477003247011,
+    "median_ms": 13.619150005979463,
+    "p95_ms": 16.363100049784407,
+    "n": 200
+   },
+   "_graph_build_seconds": {
+    "mention": 1.0767072000307962
+   },
+   "ISONGraph semantic_multi_hop (tuned), graph=mention": {
+    "mean_ms": 16.80029300332535,
+    "median_ms": 16.35764999082312,
+    "p95_ms": 21.890034989337433,
+    "n": 200
+   },
+   "ISONGraph semantic_subgraph(connect=True), graph=mention": {
+    "mean_ms": 31.09345300239511,
+    "median_ms": 30.48549999948591,
+    "p95_ms": 38.64339004503563,
+    "n": 100
+   },
+   "_selected_cfg": {
+    "variant": "mention",
+    "cfg": {
+     "hops": 2,
+     "seeds": 10,
+     "decay": 0.9,
+     "blend": 0.3,
+     "direction": "both",
+     "weight_field": null
+    }
+   }
+  },
+  "hotpotqa/bge": {
+   "vector (numpy brute force top-20)": {
+    "mean_ms": 1.3350584977888502,
+    "median_ms": 1.3147999998182058,
+    "p95_ms": 1.8358299974352117,
+    "n": 200
+   },
+   "ISONGraph similarity_search top-20 (plain vector via the library)": {
+    "mean_ms": 2.095423499995377,
+    "median_ms": 2.0103500282857567,
+    "p95_ms": 3.095170049346052,
+    "n": 200
+   },
+   "BM25 (scipy sparse)": {
+    "mean_ms": 0.5253385010291822,
+    "median_ms": 0.5105999880470335,
+    "p95_ms": 0.7368400198174639,
+    "n": 200
+   },
+   "Hybrid RRF (dense + BM25 + fusion)": {
+    "mean_ms": 6.03914749895921,
+    "median_ms": 5.834200012031943,
+    "p95_ms": 8.131710000452584,
+    "n": 200
+   },
+   "PPR re-rank, graph=mention": {
+    "mean_ms": 13.122622499649879,
+    "median_ms": 12.988400005269796,
+    "p95_ms": 15.208380005788056,
+    "n": 200
+   },
+   "_graph_build_seconds": {
+    "mention": 0.950012199988123
+   },
+   "ISONGraph semantic_multi_hop (tuned), graph=mention": {
+    "mean_ms": 2.1502415000577457,
+    "median_ms": 2.1122499892953783,
+    "p95_ms": 2.7931800083024423,
+    "n": 200
+   },
+   "ISONGraph semantic_subgraph(connect=True), graph=mention": {
+    "mean_ms": 10.563406005385332,
+    "median_ms": 10.059049993287772,
+    "p95_ms": 14.326804989832453,
+    "n": 100
+   },
+   "_selected_cfg": {
+    "variant": "mention",
+    "cfg": {
+     "hops": 2,
+     "seeds": 5,
+     "decay": 0.7,
+     "blend": 0.0,
+     "direction": "both",
+     "weight_field": null
+    }
+   }
+  }
+ }
+}

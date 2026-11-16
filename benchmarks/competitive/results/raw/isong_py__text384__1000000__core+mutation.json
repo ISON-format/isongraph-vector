@@ -1,0 +1,122 @@
+{
+ "system": "isong_py",
+ "ds": "text384",
+ "n": 1000000,
+ "d": 384,
+ "k": 10,
+ "queries": 2000,
+ "all_threads": 32,
+ "exps": [
+  "core",
+  "mutation"
+ ],
+ "started": "2026-11-16 09:44:46",
+ "mem_baseline": {
+  "rss_mb": 37.44140625,
+  "peak_mb": 37.44140625
+ },
+ "version": "isongraph-vector (python, repo HEAD)",
+ "build": {
+  "ingest_s": 19.603895099658985,
+  "index_s": 2.8999638743698597e-06,
+  "total_s": 19.60389799962286,
+  "first_query_ms": 3159.0028000064194,
+  "ready_s": 22.76290079962928
+ },
+ "mem_after_build": {
+  "rss_mb": 2458.02734375,
+  "peak_mb": 2719.56640625
+ },
+ "mem_after_first_query": {
+  "rss_mb": 4260.78125,
+  "peak_mb": 4282.1875
+ },
+ "sweep": [
+  {
+   "nq": 36,
+   "recall_queries": 36,
+   "recall": 1.0,
+   "qps_1t_runs": [
+    12.691703331185803,
+    12.691139131289624,
+    12.803293120965305
+   ],
+   "qps_1t": 12.691703331185803,
+   "qps_1t_min": 12.691139131289624,
+   "qps_1t_max": 12.803293120965305,
+   "median_ms": 77.24439998855814,
+   "p95_ms": 86.11922999843955,
+   "p99_ms": 92.96392500284126,
+   "mean_ms": 78.56388981464853,
+   "knob": null
+  }
+ ],
+ "knob_name": null,
+ "loop_allthreads": {
+  "nq": 64,
+  "threads": 32,
+  "qps": 21.255942570846003,
+  "median_ms": 46.58279998693615,
+  "p95_ms": 51.560625023557805,
+  "p99_ms": 56.12793797801715,
+  "mean_ms": 47.07301093882658
+ },
+ "mem_after_sweep": {
+  "rss_mb": 4261.796875,
+  "peak_mb": 4282.1875
+ },
+ "ref_knob": null,
+ "ref_recall_pre": 1.0,
+ "mutation": {
+  "ref_knob": null,
+  "recall_before": 1.0,
+  "insert_10k": {
+   "seconds": 0.28422920004231855,
+   "per_s": 35182.873534848324,
+   "batch": 1000
+  },
+  "update_10k": {
+   "seconds": 0.21219099999871105,
+   "per_s": 47127.352244255155,
+   "batch": 1000
+  },
+  "delete_10k": {
+   "seconds": 0.1480594999738969,
+   "per_s": 67540.41450743124,
+   "batch": 1000
+  },
+  "mem_after": {
+   "rss_mb": 4319.8125,
+   "peak_mb": 4319.8125
+  },
+  "first_query_after_ms": 76.06789999408647,
+  "after": {
+   "nq": 37,
+   "recall_queries": 37,
+   "recall": 1.0,
+   "qps_1t_runs": [
+    12.633175004505267,
+    12.728609263827707,
+    12.417905062494837
+   ],
+   "qps_1t": 12.633175004505267,
+   "qps_1t_min": 12.417905062494837,
+   "qps_1t_max": 12.728609263827707,
+   "median_ms": 78.01810000091791,
+   "p95_ms": 86.07399999164045,
+   "p99_ms": 98.09642998152417,
+   "mean_ms": 79.41624143702053
+  },
+  "recall_after": 1.0
+ },
+ "mem_end": {
+  "rss_mb": 4287.57421875,
+  "peak_mb": 4331.37890625
+ },
+ "status": "ok",
+ "finished": "2026-11-16 09:45:45",
+ "load_before_pct": 4.121874999999999,
+ "load_contaminated": false,
+ "wall_s": 59.9491012096405,
+ "flag": null
+}

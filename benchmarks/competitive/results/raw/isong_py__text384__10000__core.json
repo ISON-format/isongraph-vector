@@ -1,0 +1,79 @@
+{
+ "system": "isong_py",
+ "ds": "text384",
+ "n": 10000,
+ "d": 384,
+ "k": 10,
+ "queries": 2000,
+ "all_threads": 32,
+ "exps": [
+  "core"
+ ],
+ "started": "2026-11-16 08:57:19",
+ "mem_baseline": {
+  "rss_mb": 37.21875,
+  "peak_mb": 37.21875
+ },
+ "version": "isongraph-vector (python, repo HEAD)",
+ "build": {
+  "ingest_s": 0.18982440000399947,
+  "index_s": 2.700020559132099e-06,
+  "total_s": 0.1898271000245586,
+  "first_query_ms": 32.44519996223971,
+  "ready_s": 0.22227229998679832
+ },
+ "mem_after_build": {
+  "rss_mb": 71.58203125,
+  "peak_mb": 232.5390625
+ },
+ "mem_after_first_query": {
+  "rss_mb": 89.04296875,
+  "peak_mb": 232.5390625
+ },
+ "sweep": [
+  {
+   "nq": 2000,
+   "recall_queries": 2000,
+   "recall": 1.0,
+   "qps_1t_runs": [
+    2336.9320918560566,
+    2206.460009760146,
+    2201.8797907733897
+   ],
+   "qps_1t": 2206.460009760146,
+   "qps_1t_min": 2201.8797907733897,
+   "qps_1t_max": 2336.9320918560566,
+   "median_ms": 0.42050000047311187,
+   "p95_ms": 0.5032299901358784,
+   "p99_ms": 0.8731300116051017,
+   "mean_ms": 0.4450944997079205,
+   "knob": null
+  }
+ ],
+ "knob_name": null,
+ "loop_allthreads": {
+  "nq": 2000,
+  "threads": 32,
+  "qps": 3333.930658197846,
+  "median_ms": 0.2832000027410686,
+  "p95_ms": 0.400005019037053,
+  "p99_ms": 0.6143000209704041,
+  "mean_ms": 0.3009677502947549
+ },
+ "mem_after_sweep": {
+  "rss_mb": 90.64453125,
+  "peak_mb": 232.5390625
+ },
+ "ref_knob": null,
+ "ref_recall_pre": 1.0,
+ "mem_end": {
+  "rss_mb": 85.28125,
+  "peak_mb": 232.5390625
+ },
+ "status": "ok",
+ "finished": "2026-11-16 08:57:24",
+ "load_before_pct": 5.9937500000000075,
+ "load_contaminated": false,
+ "wall_s": 4.94828724861145,
+ "flag": null
+}

@@ -1,0 +1,37 @@
+{
+ "python": "3.12.7",
+ "platform": "Windows-11-10.0.26300-SP0",
+ "cpu_model": "Intel(R) Core(TM) i9-14900HX",
+ "cpu_cores": 24,
+ "cpu_logical": 32,
+ "ram_gb": 47.7,
+ "note": "i9-14900HX is a hybrid CPU (8 P-cores with SMT + 16 E-cores); single-thread loops are not pinned to a core type",
+ "packages": {
+  "numpy": "2.5.5",
+  "faiss-cpu": "1.16.0",
+  "hnswlib": "0.8.0",
+  "usearch": "2.26.6",
+  "chromadb": "1.5.9",
+  "qdrant-client": "1.20.0",
+  "lancedb": "0.41.0",
+  "sqlite-vec": "0.1.9",
+  "pyarrow": "26.0.1",
+  "threadpoolctl": "3.8.0",
+  "psutil": "7.2.2"
+ },
+ "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+ "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)",
+ "rust_build": "cargo build --release --example competitive_bench (default flags = baseline x86-64) and RUSTFLAGS='-C target-cpu=native'",
+ "msvc": [
+  "Microsoft (R) C/C++ Optimizing Compiler Version 19.41.34123 for x64"
+ ],
+ "cpp_build": "cl /std:c++17 /O2 /EHsc /MD /DNDEBUG (default SSE2) and the same with /arch:AVX2",
+ "dotnet": "8.0.403",
+ "node": "v24.18.0",
+ "sqlite3": "3.45.3",
+ "numpy_blas": "{'name': 'scipy-openblas', 'found': True, 'version': '0.3.34.237.2', 'detection method': 'pkgconfig', 'include directory': 'C:/Users/runneradmin/AppData/Local/Temp/cibw-run-4tkbs59h/cp312-win_amd64/build/venv/Lib/site-packages/scipy_openblas64/include', 'lib directory': 'C:/Users/runneradmin/AppData/Local/Temp/cibw-run-4tkbs59h/cp312-win_amd64/build/venv/Lib/site-packages/scipy_openblas64/lib', 'openblas configuration': 'OpenBLAS 0.3.34.237.2  USE64BITINT DYNAMIC_ARCH NO_AFFINITY SkylakeX MAX_THREADS=24', 'pc file directory': 'D:/a/numpy-release/numpy-release/.openblas'}",
+ "faiss_avx": [
+  "avx2",
+  "sse4"
+ ]
+}

@@ -1,0 +1,8 @@
+{
+ "dataset": "hotpotqa",
+ "model": "bge",
+ "corpus_size": 14570,
+ "n_questions": 1500,
+ "lib_similarity_search_same_top20_set": "200/200",
+ "seconds": 68.6482903957367
+}

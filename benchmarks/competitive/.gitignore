@@ -1,0 +1,4 @@
+# Large captured console output and the discarded first (unpinned) run stay local
+results/raw/*.stdout.txt
+results/archive_unpinned/
+__pycache__/

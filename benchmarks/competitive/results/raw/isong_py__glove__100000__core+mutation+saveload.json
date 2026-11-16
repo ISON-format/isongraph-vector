@@ -1,0 +1,135 @@
+{
+ "system": "isong_py",
+ "ds": "glove",
+ "n": 100000,
+ "d": 100,
+ "k": 10,
+ "queries": 2000,
+ "all_threads": 32,
+ "exps": [
+  "core",
+  "mutation",
+  "saveload"
+ ],
+ "started": "2026-11-16 08:25:25",
+ "mem_baseline": {
+  "rss_mb": 35.02734375,
+  "peak_mb": 35.02734375
+ },
+ "version": "isongraph-vector (python, repo HEAD)",
+ "build": {
+  "ingest_s": 0.9344128000084311,
+  "index_s": 2.400018274784088e-06,
+  "total_s": 0.9344152000267059,
+  "first_query_ms": 179.07509999349713,
+  "ready_s": 1.113490300020203,
+  "total_s_runs": [
+   0.9344152000267059,
+   0.9137653000070713,
+   0.9312418999616057
+  ]
+ },
+ "mem_after_build": {
+  "rss_mb": 111.9140625,
+  "peak_mb": 199.09765625
+ },
+ "mem_after_first_query": {
+  "rss_mb": 194.46484375,
+  "peak_mb": 199.09765625
+ },
+ "sweep": [
+  {
+   "nq": 1462,
+   "recall_queries": 1462,
+   "recall": 1.0,
+   "qps_1t_runs": [
+    470.57277024090325,
+    487.232330096314,
+    468.2267177290404
+   ],
+   "qps_1t": 470.57277024090325,
+   "qps_1t_min": 468.2267177290404,
+   "qps_1t_max": 487.232330096314,
+   "median_ms": 1.9831500248983502,
+   "p95_ms": 2.7151750109624118,
+   "p99_ms": 4.885184983140761,
+   "mean_ms": 2.1043987691772332,
+   "knob": null
+  }
+ ],
+ "knob_name": null,
+ "loop_allthreads": {
+  "nq": 2000,
+  "threads": 32,
+  "qps": 733.8303687431866,
+  "median_ms": 1.276099996175617,
+  "p95_ms": 1.7859099782072008,
+  "p99_ms": 3.2207130180904646,
+  "mean_ms": 1.3543596997818288
+ },
+ "mem_after_sweep": {
+  "rss_mb": 195.34375,
+  "peak_mb": 199.09765625
+ },
+ "ref_knob": null,
+ "ref_recall_pre": 1.0,
+ "mutation": {
+  "ref_knob": null,
+  "recall_before": 1.0,
+  "insert_10k": {
+   "seconds": 0.12977739999769256,
+   "per_s": 77055.01882591115,
+   "batch": 1000
+  },
+  "update_10k": {
+   "seconds": 0.1261600000434555,
+   "per_s": 79264.42609825241,
+   "batch": 1000
+  },
+  "delete_10k": {
+   "seconds": 0.11555340001359582,
+   "per_s": 86540.07583354031,
+   "batch": 1000
+  },
+  "mem_after": {
+   "rss_mb": 217.94921875,
+   "peak_mb": 339.4375
+  },
+  "first_query_after_ms": 3.411400015465915,
+  "after": {
+   "nq": 1133,
+   "recall_queries": 1133,
+   "recall": 1.0,
+   "qps_1t_runs": [
+    368.6149218486817,
+    362.15402827025093,
+    359.13217803847925
+   ],
+   "qps_1t": 362.15402827025093,
+   "qps_1t_min": 359.13217803847925,
+   "qps_1t_max": 368.6149218486817,
+   "median_ms": 2.634999982547015,
+   "p95_ms": 3.3076899824663992,
+   "p99_ms": 4.197101996978744,
+   "mean_ms": 2.7528681083551927
+  },
+  "recall_after": 1.0
+ },
+ "saveload": {
+  "save_s": 4.347207100014202,
+  "disk_mb": 215.12163829803467,
+  "load_s": 3.3704436999978498,
+  "first_query_after_load_ms": 173.42160001862794,
+  "time_to_ready_s": 3.5438653000164777
+ },
+ "mem_end": {
+  "rss_mb": 205.3046875,
+  "peak_mb": 1124.09765625
+ },
+ "status": "ok",
+ "finished": "2026-11-16 08:26:04",
+ "load_before_pct": 4.871874999999999,
+ "load_contaminated": false,
+ "wall_s": 38.56782865524292,
+ "flag": null
+}

@@ -1,0 +1,118 @@
+{
+ "system": "sqlite_vec",
+ "ds": "text384",
+ "n": 1000000,
+ "d": 384,
+ "k": 10,
+ "queries": 2000,
+ "all_threads": 32,
+ "exps": [
+  "core",
+  "mutation"
+ ],
+ "started": "2026-11-16 09:49:32",
+ "mem_baseline": {
+  "rss_mb": 37.296875,
+  "peak_mb": 37.296875
+ },
+ "version": "sqlite-vec 0.1.9 / sqlite 3.45.3",
+ "build": {
+  "ingest_s": 9.600988200050779,
+  "index_s": 1.9999570213258266e-06,
+  "total_s": 9.6009902000078,
+  "first_query_ms": 942.8271999931894,
+  "ready_s": 10.54381740000099
+ },
+ "mem_after_build": {
+  "rss_mb": 41.10546875,
+  "peak_mb": 99.70703125
+ },
+ "mem_after_first_query": {
+  "rss_mb": 41.140625,
+  "peak_mb": 99.70703125
+ },
+ "sweep": [
+  {
+   "nq": 30,
+   "recall_queries": 30,
+   "recall": 1.0,
+   "qps_1t_runs": [
+    1.0509534128538331
+   ],
+   "qps_1t": 1.0509534128538331,
+   "qps_1t_min": 1.0509534128538331,
+   "qps_1t_max": 1.0509534128538331,
+   "median_ms": 946.5698999993037,
+   "p95_ms": 988.4569849993568,
+   "p99_ms": 990.9356639964972,
+   "mean_ms": 951.5169633300198,
+   "knob": null
+  }
+ ],
+ "knob_name": null,
+ "loop_allthreads": {
+  "nq": 30,
+  "threads": 32,
+  "qps": 1.0638727873009715,
+  "median_ms": 937.6317000424024,
+  "p95_ms": 963.8271150091896,
+  "p99_ms": 971.6743419924751,
+  "mean_ms": 939.9620066765541
+ },
+ "mem_after_sweep": {
+  "rss_mb": 42.5234375,
+  "peak_mb": 99.70703125
+ },
+ "ref_knob": null,
+ "ref_recall_pre": 1.0,
+ "mutation": {
+  "ref_knob": null,
+  "recall_before": 1.0,
+  "insert_10k": {
+   "seconds": 0.1939520000014454,
+   "per_s": 51559.14865495316,
+   "batch": 1000
+  },
+  "update_10k": {
+   "seconds": 10.536050499998964,
+   "per_s": 949.122254112296,
+   "batch": 1000
+  },
+  "delete_10k": {
+   "seconds": 8.067454600008205,
+   "per_s": 1239.5483452723527,
+   "batch": 1000
+  },
+  "mem_after": {
+   "rss_mb": 72.34765625,
+   "peak_mb": 99.70703125
+  },
+  "first_query_after_ms": 957.5068000121973,
+  "after": {
+   "nq": 30,
+   "recall_queries": 30,
+   "recall": 1.0,
+   "qps_1t_runs": [
+    1.0352260402141704
+   ],
+   "qps_1t": 1.0352260402141704,
+   "qps_1t_min": 1.0352260402141704,
+   "qps_1t_max": 1.0352260402141704,
+   "median_ms": 963.0893999710679,
+   "p95_ms": 991.10578498221,
+   "p99_ms": 993.1055910210125,
+   "mean_ms": 965.972609994545
+  },
+  "recall_after": 1.0
+ },
+ "mem_end": {
+  "rss_mb": 38.8984375,
+  "peak_mb": 99.70703125
+ },
+ "status": "ok",
+ "finished": "2026-11-16 09:51:55",
+ "load_before_pct": 4.396875,
+ "load_contaminated": false,
+ "wall_s": 142.72977542877197,
+ "flag": null
+}
