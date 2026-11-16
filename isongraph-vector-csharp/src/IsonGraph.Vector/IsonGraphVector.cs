@@ -381,7 +381,7 @@ public sealed class ExportedEmbeddings
 /// <summary>
 /// In-memory embedding storage with brute-force cosine similarity search.
 /// </summary>
-public sealed class EmbeddingStore
+public sealed partial class EmbeddingStore
 {
     private readonly Dictionary<string, EmbeddingRecord> _embeddings = new();
     private readonly object _lock = new();
@@ -392,6 +392,19 @@ public sealed class EmbeddingStore
     private Dictionary<string, int>? _modelsCache;
     private readonly HashSet<string> _warnedMismatch = new();
     private IReadOnlyDictionary<string, string> _lastImportMeta = new Dictionary<string, string>();
+
+    // Opt-in approximate index (see AnnMode). _ivf is built lazily by the first
+    // search that qualifies, kept current by Put/Remove/Clear, and never saved.
+    private readonly AnnMode _ann;
+    private readonly int? _annNlist;
+    private int? _annNprobe;
+    private readonly int _annMinSize;
+    private readonly int _annSeed;
+    private IvfIndex? _ivf;
+    private long _annApproximate, _annExact, _annWidened, _annBuilds;
+
+    /// <summary>Below this many vectors the index is not used by default.</summary>
+    public const int DefaultAnnMinSize = 50_000;
 
     /// <param name="encoder">Encoder used when a text is added or queried without a vector.</param>
     /// <param name="version">
@@ -404,15 +417,68 @@ public sealed class EmbeddingStore
     /// "unknown"/"provided" never trigger it, and vector queries are never
     /// checked.
     /// </param>
+    /// <param name="ann">
+    /// <see cref="AnnMode.None"/> (default) keeps search exact, exactly as it
+    /// always was. <see cref="AnnMode.Ivf"/> answers bounded top-k searches
+    /// from an in-memory IVF-flat index: vectors are clustered into
+    /// <paramref name="annNlist"/> cells and only the <paramref name="annNprobe"/>
+    /// cells nearest the query are scored. It is approximate - a true neighbour
+    /// in an unprobed cell is missed - so measure it with
+    /// <see cref="RecallCheck(IEnumerable{float[]}, int, string?, float)"/>. The
+    /// index is built lazily by the first search, never persisted, and kept
+    /// current through writes and deletes. It holds its own contiguous copy of
+    /// the vectors (about the size of the vectors again).
+    /// </param>
+    /// <param name="annNlist">Cells in the index. Null picks about 4 * sqrt(N) when it is built.</param>
+    /// <param name="annNprobe">
+    /// Cells scanned per query. Null picks about 5% of nlist. More cells = higher
+    /// recall, slower; nprobe &gt;= nlist is the exact scan. Adjustable later via
+    /// <see cref="AnnNprobe"/>.
+    /// </param>
+    /// <param name="annMinSize">Below this many vectors search stays exact. Default 50,000.</param>
+    /// <param name="annSeed">Seed for the k-means initialisation, so the same data gives the same index.</param>
     public EmbeddingStore(
         IEmbeddingEncoder? encoder = null,
         string? version = null,
-        ModelMismatchMode onModelMismatch = ModelMismatchMode.Warn)
+        ModelMismatchMode onModelMismatch = ModelMismatchMode.Warn,
+        AnnMode ann = AnnMode.None,
+        int? annNlist = null,
+        int? annNprobe = null,
+        int annMinSize = DefaultAnnMinSize,
+        int annSeed = 0)
     {
         CheckMode(onModelMismatch);
+        if (!Enum.IsDefined(ann))
+            throw new ArgumentOutOfRangeException(nameof(ann), ann, "unknown AnnMode");
+        if (annNlist is < 1)
+            throw new ArgumentOutOfRangeException(nameof(annNlist), annNlist, "annNlist must be >= 1");
+        if (annNprobe is < 1)
+            throw new ArgumentOutOfRangeException(nameof(annNprobe), annNprobe, "annNprobe must be >= 1");
+        if (annMinSize < 0)
+            throw new ArgumentOutOfRangeException(nameof(annMinSize), annMinSize, "annMinSize must be >= 0");
         _encoder = encoder;
         _version = version;
         _onModelMismatch = onModelMismatch;
+        _ann = ann;
+        _annNlist = annNlist;
+        _annNprobe = annNprobe;
+        _annMinSize = annMinSize;
+        _annSeed = annSeed;
+    }
+
+    /// <summary>The approximate index in use, or <see cref="AnnMode.None"/> for exact search.</summary>
+    public AnnMode Ann => _ann;
+
+    /// <summary>Cells scanned per query; null means automatic (about 5% of nlist).</summary>
+    public int? AnnNprobe
+    {
+        get { lock (_lock) return _annNprobe; }
+        set
+        {
+            if (value is < 1)
+                throw new ArgumentOutOfRangeException(nameof(value), value, "AnnNprobe must be >= 1");
+            lock (_lock) _annNprobe = value;
+        }
     }
 
     private static void CheckMode(ModelMismatchMode mode)
@@ -662,8 +728,10 @@ public sealed class EmbeddingStore
     private string Put(NodeRef nodeRef, string text, float[] vector, string model)
     {
         var key = Key(nodeRef);
-        _embeddings[key] = new EmbeddingRecord(key, nodeRef, vector, text, model);
+        var record = new EmbeddingRecord(key, nodeRef, vector, text, model);
+        _embeddings[key] = record;
         _modelsCache = null;
+        _ivf?.Put(record);
         return key;
     }
 
@@ -705,7 +773,10 @@ public sealed class EmbeddingStore
         lock (_lock)
         {
             _modelsCache = null;
-            return _embeddings.Remove(Key(nodeRef));
+            var key = Key(nodeRef);
+            bool removed = _embeddings.Remove(key);
+            if (removed) _ivf?.Drop(key);
+            return removed;
         }
     }
 
@@ -730,20 +801,48 @@ public sealed class EmbeddingStore
         {
             _embeddings.Clear();
             _modelsCache = null;
+            _ivf = null;
             if (resetDimension) _dimension = null;
         }
     }
 
+    /// <summary>
+    /// Find the most similar embeddings to a text query.
+    ///
+    /// With an approximate index (<see cref="Ann"/>) a bounded <paramref name="topK"/>
+    /// on a store of at least the minimum size is answered from the index
+    /// (scores are the same cosine values, but a true neighbour in an unprobed
+    /// cell can be missing). <paramref name="exact"/> forces the full scan.
+    /// </summary>
+    /// <param name="query">Query text.</param>
+    /// <param name="topK">Number of results (null returns every match).</param>
+    /// <param name="nodeType">Keep only embeddings of this node type.</param>
+    /// <param name="threshold">Minimum similarity.</param>
+    /// <param name="exact">Skip the approximate index and scan everything (no effect without one).</param>
     public IReadOnlyList<SimilarityResult> SimilaritySearch(
-        string query, int? topK = 10, string? nodeType = null, float threshold = 0.0f)
-        => SimilaritySearchVector(ResolveQuery(query), topK, nodeType, threshold);
+        string query, int? topK = 10, string? nodeType = null, float threshold = 0.0f, bool exact = false)
+        => SimilaritySearchVector(ResolveQuery(query), topK, nodeType, threshold, exact);
 
+    /// <summary>Find the most similar embeddings to a query vector; see <see cref="SimilaritySearch"/>.</summary>
     public IReadOnlyList<SimilarityResult> SimilaritySearchVector(
-        float[] queryVector, int? topK = 10, string? nodeType = null, float threshold = 0.0f)
+        float[] queryVector, int? topK = 10, string? nodeType = null, float threshold = 0.0f,
+        bool exact = false)
     {
         lock (_lock)
         {
             CheckQuery(queryVector);
+
+            if (_ann != AnnMode.None)
+            {
+                if (exact || topK is null || topK <= 0)
+                    _annExact++;
+                else
+                {
+                    var answer = AnnSearch(queryVector, topK.Value, nodeType, threshold);
+                    if (answer is not null) return answer;
+                    _annExact++;
+                }
+            }
 
             var results = new List<SimilarityResult>();
             foreach (var record in _embeddings.Values)
@@ -977,6 +1076,11 @@ public sealed class SemanticGraph
     /// <param name="directed">Whether edges are directed.</param>
     /// <param name="version">Encoder/model version recorded in the sidecar (default: the encoder's own Version).</param>
     /// <param name="onModelMismatch">What a text search does when the encoder's model differs from the stored vectors' model.</param>
+    /// <param name="ann">Opt-in approximate index for the graph's embedding store (see <see cref="EmbeddingStore"/>); default is exact search.</param>
+    /// <param name="annNlist">Cells in the index; null picks about 4 * sqrt(N).</param>
+    /// <param name="annNprobe">Cells scanned per query; null picks about 5% of nlist.</param>
+    /// <param name="annMinSize">Below this many vectors search stays exact.</param>
+    /// <param name="annSeed">Seed for the k-means initialisation.</param>
     public SemanticGraph(
         string name = "semantic_graph",
         IEmbeddingEncoder? encoder = null,
@@ -984,11 +1088,16 @@ public sealed class SemanticGraph
         IEnumerable<string>? embedFields = null,
         bool directed = true,
         string? version = null,
-        ModelMismatchMode onModelMismatch = ModelMismatchMode.Warn)
+        ModelMismatchMode onModelMismatch = ModelMismatchMode.Warn,
+        AnnMode ann = AnnMode.None,
+        int? annNlist = null,
+        int? annNprobe = null,
+        int annMinSize = EmbeddingStore.DefaultAnnMinSize,
+        int annSeed = 0)
     {
         _graph = new ISONGraph(name, directed);
         _view = new ReadOnlyGraphView(_graph);
-        _store = new EmbeddingStore(encoder, version, onModelMismatch);
+        _store = new EmbeddingStore(encoder, version, onModelMismatch, ann, annNlist, annNprobe, annMinSize, annSeed);
         _autoEmbed = autoEmbed;
         _embedFields = (embedFields ?? DefaultEmbedFields).ToList();
     }
@@ -1184,14 +1293,48 @@ public sealed class SemanticGraph
     /// With a gate the store cannot truncate first: the best k unfiltered
     /// matches may all be filtered out, so every match is scored, filtered, and
     /// only then cut to k.
+    ///
+    /// With the store's approximate index (<paramref name="ann"/> given) the
+    /// candidates are the probed cells only. If fewer than k of them pass the
+    /// gate, the probe is widened (4x each step) and the search retried,
+    /// ending in the exact scan, so a selective filter costs time rather than
+    /// results.
     /// </summary>
     private IReadOnlyList<SimilarityResult> SeedSearch(
-        Func<int?, IReadOnlyList<SimilarityResult>> search, int? topK, Func<NodeRef, bool>? gate)
+        Func<int?, IReadOnlyList<SimilarityResult>> search, int? topK, Func<NodeRef, bool>? gate,
+        Func<long, (IEnumerable<SimilarityResult> Ranked, bool Approximate)>? ann = null)
     {
         if (gate is null) return search(topK);
-        var passing = search(null).Where(r => gate(r.NodeRef)).ToList();
-        return topK is null ? passing : passing.Take(Math.Max(topK.Value, 0)).ToList();
+        if (ann is null || topK is not > 0)
+        {
+            var passing = search(null).Where(r => gate(r.NodeRef)).ToList();
+            return topK is null ? passing : passing.Take(Math.Max(topK.Value, 0)).ToList();
+        }
+
+        int limit = topK.Value;
+        for (long scale = 1; ; scale *= 4)
+        {
+            var (ranked, approximate) = ann(scale);
+            // Best first, and stop as soon as k have passed: the gate (a user
+            // callback that may touch the graph) runs on the matches that are
+            // needed, not on every stored vector.
+            var results = new List<SimilarityResult>();
+            foreach (var result in ranked)
+            {
+                if (!gate(result.NodeRef)) continue;
+                results.Add(result);
+                if (results.Count >= limit) break;
+            }
+            if (!approximate || results.Count >= limit) return results;
+        }
     }
+
+    /// <summary>The widening search for <see cref="SeedSearch"/>, or null when the store has no index in play.</summary>
+    private Func<long, (IEnumerable<SimilarityResult>, bool)>? AnnRanked(
+        float[] queryVector, string? nodeType, float threshold, bool exact = false) =>
+        _store.Ann == AnnMode.None || exact
+            ? null
+            : scale => _store.RankedForGate(queryVector, nodeType, threshold, scale);
 
     /// <summary>
     /// Search by embedding similarity.
@@ -1209,13 +1352,35 @@ public sealed class SemanticGraph
     /// Keep only nodes whose type is in this collection (combines with
     /// nodeType and nodeFilter by AND; empty matches nothing).
     /// </param>
+    /// <param name="exact">
+    /// Force the full scan even when the graph was created with an approximate
+    /// index (<c>ann</c>); no effect otherwise.
+    /// </param>
     public IReadOnlyList<SimilarityResult> SimilaritySearch(
         string query, int? topK = 10, string? nodeType = null, float threshold = 0.0f,
-        Func<Node, bool>? nodeFilter = null, IEnumerable<string>? nodeTypes = null)
+        Func<Node, bool>? nodeFilter = null, IEnumerable<string>? nodeTypes = null, bool exact = false)
     {
         var gate = NodeGate(nodeFilter, nodeTypes);
-        return SeedSearch(k => _store.SimilaritySearch(query, k, nodeType, threshold), topK, gate);
+        if (gate is null)
+            return _store.SimilaritySearch(query, topK, nodeType, threshold, exact);
+        var queryVector = _store.EncodeQuery(query);
+        return SeedSearch(
+            k => _store.SimilaritySearchVector(queryVector, k, nodeType, threshold, exact), topK, gate,
+            AnnRanked(queryVector, nodeType, threshold, exact));
     }
+
+    /// <summary>
+    /// Recall@k of the approximate index against the exact scan, over text
+    /// queries (see <see cref="EmbeddingStore.RecallCheck(IEnumerable{float[]}, int, string?, float)"/>).
+    /// </summary>
+    public RecallReport RecallCheck(
+        IEnumerable<string> queries, int k = 10, string? nodeType = null, float threshold = 0.0f) =>
+        _store.RecallCheck(queries, k, nodeType, threshold);
+
+    /// <summary>Recall@k over query vectors.</summary>
+    public RecallReport RecallCheck(
+        IEnumerable<float[]> queries, int k = 10, string? nodeType = null, float threshold = 0.0f) =>
+        _store.RecallCheck(queries, k, nodeType, threshold);
 
     /// <summary>
     /// Find nodes semantically closest to one already in the graph.
@@ -1317,9 +1482,12 @@ public sealed class SemanticGraph
             if (scores.Count == 0) return Array.Empty<SemanticSearchResult>();
         }
 
+        // With blend the scan above already scored every node, so the seeds come
+        // from the exact scan, never the approximate index (as in the Python port).
+        bool exactSeeds = options.Blend > 0f;
         var seeds = SeedSearch(
-            k => _store.SimilaritySearchVector(queryVector, k, null, options.Threshold),
-            options.TopKSeeds, gate);
+            k => _store.SimilaritySearchVector(queryVector, k, null, options.Threshold, exactSeeds),
+            options.TopKSeeds, gate, AnnRanked(queryVector, null, options.Threshold, exactSeeds));
         if (seeds.Count == 0) return Array.Empty<SemanticSearchResult>();
 
         float Combined(float baseScore, string key) =>
@@ -1468,7 +1636,14 @@ public sealed class SemanticGraph
         var gate = NodeGate(nodeFilter, nodeTypes);
         if (gate is not null && !gate(targetRef)) return null;
 
-        var seeds = SeedSearch(k => _store.SimilaritySearch(query, k, null, threshold), topKSeeds, gate);
+        float[]? pathQuery = null;
+        if (gate is not null && _store.Ann != AnnMode.None) pathQuery = _store.EncodeQuery(query);
+        var seeds = SeedSearch(
+            k => pathQuery is null
+                ? _store.SimilaritySearch(query, k, null, threshold)
+                : _store.SimilaritySearchVector(pathQuery, k, null, threshold),
+            topKSeeds, gate,
+            pathQuery is null ? null : AnnRanked(pathQuery, null, threshold));
 
         SemanticSearchResult? best = null;
         foreach (var seed in seeds)
@@ -1845,6 +2020,14 @@ public sealed class SemanticGraph
     /// Receives warnings raised while loading and afterwards; null sends them to
     /// standard error.
     /// </param>
+    /// <param name="ann">
+    /// Opt-in approximate index for the loaded graph's store. Nothing about it
+    /// is saved or loaded: the index is built lazily from the loaded vectors.
+    /// </param>
+    /// <param name="annNlist">Cells in the index; null picks about 4 * sqrt(N).</param>
+    /// <param name="annNprobe">Cells scanned per query; null picks about 5% of nlist.</param>
+    /// <param name="annMinSize">Below this many vectors search stays exact.</param>
+    /// <param name="annSeed">Seed for the k-means initialisation.</param>
     /// <exception cref="GraphEmbeddingMismatchException">Digest mismatch with <see cref="GraphMismatchMode.Error"/>.</exception>
     public static SemanticGraph Load(
         string path,
@@ -1855,7 +2038,12 @@ public sealed class SemanticGraph
         GraphMismatchMode onMismatch = GraphMismatchMode.Error,
         string? version = null,
         ModelMismatchMode onModelMismatch = ModelMismatchMode.Warn,
-        Action<string>? onWarning = null)
+        Action<string>? onWarning = null,
+        AnnMode ann = AnnMode.None,
+        int? annNlist = null,
+        int? annNprobe = null,
+        int annMinSize = EmbeddingStore.DefaultAnnMinSize,
+        int annSeed = 0)
     {
         if (!Enum.IsDefined(onMismatch))
             throw new ArgumentOutOfRangeException(nameof(onMismatch), onMismatch, "unknown GraphMismatchMode");
@@ -1866,7 +2054,8 @@ public sealed class SemanticGraph
         var loaded = isonl ? ISONGraph.FromIsonl(graphText, name) : ISONGraph.FromIson(graphText, name);
 
         var graph = new SemanticGraph(
-            loaded.Name, encoder, autoEmbed, embedFields, loaded.Directed, version, onModelMismatch);
+            loaded.Name, encoder, autoEmbed, embedFields, loaded.Directed, version, onModelMismatch,
+            ann, annNlist, annNprobe, annMinSize, annSeed);
         if (onWarning is not null) graph._store.Warning += onWarning;
 
         foreach (var node in loaded.Nodes())
