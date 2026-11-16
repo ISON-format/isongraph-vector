@@ -11,10 +11,13 @@ question below.
 |---|---|
 | `retrieval_quality.py` | Does graph-aware retrieval (`semantic_multi_hop`, `semantic_subgraph`) recover the *supporting* context a question needs, compared with plain vector top-k, and at what cost in nodes? |
 | `scale.py` | How do latency, ingestion, write-after-read cost, memory and concurrent use behave from 1k to 1M vectors, and where does the exact linear scan stop being acceptable? |
+| `ann.py` | What does the opt-in approximate (IVF) index buy at 100k and 1M vectors, in recall@10, latency, build time and memory, and does it survive writes and deletes? |
 
 Sample outputs (all committed under `results/`): `retrieval_quality.{md,json}`,
 `retrieval_quality_st.{md,json}` (sentence-transformers), `scale.{md,json}`
-(1k/10k/100k plus concurrency) and `scale_1M.{md,json}` (10k/100k/1M).
+(1k/10k/100k plus concurrency) and `scale_1M.{md,json}` (10k/100k/1M, the
+pre-optimisation baseline), `scale_1M_after.{md,json}` (the same 1M run after the
+exact-path optimisation) and `ann.{md,json}` / `ann_1M.{md,json}` (the approximate index).
 
 ## Running
 
@@ -27,6 +30,8 @@ python benchmarks/scale.py                         # 1k/10k/100k, both backends,
 python benchmarks/scale.py --quick                 # 1k and 10k
 python benchmarks/scale.py --max-n 1000000         # adds 1M: ~10 minutes, ~9 GB RAM peak
 python benchmarks/scale.py --sizes 10000,100000,1000000 --max-n 1000000 --skip-concurrency --out-prefix benchmarks/results/scale_1M
+python benchmarks/ann.py                           # approximate index, 20k and 100k, two data regimes: ~6 min
+python benchmarks/ann.py --include-1m --sizes 1000000 --no-drift --out-prefix benchmarks/results/ann_1M   # ~10 GB RAM, ~15 min
 ```
 
 Both write `<prefix>.md` and `<prefix>.json` (default under `benchmarks/results/`;
@@ -228,13 +233,41 @@ deletes) instead of discarding it. Re-run at the default sizes (numpy backend,
 | 4 readers, reads/s (20k) | 86 | 1,345 |
 | 2 readers + 4 writers, reads/s (20k) | 15 | 1,202 |
 
-Search is now about 1.25x the bare numpy floor instead of about 17x, so (extrapolating, not measured) the
+Search is now about 1.25x the bare numpy floor instead of about 17x, so (extrapolating) the
 exact scan's 50 ms crossover moves from roughly 90,000 vectors to roughly
-1,000,000 on this machine. The 1M run was not repeated after the change; the
-ANN conclusion in finding 3 (not warranted below ~50k, worth evaluating above
-a few hundred thousand) should be re-measured at 1M before acting on it.
+1,000,000 on this machine. **Update: that has since been measured** (see
+"1M re-run after the optimisation" below): the crossover is confirmed at about
+960,000. The ANN conclusion in finding 3 has been re-measured too (section 3).
 Scores can differ from the old path by one float32 ulp (about 1e-7), which can
 swap the order of two results whose scores were already that close.
+
+#### 1M re-run after the optimisation
+
+`results/scale_1M_after.{md,json}` repeats the 1M run (10k/100k/1M, concurrency
+skipped) once, with the same script and machine as `scale_1M.{md,json}` (the
+baseline, kept). Numpy backend at 1M:
+
+| metric | baseline | now |
+|---|---|---|
+| `similarity_search`, ms (p95) | 664 (2,143) | **52.0** (55.3) |
+| bare matmul + argpartition floor, ms | 49 | 38.6 |
+| `semantic_multi_hop`, ms | 2,128 | 44.3 |
+| `multi_hop` with `blend=0.3`, ms | 994 | 707 |
+| `semantic_subgraph`, ms | 2,320 | 346 |
+| first query (cache build), s | 5.8 | 3.8 |
+| search right after one write, ms | 5,251 | 49.9 |
+| ingest, vectors/s | 85,764 | 84,062 |
+| peak RSS growth, MB | 9,075 | 5,996 |
+
+The sqlite-vec series did not change (348 ms at 1M against 893 ms before; run
+to run noise on that backend is large). The fitted 50 ms crossover for the numpy
+scan is now **about 960,000 vectors** (interpolated between the 100k and 1M
+measurements; the 1M median itself is 52 ms), against 90,000 before. So the
+extrapolated claim "roughly 1,000,000" holds: it was off by about 4%, and the
+floor (the bare matmul) reaches 50 ms at about 1.3M. Two things remain slow at
+1M: `blend > 0` (707 ms: `score_map` builds a Python dict over every node, and
+it is not touched by the index) and `semantic_subgraph` (346 ms, it iterates
+every edge).
 
 ### Findings
 
@@ -285,6 +318,96 @@ swap the order of two results whose scores were already that close.
    falling to 86k and 23k per second at 1M. A 1M-vector load takes 12 s and
    44 s respectively, plus about 6 s for the first query to build the snapshot.
 
+## 3. Approximate index (`ann.py`)
+
+`EmbeddingStore(ann="ivf")` (numpy only, off by default) is an IVF-flat index:
+spherical k-means into `nlist` cells (about `4*sqrt(N)` when automatic), then a
+query scores only the `nprobe` cells nearest to it (about 5% of the cells when
+automatic) with the same cosine formula as the exact scan, and the best k of
+those rows are returned. Vectors are not copied. `ann.py` measures what that
+buys and costs. Unlike `scale.py` it uses **clustered** synthetic vectors,
+because an IVF index's recall depends entirely on cluster structure (on uniform
+random 384-d vectors it has none to exploit and would say nothing):
+
+| regime | construction | what it stands for |
+|---|---|---|
+| `clustered` | N/100 Gaussian clusters; same-cluster cosine about 0.5, different-cluster about 0 | distinct topics: the easy case |
+| `diffuse` | N/40 clusters grouped into 20 overlapping super-topics; same-cluster cosine about 0.2, same super-topic about 0.1 | a hard, overlapping case where the 10 nearest neighbours straddle cells |
+
+Queries are fresh draws from the same distribution (not stored vectors), 200 per
+cell, warm single-thread medians, top_k = 10, 384-d. Recall@10 is the overlap of
+the approximate and exact top-10 sets. Raw tables: `results/ann.md` (20k and
+100k, with the index under writes) and `results/ann_1M.md` (1M, run once).
+
+### Results (same machine as above, a shared machine, one run each)
+
+| N | regime | exact scan | build | nprobe=1 | automatic nprobe (5% of cells) | smallest nprobe in the sweep reaching recall >= 0.99 |
+|---|---|---|---|---|---|---|
+| 100k | clustered | 4.6 ms | 1.4 s | recall 0.948, 0.29 ms (16x) | recall 1.000, 1.22 ms (3.8x) | 2 cells (0.2%): 0.997, 0.22 ms (21x) |
+| 100k | diffuse | 5.0 ms | 1.4 s | recall 0.229, 0.26 ms (19x) | recall 0.987, 1.23 ms (4.1x) | 128 cells (10%): 0.996, 2.2 ms (2.3x) |
+| 1M | clustered | 53.7 ms | 23.3 s | recall 0.977, 0.33 ms (163x) | recall 0.997, 11.4 ms (4.7x) | 8 cells (0.2%): 0.990, 0.87 ms (62x) |
+| 1M | diffuse | 48.2 ms | 23.7 s | recall 0.030, 0.64 ms (75x) | recall 0.994, 24.3 ms (2.0x) | 200 cells (5%): 0.994, 24 ms (2.0x) |
+
+(Intermediate points from the sweep tables: 1M diffuse nprobe 64 = 1.6% of cells
+gives recall 0.704 at 11.8 ms and 128 = 3.2% gives 0.930 at 16.6 ms; 100k diffuse
+nprobe 32 gives 0.876 at 0.86 ms.)
+
+### Findings
+
+1. **Recall is a property of your data, not of the index.** At identical settings
+   recall@10 ranged from 0.03 to 0.98 at nprobe=1 depending only on the regime,
+   and the cost of reaching 0.99 ranged from 0.2% of the cells to 5-10%.
+   Clustered, topic-like data is where this works well; data whose neighbours
+   straddle cell boundaries needs a large nprobe, and then the saving is small.
+   There is no setting that is good in general. `recall_check(queries, k)` runs
+   your queries both ways and reports recall; use it on your own data and raise
+   `ann_nprobe` until the number you need holds.
+2. **The saving is smaller than the fraction of rows scanned.** Scanning 5% of
+   a 1M-vector store costs about 20-50% of the exact scan, not 5%: the exact
+   scan is one multithreaded sequential matrix product (about 0.05 us per row),
+   while the index gathers its candidate rows from scattered places in the
+   1.5 GB matrix on one thread (about 0.22 us per row at both 100k and 1M).
+   Layout work (a cell-contiguous copy of the vectors, which doubles their
+   memory, and/or a threaded scan) would recover some of it; neither is done.
+   One real trap found along the way: gathering the candidates in a single
+   fancy-index copy was 5-7x slower than doing it in blocks of about 384 KB
+   (page-faulting the fresh copy dominated); the implementation blocks.
+3. **Where it starts to pay off.** Up to about 100k vectors the exact scan is
+   4-5 ms and the index saves at most a few ms while risking recall; it is not
+   worth enabling. The exact scan reaches 50 ms at about 1M vectors (section
+   2), and that is where the index becomes worth it: with clear cluster
+   structure it is 20-160x faster at recall 0.98-0.99 (1M clustered, nprobe
+   1-8); with hard data it is only about 2-3x faster at recall 0.93-0.99. `ann_min_size` defaults to 50,000 so
+   a small store is never approximated, but that is a floor, not a
+   recommendation.
+4. **Build time and memory.** Built lazily by the first search (or
+   `build_ann_index()`): 1.4 s at 100k and about 23 s at 1M (nlist 4000), during
+   which the first query blocks. The index itself is small: 2.7 MB at 100k and
+   14 MB at 1M (about 1% of the 1.5 GB of vectors, since vectors are not
+   copied), and building needs a transient 0.22 GB (100k) to 0.56 GB (1M) on top.
+5. **Writes and deletes.** The index follows the incremental cache instead of
+   being rebuilt. At 100k with the automatic nprobe, +1% new vectors and -1%
+   deletes (new rows scored exactly while "pending") left recall at 1.000
+   (clustered) and 0.986 (diffuse) against 1.000 and 0.987 before, at +0.1 ms (the
+   1,000 pending rows are scanned exactly on every query); a
+   further +2% was folded into cells with the same recall. Pushing churn past
+   50% of the trained size (+60% more vectors) retrains on the next search: that
+   query took 2.2-2.4 s at 100k (0.5 s at 20k); the retrain at 1M would be
+   longer than the 23 s build and was not measured. Recall after the retrain
+   matched (1.000 and 0.986). Retraining blocks the query that triggers it;
+   call `build_ann_index(force=True)` at a quiet moment to choose when.
+6. **Filters.** `node_type`, `threshold` and `node_filter` are applied to the
+   probed rows. If fewer than `top_k` survive, the probe widens 4x per step and
+   past half the cells the exact scan answers. A rare type or a selective filter
+   therefore costs time instead of returning a short list; the tests cover it.
+   Not benchmarked here.
+
+Not evaluated: real embeddings and real queries, concurrent read load
+(everything is single-threaded and serialised on the store's lock), the
+retrain at 1M, and hnswlib. An HNSW graph typically beats IVF-flat on
+recall at a given latency; it was not added because it needs a dependency and
+the pure-numpy index stays the default.
+
 ## Caveats (please read before quoting numbers)
 
 * **Everything is synthetic.** Retrieval quality uses a generated graph and a
@@ -301,8 +424,9 @@ swap the order of two results whose scores were already that close.
   smallest budget; larger real answers would score lower for every method.
 * Scale uses random vectors (no cluster structure, so no recall measurement).
   Exact-search latency does not depend on the data distribution, so those
-  numbers transfer; an ANN index's recall/latency tradeoff would not, and
-  nothing here evaluates one. The recommendations about ANN are extrapolation.
+  numbers transfer; an ANN index's recall/latency tradeoff would not, which is
+  why `ann.py` (section 3) uses clustered vectors and says so. The ANN numbers
+  are synthetic too.
 * **Timings vary run to run on a shared machine.** Other processes were
   using the machine while these were collected; numpy `similarity_search` at
   100k measured 30 ms in an ad hoc check, 54-70 ms in repeated runs, and 142 ms
