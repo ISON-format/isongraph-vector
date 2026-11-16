@@ -33,7 +33,9 @@ Usage:
 Dependencies:
     - ison-graph (required)
     - sentence-transformers (required for SentenceTransformerEncoder)
-    - numpy (optional; vectorizes similarity search, orders of magnitude faster)
+    - numpy (optional; vectorizes similarity search, orders of magnitude faster;
+      also needed by the optional approximate index, ann="ivf")
+    - HttpEncoder needs nothing beyond the standard library
 
 Author: Mahesh Vaikri
 Version: 1.0.0
@@ -47,7 +49,12 @@ import struct
 import hashlib
 import heapq
 import json
+import math
 import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 import warnings
 from collections import deque
@@ -77,6 +84,12 @@ except ImportError:  # pragma: no cover - covered by installs without sqlite-vec
 
 #: Virtual table holding the vec0 index, alongside the `embeddings` table.
 VEC_TABLE = "vec_embeddings"
+
+# Approximate (IVF) index policy; see EmbeddingStore._ann_index.
+_ANN_MIN_SIZE = 50_000          # below this the exact scan is used
+_ANN_FOLD_MIN = 512             # fold pending rows into cells at >= this many ...
+_ANN_FOLD_FRACTION = 0.02       # ... and at least this fraction of the indexed rows
+_ANN_RETRAIN_FRACTION = 0.5     # retrain once writes+deletes exceed this x trained size
 
 __version__ = "1.0.0"
 __author__ = "Mahesh Vaikri"
@@ -348,6 +361,278 @@ class MockEncoder(EmbeddingEncoder):
         return [self.encode(t) for t in texts]
 
 
+class HttpEncoderError(EmbeddingError):
+    """
+    An embedding endpoint could not be reached, refused the request, or sent
+    back something that is not a usable embedding response.
+
+    ``status`` is the HTTP status when there was one, else None. The message
+    never contains the API key (it is scrubbed even if the server echoes it)
+    or the query string / credentials of the URL.
+    """
+
+    def __init__(self, message: str, status: Optional[int] = None):
+        super().__init__(message)
+        self.status = status
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects: urllib would forward the Authorization header to the
+    new host and turn the POST into a GET, silently dropping the texts."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class HttpEncoder(EmbeddingEncoder):
+    """
+    Embeddings from an HTTP endpoint, with no dependency beyond the standard
+    library (``urllib``).
+
+    Speaks the two request shapes that cover most servers. Both are a POST of
+    ``{"model": model, "input": [texts]}``; they differ in the reply:
+
+    * ``api="openai"`` - OpenAI and the many compatible servers (vLLM, LM
+      Studio, LiteLLM, text-embeddings-inference, ...): the reply carries
+      ``data[i].embedding``, ordered by each entry's ``index``.
+    * ``api="ollama"`` - Ollama's ``/api/embed``: the reply carries
+      ``embeddings``, one vector per input, in order.
+
+    ``url`` is the complete endpoint, e.g. ``https://api.openai.com/v1/embeddings``
+    or ``http://localhost:11434/api/embed``.
+
+    **Texts leave your machine.** Every text you embed - node properties,
+    queries - is sent to ``url``. Point this only at a service you trust with
+    that data. ``http://`` URLs send it, and the API key, unencrypted.
+    Redirects are refused, so the key and the texts are never forwarded to a
+    host you did not name.
+
+    ``encode_batch`` sends ``batch_size`` texts per request. A request that
+    gets 429 or a 5xx reply is retried up to ``retries`` more times with a
+    short doubling pause; nothing else is retried (a connection failure, a
+    4xx, a malformed reply raise at once).
+
+    Failures raise :class:`HttpEncoderError` (with ``status`` for HTTP
+    errors) or, when a vector is not the length ``dimension`` promised or
+    the vectors of one reply disagree, :class:`DimensionMismatchError`.
+
+    ``dimension`` is optional. Given, it is checked against every reply and
+    reading it costs nothing. Omitted, it is learned from the first reply;
+    reading ``dimension`` before any text was encoded sends one short probe
+    request.
+
+    ``model_name`` is ``model``; ``version`` is whatever you pass (an endpoint
+    does not report one), and is recorded in the embeddings sidecar.
+    """
+
+    #: Statuses worth another attempt.
+    RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+    #: First pause between attempts, in seconds; doubles each retry.
+    RETRY_BACKOFF = 0.5
+    #: Refuse replies larger than this many bytes.
+    MAX_RESPONSE_BYTES = 256 * 1024 * 1024
+
+    def __init__(
+        self,
+        url: str,
+        model: str,
+        api_key: Optional[str] = None,
+        dimension: Optional[int] = None,
+        batch_size: int = 64,
+        timeout: float = 30,
+        headers: Optional[Dict[str, str]] = None,
+        api: str = "openai",
+        version: Optional[str] = None,
+        retries: int = 2,
+    ):
+        """
+        Args:
+            url: Full endpoint URL (``http://`` or ``https://``).
+            model: Model name sent in the request; becomes ``model_name``.
+            api_key: Sent as ``Authorization: Bearer <key>`` when given.
+            dimension: Expected vector length (validated on every reply).
+            batch_size: Texts per request in :meth:`encode_batch`.
+            timeout: Seconds per request.
+            headers: Extra request headers (these win over the defaults,
+                     including ``Authorization``).
+            api: ``"openai"`` or ``"ollama"`` (reply format).
+            version: Free-form model version recorded in the sidecar.
+            retries: Extra attempts after a 429/5xx reply (0 disables).
+
+        Raises:
+            ValueError: bad ``url``, ``api``, ``batch_size``, ``timeout``,
+                        ``dimension`` or ``retries``
+        """
+        if not isinstance(url, str):
+            raise ValueError("url must be a string")
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme not in ("http", "https") or not parts.netloc:
+            raise ValueError(f"url must be an http:// or https:// URL, got {self._safe_url(url)!r}")
+        if not model or not isinstance(model, str):
+            raise ValueError("model must be a non-empty string")
+        if api not in ("openai", "ollama"):
+            raise ValueError(f"api must be 'openai' or 'ollama', got {api!r}")
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+            raise ValueError(f"batch_size must be an integer >= 1, got {batch_size!r}")
+        if not timeout or timeout <= 0:
+            raise ValueError(f"timeout must be positive, got {timeout!r}")
+        if dimension is not None and (isinstance(dimension, bool) or not isinstance(dimension, int)
+                                      or dimension < 1):
+            raise ValueError(f"dimension must be a positive integer, got {dimension!r}")
+        if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
+            raise ValueError(f"retries must be an integer >= 0, got {retries!r}")
+        self.url = url
+        self.model_name = model
+        self.api = api
+        self.version = version
+        self.batch_size = batch_size
+        self.timeout = timeout
+        self.retries = retries
+        self._api_key = api_key or None
+        self._dimension = dimension
+        self._headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if self._api_key:
+            self._headers["Authorization"] = f"Bearer {self._api_key}"
+        self._headers.update(headers or {})
+        self._opener = urllib.request.build_opener(_NoRedirect)
+
+    def __repr__(self) -> str:
+        return (f"HttpEncoder(url={self._safe_url(self.url)!r}, model={self.model_name!r}, "
+                f"api={self.api!r})")
+
+    # -- public interface -----------------------------------------------------
+
+    @property
+    def dimension(self) -> int:
+        if self._dimension is None:
+            self.encode("dimension probe")           # learns it from the reply
+        return self._dimension
+
+    def encode(self, text: str) -> List[float]:
+        return self.encode_batch([text])[0]
+
+    def encode_batch(self, texts: List[str]) -> List[List[float]]:
+        texts = list(texts)
+        for text in texts:
+            if not isinstance(text, str):
+                raise TypeError(f"texts must be strings, got {type(text).__name__}")
+        out: List[List[float]] = []
+        for start in range(0, len(texts), self.batch_size):
+            out.extend(self._request(texts[start:start + self.batch_size]))
+        return out
+
+    # -- internals ------------------------------------------------------------
+
+    @staticmethod
+    def _safe_url(url: str) -> str:
+        """The URL without credentials or query string."""
+        try:
+            parts = urllib.parse.urlsplit(url)
+            host = parts.hostname or ""
+            if parts.port:
+                host += f":{parts.port}"
+            return f"{parts.scheme}://{host}{parts.path}"
+        except ValueError:
+            return "<unparseable url>"
+
+    def _scrub(self, text: str) -> str:
+        if self._api_key:
+            text = text.replace(self._api_key, "***")
+        return text
+
+    def _fail(self, message: str, status: Optional[int] = None) -> HttpEncoderError:
+        return HttpEncoderError(self._scrub(f"{message} ({self._safe_url(self.url)})"), status)
+
+    def _post(self, payload: bytes) -> bytes:
+        """POST once, returning the body; raises HttpEncoderError."""
+        request = urllib.request.Request(
+            self.url, data=payload, headers=self._headers, method="POST")
+        try:
+            with self._opener.open(request, timeout=self.timeout) as response:
+                body = response.read(self.MAX_RESPONSE_BYTES + 1)
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = exc.read(300).decode("utf-8", "replace").strip()
+            except Exception:  # noqa: BLE001 - the status is what matters
+                detail = ""
+            exc.close()
+            if 300 <= exc.code < 400:
+                raise self._fail(
+                    f"embedding endpoint answered HTTP {exc.code} (a redirect; "
+                    f"redirects are not followed - use the final URL)", exc.code) from None
+            message = f"embedding endpoint returned HTTP {exc.code}"
+            if detail:
+                message += f": {detail}"
+            raise self._fail(message, exc.code) from None
+        except (urllib.error.URLError, OSError) as exc:
+            reason = getattr(exc, "reason", exc)
+            raise self._fail(f"could not reach the embedding endpoint: {reason}") from None
+        if len(body) > self.MAX_RESPONSE_BYTES:
+            raise self._fail("embedding response is larger than the allowed maximum")
+        return body
+
+    def _request(self, texts: List[str]) -> List[List[float]]:
+        if not texts:
+            return []
+        payload = json.dumps({"model": self.model_name, "input": texts}).encode("utf-8")
+        attempt = 0
+        while True:
+            try:
+                body = self._post(payload)
+                break
+            except HttpEncoderError as exc:
+                if exc.status in self.RETRY_STATUSES and attempt < self.retries:
+                    time.sleep(self.RETRY_BACKOFF * (2 ** attempt))
+                    attempt += 1
+                    continue
+                raise
+        return self._parse(body, len(texts))
+
+    def _parse(self, body: bytes, expected: int) -> List[List[float]]:
+        try:
+            doc = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            raise self._fail("embedding response is not valid JSON") from None
+        if not isinstance(doc, dict):
+            raise self._fail("embedding response is not a JSON object")
+
+        if self.api == "ollama":
+            rows = doc.get("embeddings")
+            if not isinstance(rows, list):
+                raise self._fail("response has no 'embeddings' list (is this an Ollama /api/embed URL?)")
+            vectors = rows
+        else:
+            data = doc.get("data")
+            if not isinstance(data, list):
+                raise self._fail("response has no 'data' list (is this an OpenAI-style embeddings URL?)")
+            if not all(isinstance(item, dict) and "embedding" in item for item in data):
+                raise self._fail("response 'data' entries have no 'embedding'")
+            if all("index" in item for item in data):
+                indexes = [item["index"] for item in data]
+                if sorted(indexes) != list(range(len(data))):
+                    raise self._fail("response 'data' indexes are not 0..n-1")
+                data = sorted(data, key=lambda item: item["index"])
+            vectors = [item["embedding"] for item in data]
+
+        if len(vectors) != expected:
+            raise self._fail(
+                f"endpoint returned {len(vectors)} embeddings for {expected} texts")
+        out: List[List[float]] = []
+        for i, vector in enumerate(vectors):
+            if (not isinstance(vector, list) or not vector or not all(
+                    isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+                    for x in vector)):
+                raise self._fail(f"embedding {i} is not a non-empty list of finite numbers")
+            if self._dimension is None:
+                self._dimension = len(vector)
+            elif len(vector) != self._dimension:
+                raise DimensionMismatchError(
+                    f"embedding {i} from the endpoint has {len(vector)} dimensions, "
+                    f"expected {self._dimension} ({self._safe_url(self.url)})")
+            out.append([float(x) for x in vector])
+        return out
+
+
 # =============================================================================
 # Embedding Store
 # =============================================================================
@@ -395,7 +680,7 @@ class _ScanCache:
     """
 
     __slots__ = ('refs', 'types', 'texts', 'vectors', 'matrix', 'norms',
-                 'n', 'dead', 'alive', 'codes', 'code_of', 'pos')
+                 'n', 'dead', 'alive', 'codes', 'code_of', 'pos', 'ivf')
 
     def __init__(self, refs, types, texts, vectors, matrix, norms):
         self.refs = refs
@@ -410,6 +695,201 @@ class _ScanCache:
         self.codes = None
         self.code_of = None
         self.pos = None
+        self.ivf = None          # optional approximate index (see _IVFIndex)
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) or (
+        _np is not None and isinstance(value, _np.number))
+
+
+def _median(values: List[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    return ordered[mid] if len(ordered) % 2 else 0.5 * (ordered[mid - 1] + ordered[mid])
+
+
+class _IVFIndex:
+    """
+    Inverted-file ("IVF-flat") index over a numpy :class:`_ScanCache`.
+
+    Spherical k-means partitions the rows into ``nlist`` cells by direction,
+    which is what cosine similarity compares. A query scores the ``nprobe``
+    cells whose centroids are nearest and only the rows inside them, with the
+    same cosine formula the exact scan uses. The vectors are not copied: the
+    index is a per-row cell number (``assign``) plus the rows grouped by cell
+    (``order``/``offsets``), about 8 bytes per vector plus the centroids.
+
+    It follows the cache it belongs to instead of being rebuilt on every
+    write:
+
+    * a **new** or **updated** row is *pending*: it has no cell (``assign``
+      is -1) and every query scores the pending rows exactly, so a write is
+      visible immediately and costs the index nothing;
+    * pending rows are folded into their nearest cell in one matrix product
+      once there are enough of them (see ``EmbeddingStore._ann_index``);
+    * a **delete** just clears the row's cell (the cache has already
+      tombstoned it); stale entries in ``order`` are skipped at query time;
+    * the cache's compaction remaps row numbers, and :meth:`compact` carries
+      the cells across without retraining;
+    * ``churn`` counts every write and delete since the centroids were
+      trained; the store retrains when it passes a fraction of the trained
+      size, because the centroids then describe data that is gone.
+
+    All of it runs under the store's lock.
+    """
+
+    __slots__ = ('centroids', 'nlist', 'assign', 'order', 'offsets',
+                 'pending', 'churn', 'trained_n', 'build_seconds')
+
+    def __init__(self, centroids, assign, trained_n, build_seconds):
+        self.centroids = centroids
+        self.nlist = centroids.shape[0]
+        self.assign = assign                  # int32 per row slot, -1 = not in a cell
+        self.order = None
+        self.offsets = None
+        self.pending = set()                  # live rows with no cell yet
+        self.churn = 0
+        self.trained_n = trained_n
+        self.build_seconds = build_seconds
+
+    # -- construction -------------------------------------------------------
+
+    @staticmethod
+    def _unit(rows, norms):
+        """Rows scaled to unit length (a zero row stays zero)."""
+        safe = _np.where(norms > 0, norms, 1.0).astype(_np.float32)
+        return rows / safe[:, None]
+
+    @staticmethod
+    def _nearest(unit_rows, centroids):
+        """Index of the most similar centroid for each unit row, chunked."""
+        m = unit_rows.shape[0]
+        out = _np.empty(m, dtype=_np.int32)
+        step = max(1024, (1 << 24) // max(1, centroids.shape[0]))   # <= ~64 MB of scores
+        ct = centroids.T
+        for start in range(0, m, step):
+            out[start:start + step] = (unit_rows[start:start + step] @ ct).argmax(axis=1)
+        return out
+
+    @classmethod
+    def build(cls, cache, nlist: int, seed: int, iters: int = 8) -> '_IVFIndex':
+        """Train centroids on a sample, then assign every live row."""
+        started = time.perf_counter()
+        n = cache.n
+        live = _np.flatnonzero(cache.alive[:n])
+        total = live.size
+        nlist = max(1, min(int(nlist), total))
+        rng = _np.random.default_rng(seed)
+        sample_n = min(total, 40 * nlist)
+        sample = live if sample_n == total else _np.sort(
+            rng.choice(live, sample_n, replace=False))
+        x = cls._unit(cache.matrix[sample], cache.norms[sample])
+        dim = x.shape[1]
+        centroids = x[rng.choice(sample_n, nlist, replace=False)].copy()
+        xt = _np.ascontiguousarray(x.T)       # column sums as bincounts over rows
+        for _ in range(iters):
+            cell = cls._nearest(x, centroids)
+            counts = _np.bincount(cell, minlength=nlist)
+            sums = _np.empty((nlist, dim), dtype=_np.float64)
+            for j in range(dim):
+                sums[:, j] = _np.bincount(cell, weights=xt[j], minlength=nlist)
+            centroids = sums.astype(_np.float32)
+            length = _np.linalg.norm(centroids, axis=1)
+            empty = (counts == 0) | (length == 0)
+            if empty.any():                   # re-seed dead centroids on random points
+                centroids[empty] = x[rng.choice(sample_n, int(empty.sum()), replace=True)]
+                length = _np.linalg.norm(centroids, axis=1)
+            centroids /= _np.where(length > 0, length, 1.0).astype(_np.float32)[:, None]
+        del xt, x
+
+        assign = _np.full(cache.matrix.shape[0], -1, dtype=_np.int32)
+        step = max(1024, (1 << 24) // nlist)
+        for start in range(0, n, step):
+            stop = min(n, start + step)
+            assign[start:stop] = cls._nearest(
+                cls._unit(cache.matrix[start:stop], cache.norms[start:stop]), centroids)
+        assign[:n][~cache.alive[:n]] = -1
+        index = cls(centroids, assign, total, 0.0)
+        index.relist(n)
+        index.build_seconds = time.perf_counter() - started
+        return index
+
+    def relist(self, n: int) -> None:
+        """Regroup the rows by cell (a stable sort of ``assign``)."""
+        cells = self.assign[:n]
+        rows = _np.flatnonzero(cells >= 0)
+        picked = cells[rows]
+        self.order = rows[_np.argsort(picked, kind='stable')].astype(_np.int32)
+        counts = _np.bincount(picked, minlength=self.nlist)
+        self.offsets = _np.concatenate(([0], _np.cumsum(counts)))
+
+    def fold(self, cache) -> None:
+        """Give every pending row its nearest cell and regroup."""
+        if self.pending:
+            ids = _np.fromiter(sorted(self.pending), dtype=_np.int64, count=len(self.pending))
+            self.assign[ids] = self._nearest(
+                self._unit(cache.matrix[ids], cache.norms[ids]), self.centroids)
+            self.pending.clear()
+        self.relist(cache.n)
+
+    # -- incremental upkeep ---------------------------------------------------
+
+    def note_put(self, i: int, capacity: int) -> None:
+        if i >= self.assign.shape[0]:
+            grown = _np.full(max(capacity, i + 1), -1, dtype=_np.int32)
+            grown[:self.assign.shape[0]] = self.assign
+            self.assign = grown
+        self.assign[i] = -1
+        self.pending.add(i)
+        self.churn += 1
+
+    def note_drop(self, i: int) -> None:
+        if i < self.assign.shape[0]:
+            self.assign[i] = -1
+        self.pending.discard(i)
+        self.churn += 1
+
+    def compact(self, live, kept: int) -> None:
+        """Follow the cache's compaction (``live`` = old slots kept, in order)."""
+        moved = self.assign[live]
+        self.assign[:kept] = moved
+        self.assign[kept:] = -1
+        if self.pending:
+            old = _np.fromiter(sorted(self.pending), dtype=_np.int64, count=len(self.pending))
+            self.pending = set(_np.searchsorted(live, old).tolist())
+        self.relist(kept)
+
+    def nbytes(self) -> int:
+        total = self.centroids.nbytes + self.assign.nbytes
+        if self.order is not None:
+            total += self.order.nbytes + self.offsets.nbytes
+        return total
+
+
+@dataclass
+class RecallReport:
+    """
+    Recall of the approximate index against the exact scan, over some queries.
+
+    ``recall`` is the mean over queries of ``|approximate top-k & exact
+    top-k| / |exact top-k|`` (1.0 = identical sets); ``min_recall`` is the
+    worst single query. ``approximate`` is False when the index was not
+    actually consulted (it is off, the store is smaller than
+    ``ann_min_size``, or ``nprobe >= nlist``), in which case recall is 1.0
+    by construction. Times are per-query medians, in milliseconds.
+    """
+    recall: float
+    min_recall: float
+    queries: int
+    k: int
+    nlist: int
+    nprobe: int
+    approximate: bool
+    ann_ms: float
+    exact_ms: float
 
 
 class EmbeddingStore:
@@ -417,9 +897,12 @@ class EmbeddingStore:
     SQLite-backed embedding storage with similarity search.
 
     Brute-force cosine similarity, vectorized through numpy when it is
-    installed and falling back to a pure-Python loop when it is not. There is
-    no ANN index: this is built for an application's own knowledge graph, not
-    as a vector-database replacement.
+    installed and falling back to a pure-Python loop when it is not. Search
+    is exact by default. For stores past a few hundred thousand vectors an
+    opt-in approximate index (``ann="ivf"``, numpy only) trades a little
+    recall for much lower latency; see the ``ann`` argument. This is built
+    for an application's own knowledge graph, not as a vector-database
+    replacement.
 
     Thread-safe: every operation is serialized on a re-entrant lock, and the
     connection is opened with ``check_same_thread=False`` so a web request
@@ -437,7 +920,12 @@ class EmbeddingStore:
         dimension: Optional[int] = None,
         sqlite_vec: bool = False,
         version: Optional[str] = None,
-        on_model_mismatch: str = "warn"
+        on_model_mismatch: str = "warn",
+        ann: Optional[str] = None,
+        ann_nlist: Optional[int] = None,
+        ann_nprobe: Optional[int] = None,
+        ann_min_size: int = _ANN_MIN_SIZE,
+        ann_seed: int = 0
     ):
         """
         Initialize embedding store.
@@ -465,16 +953,59 @@ class EmbeddingStore:
                  :class:`ModelMismatchError`) or ``"ignore"``. Vectors whose
                  model is ``"unknown"``/``"provided"`` never trigger it.
                  Vector queries are never checked.
+            ann: ``None`` (default) keeps search exact, bit-for-bit as it
+                 always was. ``"ivf"`` answers bounded top-k searches
+                 (``top_k`` not None) from an in-memory IVF-flat index:
+                 vectors are clustered into ``ann_nlist`` cells and only the
+                 ``ann_nprobe`` cells nearest the query are scored. Needs
+                 numpy. It is *approximate*: a true neighbour in an
+                 unprobed cell is missed - measure it with
+                 :meth:`recall_check`. The index is built lazily on the
+                 first search, never persisted, and kept current through
+                 writes and deletes (see the "Approximate search" section of
+                 the README for the exact policy). Not combinable with
+                 ``sqlite_vec=True``.
+            ann_nlist: Cells in the index. ``None`` (default) picks about
+                 ``4 * sqrt(N)`` when the index is built.
+            ann_nprobe: Cells scanned per query. ``None`` (default) picks
+                 about 5% of ``nlist``. More cells = higher recall, slower;
+                 ``nprobe >= nlist`` is the exact scan. Adjustable later via
+                 the ``ann_nprobe`` property.
+            ann_min_size: Below this many vectors the index is not used and
+                 search stays exact (an index only pays off on large
+                 stores). Default 50,000.
+            ann_seed: Seed for the k-means initialisation, so the same data
+                 gives the same index.
 
         Raises:
             EmbeddingError: sqlite_vec=True but the package is not installed
-                            or the extension cannot be loaded
-            ValueError: on_model_mismatch is not one of the three modes
+                            or the extension cannot be loaded; ann requested
+                            without numpy
+            ValueError: on_model_mismatch is not one of the three modes, or
+                        an ann argument is invalid
         """
         if on_model_mismatch not in ("warn", "error", "ignore"):
             raise ValueError(
                 f"on_model_mismatch must be 'warn', 'error' or 'ignore', "
                 f"got {on_model_mismatch!r}")
+        if ann is not None:
+            if ann != "ivf":
+                raise ValueError(f"ann must be None or 'ivf', got {ann!r}")
+            if _np is None:
+                raise EmbeddingError("ann='ivf' needs numpy: pip install numpy")
+            if sqlite_vec:
+                raise ValueError("ann='ivf' and sqlite_vec=True are alternatives; pick one")
+        for label, value, floor in (("ann_nlist", ann_nlist, 1), ("ann_nprobe", ann_nprobe, 1),
+                                    ("ann_min_size", ann_min_size, 0)):
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int)
+                                      or value < floor):
+                raise ValueError(f"{label} must be an integer >= {floor}, got {value!r}")
+        self._ann = ann
+        self._ann_nlist = ann_nlist
+        self._ann_nprobe = ann_nprobe
+        self._ann_min_size = ann_min_size
+        self._ann_seed = int(ann_seed)
+        self._ann_counts = {"approximate": 0, "exact": 0, "widened": 0, "builds": 0}
         self.db_path = str(db_path)
         self.encoder = encoder
         self._version = version
@@ -501,6 +1032,23 @@ class EmbeddingStore:
     def sqlite_vec(self) -> bool:
         """Whether top-k search is answered from the sqlite-vec index."""
         return self._sqlite_vec
+
+    @property
+    def ann(self) -> Optional[str]:
+        """The approximate index in use (``"ivf"``), or None for exact search."""
+        return self._ann
+
+    @property
+    def ann_nprobe(self) -> Optional[int]:
+        """Cells scanned per query; None means "automatic" (about 5% of nlist)."""
+        return self._ann_nprobe
+
+    @ann_nprobe.setter
+    def ann_nprobe(self, value: Optional[int]) -> None:
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int)
+                                  or value < 1):
+            raise ValueError(f"ann_nprobe must be an integer >= 1, got {value!r}")
+        self._ann_nprobe = value
 
     @property
     def version(self) -> Optional[str]:
@@ -1207,6 +1755,8 @@ class EmbeddingStore:
             cache.texts[i] = text
         matrix[i] = row
         cache.norms[i] = _np.linalg.norm(row.reshape(1, -1), axis=1)[0]
+        if cache.ivf is not None:
+            cache.ivf.note_put(i, matrix.shape[0])
 
     def _cache_drop(self, node_ref: NodeRef) -> None:
         """Mirror one deleted row into the cache. Caller holds the lock."""
@@ -1225,6 +1775,8 @@ class EmbeddingStore:
         cache.refs[i] = None
         cache.texts[i] = None
         cache.dead += 1
+        if cache.ivf is not None:
+            cache.ivf.note_drop(i)
         while cache.n and not cache.alive[cache.n - 1]:    # trailing tombstones
             cache.n -= 1
             cache.refs.pop()
@@ -1246,6 +1798,8 @@ class EmbeddingStore:
             cache.norms[start:end] = cache.norms[idx]
             cache.codes[start:end] = cache.codes[idx]
         kept = live.size
+        if cache.ivf is not None:
+            cache.ivf.compact(live, kept)
         cache.alive[:kept] = True
         cache.alive[kept:cache.n] = False
         order = live.tolist()
@@ -1381,11 +1935,19 @@ class EmbeddingStore:
             refs = cache.refs[:]
             texts = cache.texts[:]
 
+        return self._rank_stream(scores, refs, texts, hint)
+
+    @classmethod
+    def _rank_stream(cls, scores, refs, texts, hint: Optional[int]):
+        """Results in score order, ranked lazily in growing chunks.
+
+        ``scores`` (-inf = excluded) is aligned with ``refs``/``texts``.
+        """
         def chunks():
             k = max(64, 4 * hint) if hint else 64
             done = 0
             while True:
-                best = self._rank(scores, k)
+                best = cls._rank(scores, k)
                 for i in best[done:].tolist():
                     yield SimilarityResult(
                         node_ref=refs[i], score=float(scores[i]), text=texts[i])
@@ -1395,6 +1957,282 @@ class EmbeddingStore:
                 k *= 8
 
         return chunks()
+
+    # -- approximate (IVF) search -------------------------------------------
+
+    @staticmethod
+    def _ann_auto_nlist(n: int) -> int:
+        return int(min(max(round(4 * n ** 0.5), 16), 65536))
+
+    def _ann_index(self, cache) -> Optional[_IVFIndex]:
+        """The index for this cache, built or maintained as the policy says. Locked.
+
+        None means "answer exactly": ann is off, the cache is not the numpy
+        form, or the store holds fewer than ``ann_min_size`` vectors.
+
+        Policy:
+          * built lazily by the first search (never persisted), k-means on a
+            sample of up to 40 x nlist live vectors, then every row assigned;
+          * new and updated rows are scored exactly until at least
+            ``max(512, 2%)`` of the indexed rows are pending, then folded
+            into their nearest cell;
+          * deletes tombstone (nothing to do but skip them);
+          * once writes + deletes since training exceed 50% of the trained
+            size, the index is retrained from the current data - with an
+            automatic ``nlist``, re-chosen for the new size;
+          * a cleared store, a dimension change, or a store that shrinks
+            below ``ann_min_size`` drops the index with the cache.
+        """
+        if self._ann is None or cache.matrix is None:
+            return None
+        live = cache.n - cache.dead
+        if live < max(2, self._ann_min_size):
+            cache.ivf = None
+            return None
+        ivf = cache.ivf
+        if ivf is not None and ivf.churn > _ANN_RETRAIN_FRACTION * ivf.trained_n:
+            ivf = cache.ivf = None
+        if ivf is None:
+            nlist = self._ann_nlist or self._ann_auto_nlist(live)
+            ivf = cache.ivf = _IVFIndex.build(cache, nlist, self._ann_seed)
+            self._ann_counts["builds"] += 1
+        elif len(ivf.pending) >= max(_ANN_FOLD_MIN, _ANN_FOLD_FRACTION * ivf.trained_n):
+            ivf.fold(cache)
+        return ivf
+
+    def _ann_probe(self, ivf: _IVFIndex) -> int:
+        wanted = self._ann_nprobe or max(1, round(0.05 * ivf.nlist))
+        return min(wanted, ivf.nlist)
+
+    def _ann_scores(self, cache, ivf, query_vector, node_type, threshold, lists):
+        """Exact cosine scores for the rows in the ``lists`` cells nearest the query.
+
+        Pending rows are always included. Returns ``(rows, scores)`` with
+        ``rows`` ascending (so ties break in insertion order, as in the exact
+        scan) and ``scores`` -inf where a row is below ``threshold``; both
+        empty when nothing can match. None means "use the exact scan" (a zero
+        query has no direction to rank cells by).
+        """
+        query = _np.asarray(query_vector, dtype=_np.float32)
+        query_norm = float(_np.linalg.norm(query))
+        empty = (_np.empty(0, dtype=_np.int64), _np.empty(0, dtype=_np.float32))
+        if query_norm == 0.0:
+            return None
+        code = None
+        if node_type is not None:
+            code = cache.code_of.get(node_type)
+            if code is None:
+                return empty
+        if lists >= ivf.nlist:
+            chosen = range(ivf.nlist)
+        else:
+            chosen = _np.argpartition(-(ivf.centroids @ query), lists - 1)[:lists].tolist()
+        order, offsets = ivf.order, ivf.offsets
+        parts = [order[offsets[c]:offsets[c + 1]] for c in chosen
+                 if offsets[c + 1] > offsets[c]]
+        rows = _np.concatenate(parts).astype(_np.int64) if parts else empty[0]
+        rows = rows[ivf.assign[rows] >= 0]          # drop deleted / updated-since
+        if ivf.pending:
+            rows = _np.concatenate((rows, _np.fromiter(
+                ivf.pending, dtype=_np.int64, count=len(ivf.pending))))
+        rows.sort()
+        if code is not None:
+            rows = rows[cache.codes[rows] == code]
+        if rows.size == 0:
+            return empty
+        # Gather and multiply in blocks of about 384 KB: gathering the rows in
+        # one go (or in blocks over ~0.8 MB) is dominated by page-faulting the
+        # fresh copy, measured 5-7x slower than the same work in small blocks.
+        dots = _np.empty(rows.size, dtype=_np.float32)
+        block = max(16, 98304 // cache.matrix.shape[1])
+        for start in range(0, rows.size, block):
+            dots[start:start + block] = cache.matrix[rows[start:start + block]] @ query
+        denom = cache.norms[rows] * query_norm
+        scores = _np.zeros(rows.size, dtype=_np.float32)
+        with _np.errstate(divide='ignore', invalid='ignore'):
+            _np.divide(dots, denom, out=scores, where=denom > 0)
+        scores[scores.astype(_np.float64) < threshold] = -_np.inf
+        return rows, scores
+
+    def _ann_lists(self, ivf: _IVFIndex, scale: int) -> Optional[int]:
+        """Cells to probe at widening ``scale``; None = widened enough to just scan.
+
+        ``scale`` 1 honours ``nprobe`` as configured (``nprobe >= nlist`` is
+        the exact scan). Later steps multiply it by 4 and give up on the index
+        once they would touch half the cells, where scanning everything costs
+        about the same.
+        """
+        lists = self._ann_probe(ivf) * scale
+        if scale == 1:
+            return None if lists >= ivf.nlist else lists
+        return None if lists * 2 >= ivf.nlist else lists
+
+    def _ann_search(self, cache, query_vector, top_k, node_type, threshold):
+        """Top-k from the index, or None to fall back to the exact scan. Locked.
+
+        Filters (``node_type``, ``threshold``) apply to the probed rows. If
+        fewer than ``top_k`` survive, the probe is widened 4x and tried again,
+        and past half the cells the exact scan answers instead - so a rare
+        type or a high threshold costs time rather than silently returning a
+        short list.
+        """
+        ivf = self._ann_index(cache)
+        if ivf is None:
+            return None
+        scale = 1
+        while True:
+            lists = self._ann_lists(ivf, scale)
+            if lists is None:
+                return None
+            got = self._ann_scores(cache, ivf, query_vector, node_type, threshold, lists)
+            if got is None:
+                return None
+            rows, scores = got
+            if int(_np.count_nonzero(scores > -_np.inf)) >= top_k:
+                best = self._rank(scores, top_k)
+                refs, texts = cache.refs, cache.texts
+                self._ann_counts["approximate"] += 1
+                if scale > 1:
+                    self._ann_counts["widened"] += 1
+                return [SimilarityResult(node_ref=refs[r], score=sc, text=texts[r])
+                        for r, sc in zip(rows[best].tolist(), scores[best].tolist())]
+            scale *= 4
+
+    def _ranked_ann(self, query, node_type, threshold, hint, scale):
+        """Like :meth:`_ranked`, over the probed cells only: ``(iterator, approximate)``.
+
+        ``scale`` is the widening step (1, 4, 16, ...); None asks for the
+        exact scan. ``approximate`` is False when the answer is exact - the
+        caller has nothing left to widen to. Used by the node_filter path of
+        :meth:`SemanticGraph.similarity_search`, which widens until enough
+        candidates pass its filter.
+        """
+        if scale is not None:
+            with self._lock:
+                query_vector = self._resolve_query(query)
+                cache = self._ensure_cache()
+                ivf = self._ann_index(cache)
+                lists = None if ivf is None else self._ann_lists(ivf, scale)
+                got = (None if lists is None else self._ann_scores(
+                    cache, ivf, query_vector, node_type, threshold, lists))
+                if got is not None:
+                    rows, scores = got
+                    refs = [cache.refs[r] for r in rows.tolist()]
+                    texts = [cache.texts[r] for r in rows.tolist()]
+                    self._ann_counts["approximate"] += 1
+                    if scale > 1:
+                        self._ann_counts["widened"] += 1
+                    return self._rank_stream(scores, refs, texts, hint), True
+        return self._ranked(query, node_type, threshold, hint), False
+
+    def build_ann_index(self, force: bool = False) -> Dict[str, Any]:
+        """
+        Build the approximate index now instead of on the first search.
+
+        Returns :meth:`ann_stats`. ``force=True`` retrains even if an index
+        exists. Does nothing (and says so in the stats) while the store is
+        smaller than ``ann_min_size``.
+
+        Raises:
+            EmbeddingError: the store was created without ``ann``
+        """
+        if self._ann is None:
+            raise EmbeddingError("this store has no approximate index; create it with ann='ivf'")
+        with self._lock:
+            cache = self._ensure_cache()
+            if force and cache.ivf is not None:
+                cache.ivf = None
+            ivf = self._ann_index(cache)
+            if ivf is not None and ivf.pending:
+                ivf.fold(cache)
+            return self.ann_stats()
+
+    def ann_stats(self) -> Dict[str, Any]:
+        """
+        What the approximate index looks like right now.
+
+        Keys: ``enabled``, ``active`` (an index exists and will answer),
+        ``nlist``, ``nprobe``, ``trained_n``, ``pending`` (rows scored
+        exactly until folded), ``churn`` (writes + deletes since training),
+        ``build_seconds``, ``index_bytes`` (memory on top of the cached
+        vectors) and ``searches`` (counts of ``approximate``, ``widened``,
+        ``exact`` answers and ``builds``, since the store was created).
+        Never builds anything.
+        """
+        with self._lock:
+            cache = self._cache
+            ivf = cache.ivf if cache is not None else None
+            return {
+                "enabled": self._ann is not None,
+                "mode": self._ann,
+                "active": ivf is not None,
+                "nlist": ivf.nlist if ivf else None,
+                "nprobe": self._ann_probe(ivf) if ivf else self._ann_nprobe,
+                "trained_n": ivf.trained_n if ivf else None,
+                "pending": len(ivf.pending) if ivf else 0,
+                "churn": ivf.churn if ivf else 0,
+                "build_seconds": ivf.build_seconds if ivf else None,
+                "index_bytes": ivf.nbytes() if ivf else 0,
+                "min_size": self._ann_min_size,
+                "searches": dict(self._ann_counts),
+            }
+
+    def recall_check(
+        self,
+        queries: Union[str, Sequence[float], Iterable[Union[str, Sequence[float]]]],
+        k: int = 10,
+        node_type: Optional[str] = None,
+        threshold: float = 0.0
+    ) -> RecallReport:
+        """
+        Recall@k of the approximate index against the exact scan.
+
+        Runs every query both ways and compares the *sets* of top-k nodes.
+        ``queries`` is a sequence of texts or vectors (a single text or a
+        single flat vector is accepted too). Use real queries drawn from your
+        own workload: recall depends on how the data clusters, and a score
+        measured on unrelated queries or data does not transfer. Raise
+        ``ann_nprobe`` until the recall you need holds.
+
+        Without an index in use (``ann`` off, a store under ``ann_min_size``,
+        or ``nprobe >= nlist``) both answers are the exact scan, recall is
+        1.0 and ``approximate`` is False.
+        """
+        if isinstance(queries, str):
+            batch = [queries]
+        else:
+            if hasattr(queries, 'ndim') and getattr(queries, 'ndim') == 1:
+                queries = [queries]
+            batch = list(queries)
+            if batch and not isinstance(batch[0], str) and _is_number(batch[0]):
+                batch = [batch]
+        if k <= 0:
+            raise ValueError(f"k must be positive, got {k}")
+        recalls: List[float] = []
+        ann_times: List[float] = []
+        exact_times: List[float] = []
+        used = False
+        for query in batch:
+            before = self._ann_counts["approximate"]
+            started = time.perf_counter()
+            found = self.similarity_search(query, k, node_type, threshold)
+            ann_times.append(time.perf_counter() - started)
+            used = used or self._ann_counts["approximate"] > before
+            started = time.perf_counter()
+            truth = self.similarity_search(query, k, node_type, threshold, exact=True)
+            exact_times.append(time.perf_counter() - started)
+            if truth:
+                wanted = {r.node_ref for r in truth}
+                recalls.append(len({r.node_ref for r in found} & wanted) / len(wanted))
+        with self._lock:
+            ivf = self._cache.ivf if self._cache is not None else None
+            nlist = ivf.nlist if ivf else 0
+            nprobe = self._ann_probe(ivf) if ivf else (self._ann_nprobe or 0)
+        return RecallReport(
+            recall=sum(recalls) / len(recalls) if recalls else 1.0,
+            min_recall=min(recalls) if recalls else 1.0,
+            queries=len(batch), k=k, nlist=nlist, nprobe=nprobe, approximate=used,
+            ann_ms=1000.0 * _median(ann_times), exact_ms=1000.0 * _median(exact_times))
 
     def _sqlite_vec_search(
         self,
@@ -1446,7 +2284,8 @@ class EmbeddingStore:
         query: Union[str, Sequence[float]],
         top_k: Optional[int] = 10,
         node_type: Optional[str] = None,
-        threshold: float = 0.0
+        threshold: float = 0.0,
+        exact: bool = False
     ) -> List[SimilarityResult]:
         """
         Find most similar nodes by embedding.
@@ -1455,6 +2294,11 @@ class EmbeddingStore:
         virtual table; otherwise every stored vector is scored here. Asking for
         every match (top_k=None) always uses the scan - there is nothing for an
         index to narrow down.
+
+        With ``ann="ivf"`` a bounded top_k on a store of at least
+        ``ann_min_size`` vectors is answered from the approximate index
+        (scores are the same cosine values, but a true neighbour in an
+        unprobed cell can be missing). ``exact=True`` forces the full scan.
 
         With numpy the scan is one matrix-vector product over a cached float32
         matrix, a partition to find the k best, and a result object for each
@@ -1466,12 +2310,23 @@ class EmbeddingStore:
             top_k: Number of results to return (None returns every match)
             node_type: Filter by node type (optional)
             threshold: Minimum similarity score
+            exact: Skip the approximate index and scan everything (no effect
+                   unless the store was created with ``ann``)
 
         Returns:
             List of SimilarityResult sorted by score descending
         """
         with self._lock:
             query_vector = self._resolve_query(query)
+            if self._ann is not None:
+                if exact or top_k is None or top_k <= 0:
+                    self._ann_counts["exact"] += 1
+                else:
+                    cache = self._ensure_cache()
+                    answer = self._ann_search(cache, query_vector, top_k, node_type, threshold)
+                    if answer is not None:
+                        return answer
+                    self._ann_counts["exact"] += 1
 
             if self._sqlite_vec and top_k is not None and top_k > 0:
                 # A zero vector has no direction for cosine to measure; vec0
@@ -1735,7 +2590,12 @@ class SemanticGraph(ISONGraph):
         embed_fields: Optional[List[str]] = None,
         sqlite_vec: bool = False,
         version: Optional[str] = None,
-        on_model_mismatch: str = "warn"
+        on_model_mismatch: str = "warn",
+        ann: Optional[str] = None,
+        ann_nlist: Optional[int] = None,
+        ann_nprobe: Optional[int] = None,
+        ann_min_size: int = _ANN_MIN_SIZE,
+        ann_seed: int = 0
     ):
         """
         Initialize semantic graph.
@@ -1754,6 +2614,13 @@ class SemanticGraph(ISONGraph):
             on_model_mismatch: ``"warn"`` (default), ``"error"`` or
                      ``"ignore"``: what a text search does when the
                      encoder's model differs from the stored vectors' model
+            ann, ann_nlist, ann_nprobe, ann_min_size, ann_seed: the opt-in
+                     approximate (IVF) index of the embedding store; see
+                     :class:`EmbeddingStore`. Off by default. It speeds up
+                     the seed search of ``similarity_search``,
+                     ``similar_to_node`` and ``semantic_multi_hop`` (with
+                     ``blend=0``); ``blend > 0`` scores every node and stays
+                     exact.
         """
         super().__init__(name=name, directed=directed)
 
@@ -1766,7 +2633,12 @@ class SemanticGraph(ISONGraph):
             encoder=encoder,
             sqlite_vec=sqlite_vec,
             version=version,
-            on_model_mismatch=on_model_mismatch
+            on_model_mismatch=on_model_mismatch,
+            ann=ann,
+            ann_nlist=ann_nlist,
+            ann_nprobe=ann_nprobe,
+            ann_min_size=ann_min_size,
+            ann_seed=ann_seed
         )
 
         self.auto_embed = auto_embed
@@ -2044,7 +2916,8 @@ class SemanticGraph(ISONGraph):
         top_k: Optional[int],
         node_type: Optional[str],
         threshold: float,
-        gate: Optional[Callable[[NodeRef], bool]]
+        gate: Optional[Callable[[NodeRef], bool]],
+        exact: bool = False
     ) -> List[SimilarityResult]:
         """
         Top-k similarity search among the nodes that pass ``gate``.
@@ -2052,23 +2925,34 @@ class SemanticGraph(ISONGraph):
         With a gate the store cannot truncate first: the best k *unfiltered*
         matches may all be filtered out, so every match is scored, filtered,
         and only then cut to k.
+
+        With the store's approximate index the candidates are the probed
+        cells only. If fewer than k of them pass the gate, the probe is
+        widened (4x each step) and the search retried, ending in the exact
+        scan, so a selective filter costs time rather than results.
         """
+        store = self.embedding_store
         if gate is None:
-            return self.embedding_store.similarity_search(query, top_k, node_type, threshold)
-        ranked = self.embedding_store._ranked(query, node_type, threshold, hint=top_k)
+            return store.similarity_search(query, top_k, node_type, threshold, exact=exact)
         limit = None if top_k is None else max(top_k, 0)
-        results: List[SimilarityResult] = []
-        if limit == 0:
-            return results
-        # Best first, and stop as soon as k have passed: the gate (a user
-        # callback that may touch the graph) runs on the matches that are
-        # needed, not on every stored vector.
-        for result in ranked:
-            if gate(result.node_ref):
-                results.append(result)
-                if limit is not None and len(results) >= limit:
-                    break
-        return results
+        scale = 1 if (store.ann is not None and not exact and limit) else None
+        while True:
+            ranked, approximate = store._ranked_ann(
+                query, node_type, threshold, top_k, scale)
+            results: List[SimilarityResult] = []
+            if limit == 0:
+                return results
+            # Best first, and stop as soon as k have passed: the gate (a user
+            # callback that may touch the graph) runs on the matches that are
+            # needed, not on every stored vector.
+            for result in ranked:
+                if gate(result.node_ref):
+                    results.append(result)
+                    if limit is not None and len(results) >= limit:
+                        break
+            if not approximate or (limit is not None and len(results) >= limit):
+                return results
+            scale *= 4
 
     def similarity_search(
         self,
@@ -2077,7 +2961,8 @@ class SemanticGraph(ISONGraph):
         node_type: Optional[str] = None,
         threshold: float = 0.0,
         node_filter: Optional[Callable[[Node], bool]] = None,
-        node_types: Optional[Sequence[str]] = None
+        node_types: Optional[Sequence[str]] = None,
+        exact: bool = False
     ) -> List[SimilarityResult]:
         """
         Find similar nodes by embedding.
@@ -2093,6 +2978,8 @@ class SemanticGraph(ISONGraph):
                 whose node is not in the graph fails the filter.
             node_types: Keep only nodes whose type is in this sequence
                 (combines with ``node_type`` and ``node_filter`` by AND).
+            exact: Force the full scan even when the graph was created with
+                an approximate index (``ann``); no effect otherwise.
 
         Returns:
             List of SimilarityResult
@@ -2101,7 +2988,22 @@ class SemanticGraph(ISONGraph):
             encoder = self._get_encoder()
             self.embedding_store.encoder = encoder
         gate = self._node_gate(node_filter, node_types)
-        return self._seed_search(query, top_k, node_type, threshold, gate)
+        return self._seed_search(query, top_k, node_type, threshold, gate, exact=exact)
+
+    def recall_check(
+        self,
+        queries: Union[str, Sequence[float], Iterable[Union[str, Sequence[float]]]],
+        k: int = 10,
+        node_type: Optional[str] = None,
+        threshold: float = 0.0
+    ) -> 'RecallReport':
+        """Recall@k of the approximate index against the exact scan
+        (see :meth:`EmbeddingStore.recall_check`)."""
+        if not isinstance(queries, str) and not hasattr(queries, 'ndim'):
+            queries = list(queries)
+        if isinstance(queries, str) or any(isinstance(q, str) for q in queries[:1]):
+            self.embedding_store.encoder = self._get_encoder()
+        return self.embedding_store.recall_check(queries, k, node_type, threshold)
 
     def similar_to_node(
         self,
@@ -2751,7 +3653,12 @@ class SemanticGraph(ISONGraph):
         sqlite_vec: bool = False,
         on_mismatch: str = "error",
         version: Optional[str] = None,
-        on_model_mismatch: str = "warn"
+        on_model_mismatch: str = "warn",
+        ann: Optional[str] = None,
+        ann_nlist: Optional[int] = None,
+        ann_nprobe: Optional[int] = None,
+        ann_min_size: int = _ANN_MIN_SIZE,
+        ann_seed: int = 0
     ) -> 'SemanticGraph':
         """
         Load graph from file, restoring embeddings from its sidecar.
@@ -2786,6 +3693,10 @@ class SemanticGraph(ISONGraph):
             on_model_mismatch: ``"warn"``/``"error"``/``"ignore"`` for text
                      searches whose encoder model differs from the stored
                      vectors' model (see :class:`EmbeddingStore`).
+            ann, ann_nlist, ann_nprobe, ann_min_size, ann_seed: the opt-in
+                     approximate index (see :class:`EmbeddingStore`). It is
+                     never saved; it is rebuilt from the loaded vectors on
+                     the first search.
 
         Returns:
             SemanticGraph instance
@@ -2812,7 +3723,12 @@ class SemanticGraph(ISONGraph):
             embed_fields=embed_fields,
             sqlite_vec=sqlite_vec,
             version=version,
-            on_model_mismatch=on_model_mismatch
+            on_model_mismatch=on_model_mismatch,
+            ann=ann,
+            ann_nlist=ann_nlist,
+            ann_nprobe=ann_nprobe,
+            ann_min_size=ann_min_size,
+            ann_seed=ann_seed
         )
 
         # Copy the loaded state across through the public API.

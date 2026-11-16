@@ -2343,5 +2343,701 @@ class TestIncrementalExactSearch:
         store.close()
 
 
+# =============================================================================
+# Approximate (IVF) index
+# =============================================================================
+
+#: Recall@10 the tests demand of the index on the clustered data below
+#: (4,000 vectors, 40 clusters, 64 cells, nprobe 8 = 12.5% of the cells).
+#: Measured: 1.000 on every seed tried; the floor leaves room for platform
+#: differences in BLAS rounding, not for a worse algorithm.
+ANN_RECALL_FLOOR = 0.95
+
+
+def _clustered(n, dim=32, clusters=40, seed=1, noise=1.0):
+    """Unit-ish clustered vectors plus a function that draws queries from them."""
+    np = pytest.importorskip('numpy')
+    rng = np.random.default_rng(seed)
+    centers = rng.standard_normal((clusters, dim)).astype(np.float32)
+    centers /= np.linalg.norm(centers, axis=1, keepdims=True)
+
+    def draw(count):
+        which = rng.integers(0, clusters, count)
+        pts = centers[which] + noise * rng.standard_normal((count, dim)).astype(np.float32) / np.sqrt(dim)
+        return pts.astype(np.float32)
+
+    return draw(n), draw
+
+
+def _ann_store(n=4000, dim=32, seed=1, types=None, **kwargs):
+    kwargs.setdefault('ann', 'ivf')
+    kwargs.setdefault('ann_min_size', 0)
+    kwargs.setdefault('ann_nlist', 64)
+    kwargs.setdefault('ann_nprobe', 8)
+    data, draw = _clustered(n, dim=dim, seed=seed)
+    store = EmbeddingStore(db_path=':memory:', **kwargs)
+    store.add_batch([((types(i) if types else 'doc', i), f'text {i}', data[i].tolist())
+                     for i in range(n)])
+    return store, data, draw
+
+
+class TestApproximateIndex:
+    """The opt-in IVF index: recall, exactness at nprobe == nlist, upkeep, filters."""
+
+    @pytest.fixture(autouse=True)
+    def _need_numpy(self):
+        pytest.importorskip('numpy')
+
+    def test_off_by_default_and_exact_is_untouched(self):
+        store, data, draw = _ann_store(ann=None)
+        assert store.ann is None
+        assert store.ann_stats()['enabled'] is False
+        with pytest.raises(Exception, match='ann'):
+            store.build_ann_index()
+        # Identical (not merely close) to the same store with the flag on and
+        # exact=True: the exact path is the same code with or without ann.
+        other, _, _ = _ann_store(ann='ivf')
+        for q in draw(5).tolist():
+            a = store.similarity_search(q, 10)
+            b = other.similarity_search(q, 10, exact=True)
+            assert [(r.node_ref, r.score) for r in a] == [(r.node_ref, r.score) for r in b]
+
+    def test_argument_validation(self):
+        with pytest.raises(ValueError):
+            EmbeddingStore(ann='hnsw')
+        with pytest.raises(ValueError):
+            EmbeddingStore(ann_nprobe=0)
+        with pytest.raises(ValueError):
+            EmbeddingStore(ann='ivf', ann_nlist=0)
+        with pytest.raises(ValueError):
+            EmbeddingStore(ann='ivf', ann_min_size=-1)
+        with pytest.raises(ValueError):
+            EmbeddingStore(ann='ivf', sqlite_vec=True)
+        store = EmbeddingStore(ann='ivf')
+        with pytest.raises(ValueError):
+            store.ann_nprobe = 0
+        store.ann_nprobe = 5
+        assert store.ann_nprobe == 5
+
+    def test_ann_without_numpy_is_refused(self, monkeypatch):
+        import isongraph_vector as iv
+        monkeypatch.setattr(iv, '_np', None)
+        with pytest.raises(iv.EmbeddingError, match='numpy'):
+            EmbeddingStore(ann='ivf')
+        assert EmbeddingStore().ann is None            # exact search needs no numpy
+
+    def test_recall_floor_on_clustered_data(self):
+        store, data, draw = _ann_store()
+        report = store.recall_check(draw(60).tolist(), k=10)
+        assert report.approximate is True
+        assert report.nlist == 64 and report.nprobe == 8
+        assert report.recall >= ANN_RECALL_FLOOR, report
+        assert 0.0 <= report.min_recall <= report.recall <= 1.0
+        stats = store.ann_stats()
+        assert stats['active'] and stats['nlist'] == 64 and stats['trained_n'] == 4000
+        assert stats['index_bytes'] > 0 and stats['searches']['approximate'] >= 60
+
+    def test_results_carry_exact_scores(self):
+        store, data, draw = _ann_store()
+        for q in draw(10).tolist():
+            exact = {r.node_ref: r.score for r in store.similarity_search(q, 50, exact=True)}
+            for r in store.similarity_search(q, 10):
+                if r.node_ref in exact:
+                    assert r.score == pytest.approx(exact[r.node_ref], abs=1e-6)
+            scores = [r.score for r in store.similarity_search(q, 10)]
+            assert scores == sorted(scores, reverse=True)
+
+    def test_probing_every_cell_is_the_exact_scan(self):
+        import numpy as np
+        store, data, draw = _ann_store(ann_nprobe=64)         # nprobe == nlist
+        reference = EmbeddingStore(db_path=':memory:')
+        reference.add_batch([(('doc', i), f'text {i}', data[i].tolist()) for i in range(len(data))])
+        for q in draw(8).tolist():
+            got = store.similarity_search(q, 10)
+            want = reference.similarity_search(q, 10)
+            assert [(r.node_ref, r.score, r.text) for r in got] == \
+                   [(r.node_ref, r.score, r.text) for r in want]
+        assert store.recall_check(draw(5).tolist()).approximate is False
+        # and the candidate machinery itself, asked for every cell, sees every row
+        cache = store._ensure_cache()
+        ivf = store._ann_index(cache)
+        rows, scores = store._ann_scores(cache, ivf, draw(1)[0], None, -1.0, ivf.nlist)
+        assert rows.tolist() == list(range(len(data)))
+        exact_scores = store._np_scores(cache, draw(1)[0])
+        assert np.isfinite(scores).all() and exact_scores.shape == scores.shape
+
+    def test_under_min_size_stays_exact(self):
+        store, data, draw = _ann_store(n=500, ann_min_size=1000)
+        q = draw(1)[0].tolist()
+        assert [r.node_ref for r in store.similarity_search(q, 10)] == \
+               [r.node_ref for r in store.similarity_search(q, 10, exact=True)]
+        assert store.ann_stats()['active'] is False
+        assert store.recall_check([q]).approximate is False
+
+    def test_top_k_none_and_exact_flag_scan(self):
+        store, data, draw = _ann_store()
+        q = draw(1)[0].tolist()
+        before = store.ann_stats()['searches']['approximate']
+        assert len(store.similarity_search(q, None, threshold=-1.0)) == 4000
+        store.similarity_search(q, 5, exact=True)
+        assert store.ann_stats()['searches']['approximate'] == before
+        assert store.similarity_search(q, 0) == []
+
+    def test_zero_query_falls_back_to_exact(self):
+        store, data, draw = _ann_store()
+        res = store.similarity_search([0.0] * 32, 5, threshold=0.0)
+        assert [r.score for r in res] == [0.0] * 5
+
+    def test_writes_are_visible_immediately(self):
+        store, data, draw = _ann_store()
+        store.build_ann_index()
+        fresh = draw(1)[0].tolist()
+        store.add(('new', 1), 'fresh', vector=fresh)
+        top = store.similarity_search(fresh, 3)
+        assert top[0].node_ref == ('new', 1) and top[0].score == pytest.approx(1.0, abs=1e-5)
+        assert store.ann_stats()['pending'] == 1
+
+        # an in-place update moves the row: found at its new place, scored
+        # from its new vector everywhere, and listed once
+        target = draw(1)[0].tolist()
+        store.add(('doc', 7), 'moved', vector=target)
+        hit = store.similarity_search(target, 1)[0]
+        assert hit.node_ref == ('doc', 7) and hit.score == pytest.approx(1.0, abs=1e-5)
+        for q in [data[7].tolist(), target]:
+            res = store.similarity_search(q, 400, threshold=-1.0)
+            refs = [r.node_ref for r in res]
+            assert len(refs) == len(set(refs))               # no stale second entry
+            truth = {r.node_ref: r.score
+                     for r in store.similarity_search(q, None, threshold=-1.0)}
+            assert all(r.score == pytest.approx(truth[r.node_ref], abs=1e-6) for r in res)
+            cache = store._ensure_cache()
+            rows, _ = store._ann_scores(cache, cache.ivf, q, None, -1.0, 8)
+            assert len(set(rows.tolist())) == rows.size
+
+    def test_deletes_never_come_back(self):
+        store, data, draw = _ann_store()
+        store.build_ann_index()
+        gone = set()
+        for i in range(0, 4000, 3):                         # a third of them: forces compaction
+            store.remove(('doc', i))
+            gone.add(('doc', i))
+        builds = store.ann_stats()['searches']['builds']
+        for q in draw(15).tolist():
+            got = {r.node_ref for r in store.similarity_search(q, 10)}
+            assert not (got & gone)
+            # a tombstone scores 0.0, which beats any negative cosine: asking
+            # for many results with a negative threshold would surface one
+            deep = {r.node_ref for r in store.similarity_search(q, 250, threshold=-1.0)}
+            assert not (deep & gone)
+            # the candidate rows themselves: only live ones, each once (the
+            # lists still hold stale entries for rows deleted since the last regroup)
+            cache = store._ensure_cache()
+            rows, _ = store._ann_scores(cache, cache.ivf, q, None, -1.0, 8)
+            assert cache.alive[rows].all() and len(set(rows.tolist())) == rows.size
+        report = store.recall_check(draw(40).tolist())
+        assert report.recall >= ANN_RECALL_FLOOR, report
+        # the cache really compacted, and the index followed it
+        cache = store._cache
+        assert cache.dead == 0 or cache.dead * 4 <= cache.n
+        assert cache.ivf is not None
+        assert store.ann_stats()['searches']['builds'] == builds     # followed, not retrained
+        assert (cache.ivf.assign[:cache.n][~cache.alive[:cache.n]] == -1).all()
+
+    def test_pending_rows_fold_and_heavy_churn_retrains(self):
+        store, data, draw = _ann_store(n=3000)
+        store.build_ann_index()
+        builds = store.ann_stats()['searches']['builds']
+        extra = draw(700)
+        store.add_batch([(('late', i), '', extra[i].tolist()) for i in range(700)])
+        assert store.ann_stats()['pending'] == 700
+        store.similarity_search(extra[0].tolist(), 5)        # >= 512 pending: folded
+        stats = store.ann_stats()
+        assert stats['pending'] == 0 and stats['searches']['builds'] == builds
+        more = draw(1200)
+        store.add_batch([(('later', i), '', more[i].tolist()) for i in range(1200)])
+        store.similarity_search(more[0].tolist(), 5)         # churn 1900 > 50% of 3000
+        assert store.ann_stats()['searches']['builds'] == builds + 1
+        assert store.ann_stats()['trained_n'] == 4900
+        assert store.recall_check(draw(30).tolist()).recall >= ANN_RECALL_FLOOR
+
+    def test_clear_and_dimension_change(self):
+        store, data, draw = _ann_store(n=1500, ann_nlist=16, ann_nprobe=4)
+        store.build_ann_index()
+        store.clear()
+        assert store.similarity_search(data[0].tolist(), 5) == []
+        assert store.ann_stats()['active'] is False
+        store.clear(reset_dimension=True)
+        small, draw8 = _clustered(1200, dim=8, clusters=12, seed=3)
+        store.add_batch([(('doc', i), '', small[i].tolist()) for i in range(1200)])
+        res = store.similarity_search(small[5].tolist(), 5)
+        assert res[0].node_ref == ('doc', 5)
+        assert store.ann_stats()['active'] and store.dimension == 8
+
+    def test_node_type_filter_and_widening(self):
+        store, data, draw = _ann_store(types=lambda i: 'rare' if i % 200 == 0 else 'common',
+                                       ann_nprobe=2)
+        q = draw(1)[0].tolist()
+        common = store.similarity_search(q, 10, node_type='common')
+        assert len(common) == 10 and {r.node_ref[0] for r in common} == {'common'}
+        # 20 rare rows in the whole store, a top_k of 15: the two probed cells
+        # cannot hold 15 of them, so the probe must widen (ending in the scan)
+        widened_before = store.ann_stats()['searches']['widened']
+        rare = store.similarity_search(q, 15, node_type='rare', threshold=-1.0)
+        assert len(rare) == 15 and {r.node_ref[0] for r in rare} == {'rare'}
+        exact = store.similarity_search(q, 15, node_type='rare', threshold=-1.0, exact=True)
+        assert len(rare) == len(exact)
+        counts = store.ann_stats()['searches']
+        assert counts['widened'] > widened_before or counts['exact'] > 0
+        assert store.similarity_search(q, 5, node_type='nope') == []
+
+    def test_threshold_is_respected(self):
+        store, data, draw = _ann_store()
+        q = draw(1)[0].tolist()
+        best = store.similarity_search(q, 1, exact=True)[0].score
+        res = store.similarity_search(q, 10, threshold=best - 1e-3)
+        assert all(r.score >= best - 1e-3 for r in res)
+        assert store.similarity_search(q, 10, threshold=2.0) == []
+        # fewer than k above a threshold: same short list as the scan
+        cut = store.similarity_search(q, 10, exact=True)[4].score
+        got = store.similarity_search(q, 10, threshold=cut)
+        want = store.similarity_search(q, 10, threshold=cut, exact=True)
+        assert {r.node_ref for r in got} == {r.node_ref for r in want}
+
+    def test_recall_check_shapes(self):
+        np = pytest.importorskip('numpy')
+        store, data, draw = _ann_store()
+        q = draw(3)
+        assert store.recall_check(q[0].tolist()).queries == 1            # one flat vector
+        assert store.recall_check(q[0]).queries == 1                      # one ndarray
+        assert store.recall_check(q).queries == 3                         # a 2-D array
+        off = EmbeddingStore(db_path=':memory:')
+        off.add_batch([(('doc', i), '', data[i].tolist()) for i in range(100)])
+        r = off.recall_check(q.tolist())
+        assert r.recall == 1.0 and r.approximate is False
+        with pytest.raises(ValueError):
+            store.recall_check(q, k=0)
+
+    def test_thread_safety_smoke(self):
+        store, data, draw = _ann_store(n=3000, ann_nlist=32, ann_nprobe=4)
+        errors = []
+        extra = draw(600)
+        queries = draw(40).tolist()
+
+        def reader(seed):
+            try:
+                for i in range(120):
+                    res = store.similarity_search(queries[(i + seed) % 40], 8, threshold=-1.0)
+                    assert len(res) == 8
+                    scores = [r.score for r in res]
+                    assert scores == sorted(scores, reverse=True)
+                    assert len({r.node_ref for r in res}) == len(res)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(repr(exc))
+
+        def writer(seed):
+            try:
+                for i in range(100):
+                    store.add(('w', seed * 1000 + i), '', vector=extra[(seed * 100 + i) % 600].tolist())
+                    if i % 4 == 0:
+                        store.remove(('doc', seed * 300 + i))
+                    if i % 20 == 0:
+                        store.build_ann_index()
+            except Exception as exc:  # noqa: BLE001
+                errors.append(repr(exc))
+
+        threads = [threading.Thread(target=reader, args=(t,)) for t in range(3)] + \
+                  [threading.Thread(target=writer, args=(t,)) for t in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert errors == []
+        cache = store._cache
+        assert cache.n - cache.dead == store.count()
+        assert store.recall_check(queries[:20]).recall >= ANN_RECALL_FLOOR
+
+
+class TestApproximateIndexInGraph:
+    """The index through SemanticGraph: node_filter, passthrough, load."""
+
+    @pytest.fixture(autouse=True)
+    def _need_numpy(self):
+        pytest.importorskip('numpy')
+
+    @staticmethod
+    def _graph(n=3000, dim=32, **kwargs):
+        data, draw = _clustered(n, dim=dim)
+        graph = SemanticGraph(name='ann', encoder=MockEncoder(dimension=dim), auto_embed=False,
+                              ann='ivf', ann_min_size=0, ann_nlist=48, ann_nprobe=6, **kwargs)
+        for i in range(n):
+            graph.add_node('item', i, group=i % 50)
+        graph.embedding_store.add_batch(
+            [(('item', i), f'item {i}', data[i].tolist()) for i in range(n)])
+        return graph, data, draw
+
+    def test_constructor_passthrough(self):
+        graph, data, draw = self._graph()
+        store = graph.embedding_store
+        assert store.ann == 'ivf' and store.ann_nprobe == 6
+        res = graph.similarity_search(draw(1)[0].tolist(), 5)
+        assert len(res) == 5 and store.ann_stats()['active']
+        assert graph.recall_check(draw(20).tolist()).recall >= ANN_RECALL_FLOOR
+        assert SemanticGraph().embedding_store.ann is None
+
+    def test_exact_flag_and_similar_to_node(self):
+        graph, data, draw = self._graph()
+        q = draw(1)[0].tolist()
+        before = graph.embedding_store.ann_stats()['searches']['approximate']
+        graph.similarity_search(q, 5, exact=True)
+        graph.similarity_search(q, 5, exact=True, node_filter=lambda n: True)
+        assert graph.embedding_store.ann_stats()['searches']['approximate'] == before
+        near = graph.similar_to_node(('item', 3), top_k=5)
+        assert len(near) == 5 and ('item', 3) not in {r.node_ref for r in near}
+
+    def test_node_filter_gets_k_results_even_when_selective(self):
+        graph, data, draw = self._graph()
+        q = draw(1)[0].tolist()
+        # 1 node in 50 passes: the probed cells hold few of them, so the
+        # search has to widen until 10 pass
+        res = graph.similarity_search(q, 10, node_filter=lambda n: n.properties['group'] == 7)
+        assert len(res) == 10
+        assert all(graph.get_node_by_ref(r.node_ref).properties['group'] == 7 for r in res)
+        want = graph.similarity_search(q, 10, exact=True,
+                                       node_filter=lambda n: n.properties['group'] == 7)
+        assert len({r.node_ref for r in res} & {r.node_ref for r in want}) >= 7
+        scores = [r.score for r in res]
+        assert scores == sorted(scores, reverse=True)
+        # a filter nothing passes: terminates, empty
+        assert graph.similarity_search(q, 10, node_filter=lambda n: False) == []
+        # ...and a lenient one agrees closely with the scan
+        got = graph.similarity_search(q, 10, node_filter=lambda n: n.properties['group'] % 2 == 0)
+        ref = graph.similarity_search(q, 10, exact=True,
+                                      node_filter=lambda n: n.properties['group'] % 2 == 0)
+        assert len({r.node_ref for r in got} & {r.node_ref for r in ref}) >= 8
+
+    def test_semantic_multi_hop_uses_index_for_seeds(self):
+        graph, data, draw = self._graph(n=2000)
+        for i in range(1999):
+            graph.add_edge('NEXT', ('item', i), ('item', i + 1))
+        q = draw(1)[0].tolist()
+        out = graph.semantic_multi_hop(q, rel_type='NEXT', max_hops=2, top_k_seeds=3,
+                                       threshold=-1.0)
+        assert out and out[0].hop_count == 0
+        assert graph.embedding_store.ann_stats()['searches']['approximate'] >= 1
+        # blend > 0 scores every node and must not touch the approximate path
+        before = graph.embedding_store.ann_stats()['searches']['approximate']
+        graph.semantic_multi_hop(q, rel_type='NEXT', max_hops=1, blend=0.3, threshold=-1.0)
+        assert graph.embedding_store.ann_stats()['searches']['approximate'] == before
+
+    def test_load_passes_ann_and_rebuilds_lazily(self, tmp_path):
+        graph, data, draw = self._graph(n=1500)
+        path = tmp_path / 'g.isong'
+        graph.save(path)
+        loaded = SemanticGraph.load(path, encoder=graph.encoder, ann='ivf', ann_min_size=0,
+                                    ann_nlist=32, ann_nprobe=4)
+        assert loaded.embedding_store.ann == 'ivf'
+        assert loaded.embedding_store.ann_stats()['active'] is False      # nothing persisted
+        assert len(loaded.similarity_search(draw(1)[0].tolist(), 5)) == 5
+        assert loaded.embedding_store.ann_stats()['active'] is True
+
+
+# =============================================================================
+# HttpEncoder (against a local http.server; the tests never leave the machine)
+# =============================================================================
+
+class _FakeEmbeddingServer:
+    """A throwaway HTTP server on 127.0.0.1 that plays back programmed replies."""
+
+    def __init__(self):
+        import http.server
+        import json as _json
+        import threading as _threading
+        self.requests = []          # (path, headers dict, parsed body)
+        self.script = []            # callables(request_index, body) -> (status, headers, bytes)
+        self.default = None
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                length = int(self.headers.get('Content-Length', 0))
+                raw = self.rfile.read(length)
+                try:
+                    body = _json.loads(raw)
+                except ValueError:
+                    body = None
+                index = len(outer.requests)
+                outer.requests.append((self.path, {k.lower(): v for k, v in self.headers.items()}, body))
+                step = outer.script[index] if index < len(outer.script) else outer.default
+                status, headers, payload = step(index, body)
+                self.send_response(status)
+                for key, value in headers.items():
+                    self.send_header(key, value)
+                self.send_header('Content-Length', str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        self.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        self.server.daemon_threads = True
+        self.thread = _threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        self.thread.start()
+        self.base = f'http://127.0.0.1:{self.server.server_address[1]}'
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+
+def _vec_for(text, dim=4):
+    """A stable little vector per text, so tests can tell which text it came from."""
+    base = float(sum(map(ord, text)) % 97) + 1.0
+    return [base + j for j in range(dim)]
+
+
+def _openai_reply(dim=4, shuffle=False, with_index=True):
+    import json as _json
+
+    def step(index, body):
+        items = [{'object': 'embedding', 'embedding': _vec_for(t, dim), **({'index': i} if with_index else {})}
+                 for i, t in enumerate(body['input'])]
+        if shuffle:
+            items.reverse()
+        return 200, {'Content-Type': 'application/json'}, _json.dumps(
+            {'object': 'list', 'data': items, 'model': body['model']}).encode()
+    return step
+
+
+def _ollama_reply(dim=4):
+    import json as _json
+
+    def step(index, body):
+        return 200, {'Content-Type': 'application/json'}, _json.dumps(
+            {'model': body['model'], 'embeddings': [_vec_for(t, dim) for t in body['input']]}).encode()
+    return step
+
+
+def _json_reply(obj, status=200, headers=None):
+    import json as _json
+    return lambda index, body: (status, {'Content-Type': 'application/json', **(headers or {})},
+                                 _json.dumps(obj).encode())
+
+
+@pytest.fixture
+def fake_server():
+    server = _FakeEmbeddingServer()
+    yield server
+    server.close()
+
+
+class TestHttpEncoder:
+    def _encoder(self, server, path='/v1/embeddings', **kwargs):
+        from isongraph_vector import HttpEncoder
+        kwargs.setdefault('model', 'test-embed')
+        return HttpEncoder(server.base + path, **kwargs)
+
+    def test_openai_request_and_response(self, fake_server):
+        fake_server.default = _openai_reply()
+        enc = self._encoder(fake_server, api_key='sk-secret', dimension=4, version='2025-01')
+        assert enc.model_name == 'test-embed' and enc.version == '2025-01' and enc.dimension == 4
+        vec = enc.encode('hello')
+        assert vec == _vec_for('hello') and all(isinstance(x, float) for x in vec)
+        path, headers, body = fake_server.requests[0]
+        assert path == '/v1/embeddings'
+        assert body == {'model': 'test-embed', 'input': ['hello']}
+        assert headers['authorization'] == 'Bearer sk-secret'
+        assert headers['content-type'] == 'application/json'
+
+    def test_openai_data_is_sorted_by_index(self, fake_server):
+        fake_server.default = _openai_reply(shuffle=True)
+        enc = self._encoder(fake_server)
+        texts = ['alpha', 'bravo', 'charlie']
+        assert enc.encode_batch(texts) == [_vec_for(t) for t in texts]
+
+    def test_openai_without_index_keeps_order(self, fake_server):
+        fake_server.default = _openai_reply(with_index=False)
+        enc = self._encoder(fake_server)
+        assert enc.encode_batch(['a', 'bb']) == [_vec_for('a'), _vec_for('bb')]
+
+    def test_ollama_format(self, fake_server):
+        fake_server.default = _ollama_reply()
+        enc = self._encoder(fake_server, path='/api/embed', api='ollama')
+        assert enc.encode_batch(['x', 'yy']) == [_vec_for('x'), _vec_for('yy')]
+        assert 'authorization' not in fake_server.requests[0][1]
+        assert fake_server.requests[0][2] == {'model': 'test-embed', 'input': ['x', 'yy']}
+
+    def test_batches_are_split_and_order_kept(self, fake_server):
+        fake_server.default = _openai_reply()
+        enc = self._encoder(fake_server, batch_size=2)
+        texts = [f't{i}' for i in range(5)]
+        assert enc.encode_batch(texts) == [_vec_for(t) for t in texts]
+        assert [len(r[2]['input']) for r in fake_server.requests] == [2, 2, 1]
+        assert enc.encode_batch([]) == [] and len(fake_server.requests) == 3
+
+    def test_dimension_is_learned_or_probed(self, fake_server):
+        fake_server.default = _openai_reply(dim=6)
+        enc = self._encoder(fake_server)
+        assert enc.dimension == 6                    # one probe request
+        assert len(fake_server.requests) == 1
+        assert enc.encode('abc') and enc.dimension == 6 and len(fake_server.requests) == 2
+
+    def test_dimension_mismatch_is_an_error(self, fake_server):
+        from isongraph_vector import DimensionMismatchError
+        fake_server.default = _openai_reply(dim=4)
+        enc = self._encoder(fake_server, dimension=8)
+        with pytest.raises(DimensionMismatchError, match='4 dimensions, expected 8'):
+            enc.encode('x')
+        # a reply whose own vectors disagree
+        fake_server.requests.clear()
+        fake_server.default = _json_reply({'data': [
+            {'index': 0, 'embedding': [1.0, 2.0]}, {'index': 1, 'embedding': [1.0, 2.0, 3.0]}]})
+        with pytest.raises(DimensionMismatchError):
+            self._encoder(fake_server).encode_batch(['a', 'b'])
+
+    def test_http_error_carries_status_and_never_the_key(self, fake_server):
+        from isongraph_vector import HttpEncoderError
+        fake_server.default = _json_reply(
+            {'error': {'message': 'Incorrect API key provided: sk-secret-123'}}, status=401)
+        enc = self._encoder(fake_server, api_key='sk-secret-123')
+        with pytest.raises(HttpEncoderError) as info:
+            enc.encode('x')
+        assert info.value.status == 401
+        assert 'HTTP 401' in str(info.value) and 'Incorrect API key' in str(info.value)
+        assert 'sk-secret-123' not in str(info.value) and 'sk-secret-123' not in repr(enc)
+        assert len(fake_server.requests) == 1                  # a 401 is not retried
+
+    def test_error_message_hides_url_credentials_and_query(self, fake_server):
+        from isongraph_vector import HttpEncoder, HttpEncoderError
+        fake_server.default = _json_reply({'error': 'nope'}, status=403)
+        host = fake_server.base.split('//')[1]
+        enc = HttpEncoder(f'http://user:pw@{host}/v1/embeddings?key=URLSECRET', 'm')
+        with pytest.raises(HttpEncoderError) as info:
+            enc.encode('x')
+        text = str(info.value) + repr(enc)
+        assert 'URLSECRET' not in text and 'pw@' not in text and 'user:' not in text
+
+    def test_retries_429_and_5xx_then_succeeds(self, fake_server, monkeypatch):
+        from isongraph_vector import HttpEncoder
+        monkeypatch.setattr(HttpEncoder, 'RETRY_BACKOFF', 0.0)
+        fake_server.script = [_json_reply({'e': 1}, status=429), _json_reply({'e': 1}, status=503)]
+        fake_server.default = _openai_reply()
+        enc = self._encoder(fake_server)
+        assert enc.encode('retry me') == _vec_for('retry me')
+        assert len(fake_server.requests) == 3
+
+    def test_retries_are_bounded(self, fake_server, monkeypatch):
+        from isongraph_vector import HttpEncoder, HttpEncoderError
+        monkeypatch.setattr(HttpEncoder, 'RETRY_BACKOFF', 0.0)
+        fake_server.default = _json_reply({'e': 1}, status=500)
+        with pytest.raises(HttpEncoderError) as info:
+            self._encoder(fake_server, retries=2).encode('x')
+        assert info.value.status == 500 and len(fake_server.requests) == 3
+        fake_server.requests.clear()
+        with pytest.raises(HttpEncoderError):
+            self._encoder(fake_server, retries=0).encode('x')
+        assert len(fake_server.requests) == 1
+        fake_server.requests.clear()
+        fake_server.default = _json_reply({'e': 1}, status=400)       # client errors: no retry
+        with pytest.raises(HttpEncoderError):
+            self._encoder(fake_server, retries=5).encode('x')
+        assert len(fake_server.requests) == 1
+
+    @pytest.mark.parametrize('reply', [
+        lambda i, b: (200, {}, b'this is not json'),
+        _json_reply([1, 2, 3]),
+        _json_reply({'object': 'list'}),                                   # no data
+        _json_reply({'data': [{'index': 0}]}),                             # no embedding
+        _json_reply({'data': [{'index': 0, 'embedding': [1.0]}]}),         # wrong count for 2 texts
+        _json_reply({'data': [{'index': 0, 'embedding': [1.0]}, {'index': 0, 'embedding': [1.0]}]}),
+        _json_reply({'data': [{'index': 0, 'embedding': 'abc'}, {'index': 1, 'embedding': [1.0]}]}),
+        _json_reply({'data': [{'index': 0, 'embedding': []}, {'index': 1, 'embedding': [1.0]}]}),
+        _json_reply({'data': [{'index': 0, 'embedding': [True]}, {'index': 1, 'embedding': [1.0]}]}),
+    ])
+    def test_malformed_replies_raise(self, fake_server, reply):
+        from isongraph_vector import HttpEncoderError
+        fake_server.default = reply
+        with pytest.raises(HttpEncoderError):
+            self._encoder(fake_server).encode_batch(['a', 'b'])
+
+    def test_nan_in_reply_is_rejected(self, fake_server):
+        from isongraph_vector import HttpEncoderError
+        fake_server.default = lambda i, b: (200, {}, b'{"data": [{"index": 0, "embedding": [1.0, NaN]}]}')
+        with pytest.raises(HttpEncoderError, match='finite'):
+            self._encoder(fake_server).encode('a')
+
+    def test_wrong_api_for_the_reply(self, fake_server):
+        from isongraph_vector import HttpEncoderError
+        fake_server.default = _ollama_reply()
+        with pytest.raises(HttpEncoderError, match="'data'"):
+            self._encoder(fake_server).encode('a')                # api="openai" against an Ollama reply
+        fake_server.default = _openai_reply()
+        with pytest.raises(HttpEncoderError, match="'embeddings'"):
+            self._encoder(fake_server, api='ollama').encode('a')
+
+    def test_redirects_are_not_followed(self, fake_server):
+        from isongraph_vector import HttpEncoderError
+        fake_server.script = [lambda i, b: (302, {'Location': fake_server.base + '/elsewhere'}, b'')]
+        fake_server.default = _openai_reply()
+        enc = self._encoder(fake_server, api_key='sk-leak-me')
+        with pytest.raises(HttpEncoderError, match='redirect') as info:
+            enc.encode('private text')
+        assert info.value.status == 302
+        assert [r[0] for r in fake_server.requests] == ['/v1/embeddings']     # never reached /elsewhere
+
+    def test_unreachable_endpoint_and_timeout(self, fake_server):
+        from isongraph_vector import HttpEncoder, HttpEncoderError
+        dead = _FakeEmbeddingServer()
+        base = dead.base
+        dead.close()
+        with pytest.raises(HttpEncoderError, match='could not reach') as info:
+            HttpEncoder(base + '/v1/embeddings', 'm', api_key='sk-xyz', timeout=2).encode('x')
+        assert info.value.status is None and 'sk-xyz' not in str(info.value)
+
+        import time as _time
+        fake_server.default = lambda i, b: (_time.sleep(1.0), (200, {}, b'{}'))[1]
+        with pytest.raises(HttpEncoderError, match='could not reach'):
+            self._encoder(fake_server, timeout=0.2).encode('slow')
+
+    def test_custom_headers_win(self, fake_server):
+        fake_server.default = _openai_reply()
+        enc = self._encoder(fake_server, api_key='ignored', headers={'Authorization': 'Token abc', 'X-Org': 'o1'})
+        enc.encode('x')
+        headers = fake_server.requests[0][1]
+        assert headers['authorization'] == 'Token abc' and headers['x-org'] == 'o1'
+
+    @pytest.mark.parametrize('kwargs', [
+        {'url': 'ftp://host/x'}, {'url': 'file:///etc/passwd'}, {'url': 'not a url'},
+        {'api': 'cohere'}, {'batch_size': 0}, {'timeout': 0}, {'dimension': 0}, {'retries': -1},
+        {'model': ''},
+    ])
+    def test_constructor_validation(self, kwargs):
+        from isongraph_vector import HttpEncoder
+        args = {'url': 'http://localhost:1/x', 'model': 'm'}
+        args.update(kwargs)
+        with pytest.raises(ValueError):
+            HttpEncoder(**args)
+
+    def test_non_string_text_is_rejected(self, fake_server):
+        fake_server.default = _openai_reply()
+        with pytest.raises(TypeError):
+            self._encoder(fake_server).encode_batch(['ok', 3])
+        assert fake_server.requests == []
+
+    def test_works_inside_a_semantic_graph(self, fake_server):
+        fake_server.default = _openai_reply(dim=8)
+        enc = self._encoder(fake_server, dimension=8)
+        graph = SemanticGraph(encoder=enc, embed_fields=['name'])
+        graph.add_node('person', 1, name='Alice')
+        graph.add_node('person', 2, name='Bob')
+        assert graph.embedding_store.models() == {'test-embed': 2}
+        best = graph.similarity_search('Alice', top_k=1)[0]
+        assert best.node_ref == ('person', 1) and best.score == pytest.approx(1.0, abs=1e-6)
+        assert graph.embedding_store.stale() == []
+        embeddings = graph.embedding_store.export_embeddings()
+        assert embeddings['encoder_model'] == 'test-embed' and embeddings['dimension'] == 8
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
