@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Loader and measurement harness for benchmarks/competitive/ (the cross-library comparison).
+    Reads the same raw float32 vectors, queries and float64 ground truth as the other harnesses.
+    Bench-only; not part of the solution or the test run. Build with
+    dotnet build bench/IsonGraph.Vector.CompetitiveBench -c Release -o OUTDIR and run the dll
+    with the options listed in Program.cs (ds-dir, ds, n, exp, queries, label, out).
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <ServerGarbageCollector>false</ServerGarbageCollector>
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\IsonGraph.Vector\IsonGraph.Vector.csproj" />
+  </ItemGroup>
+
+</Project>
