@@ -282,6 +282,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -292,6 +295,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "ison-graph>=1.4.0"
           npm --prefix isongraph-vector-js install --no-audit --no-fund
+          npm --prefix isongraph-vector-ts install --no-audit --no-fund
 
       - name: Build the Rust writer
         run: cargo build --example cross_port_write --features sqlite
@@ -318,3 +322,15 @@ jobs:
             "$RUNNER_TEMP/rs.db" "$RUNNER_TEMP/rs.json"
           python scripts/cross_port/py_read.py "$RUNNER_TEMP/rs.db" "$RUNNER_TEMP/rs.json"
           node scripts/cross_port/node_read.mjs "$RUNNER_TEMP/rs.db" "$RUNNER_TEMP/rs.json"
+
+      # Graph files, not just embeddings: every port saves the same fixture
+      # graph (graph + <graph>.embeddings.json carrying a graph_digest), and every
+      # port loads every port's output with the mismatch mode set to ERROR, then
+      # checks counts, properties, vectors against its own MockEncoder, a text
+      # search, and that the digest verified. A second matrix edits one property
+      # in each file and requires every port to raise its mismatch error. The
+      # script builds the Rust, C#, C++ and TypeScript helpers outside the
+      # checkout (scripts/cross_port/{rust,csharp,cpp}) and prints a PASS/FAIL
+      # table; any failing pair fails the job.
+      - name: Graph files and sidecars, all six ports, all pairs
+        run: python scripts/cross_port/graph_files.py
