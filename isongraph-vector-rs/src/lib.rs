@@ -29,6 +29,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use thiserror::Error;
 
+use ann::ScanState;
+
+mod ann;
+pub use ann::{AnnConfig, AnnSearchCounts, AnnStats, RecallReport, ANN_MIN_SIZE};
 mod digest;
 pub use digest::{
     graph_digest, graph_digest_of_text, graph_digest_with_int_ids, GRAPH_DIGEST_BASIS,
@@ -529,6 +533,13 @@ pub struct EmbeddingStore {
     /// Every warning this store has issued, so callers and tests can read them.
     warnings: Mutex<Vec<String>>,
     last_import_meta: ImportMeta,
+    /// The opt-in approximate index settings (`None` = every search exact).
+    ann: Option<AnnConfig>,
+    /// Threads a full scan may use (0 = automatic).
+    scan_threads: usize,
+    /// The scan cache and the index built over it: derived from `embeddings`,
+    /// built by the first search, patched by writes, never persisted.
+    scan: Mutex<ScanState>,
 }
 
 impl EmbeddingStore {
@@ -543,6 +554,9 @@ impl EmbeddingStore {
             warned: Mutex::new(HashSet::new()),
             warnings: Mutex::new(Vec::new()),
             last_import_meta: ImportMeta::default(),
+            ann: None,
+            scan_threads: 0,
+            scan: Mutex::new(ScanState::default()),
         }
     }
 
@@ -647,27 +661,6 @@ impl EmbeddingStore {
                 expected,
             }),
             _ => Ok(()),
-        }
-    }
-
-    fn cosine_similarity(v1: &[f32], v2: &[f32]) -> f32 {
-        let mut dot = 0.0;
-        let mut norm1 = 0.0;
-        let mut norm2 = 0.0;
-
-        for (a, b) in v1.iter().zip(v2.iter()) {
-            dot += a * b;
-            norm1 += a * a;
-            norm2 += b * b;
-        }
-
-        norm1 = norm1.sqrt();
-        norm2 = norm2.sqrt();
-
-        if norm1 == 0.0 || norm2 == 0.0 {
-            0.0
-        } else {
-            dot / (norm1 * norm2)
         }
     }
 
@@ -785,7 +778,10 @@ impl EmbeddingStore {
     /// Insert or replace one record, keeping the per-model counts in step.
     fn put(&mut self, node_id: NodeId, text: &str, vector: Vec<f32>, model: &str) -> String {
         let key = Self::node_id_to_key(&node_id);
-        self.forget(&key);
+        self.forget_record(&key);
+        // An update overwrites the cached row in place; an insert appends one.
+        self.scan_state_mut()
+            .note_put(&key, &node_id.node_type, &vector);
         *self.model_counts.entry(model.to_string()).or_insert(0) += 1;
         self.embeddings.insert(
             key.clone(),
@@ -800,7 +796,15 @@ impl EmbeddingStore {
         key
     }
 
+    /// Remove a record and take it out of the search cache.
     fn forget(&mut self, key: &str) -> bool {
+        self.scan_state_mut().note_remove(key);
+        self.forget_record(key)
+    }
+
+    /// Remove a record, keeping the per-model counts in step. The search cache
+    /// is the caller's business (`put` overwrites its row in place).
+    fn forget_record(&mut self, key: &str) -> bool {
         match self.embeddings.remove(key) {
             Some(old) => {
                 if let Some(n) = self.model_counts.get_mut(&old.model) {
@@ -894,6 +898,13 @@ impl EmbeddingStore {
         self.similarity_search_vector(&query_vector, top_k, node_type, threshold)
     }
 
+    /// Best `top_k` matches for a vector, best first; equal scores come back
+    /// in a stable order (the order the vectors were stored in).
+    ///
+    /// `top_k = usize::MAX` returns every match. With an approximate index
+    /// configured (`set_ann`) a bounded `top_k` on a large enough store is
+    /// answered from it; use `similarity_search_vector_exact` to force the
+    /// full scan.
     pub fn similarity_search_vector(
         &self,
         query_vector: &[f32],
@@ -901,61 +912,15 @@ impl EmbeddingStore {
         node_type: Option<&str>,
         threshold: f32,
     ) -> Result<Vec<SimilarityResult>, EmbeddingError> {
-        self.check_query(query_vector)?;
-
-        let mut results: Vec<SimilarityResult> = self
-            .embeddings
-            .values()
-            .filter(|record| node_type.is_none_or(|t| record.node_id.node_type == t))
-            .filter_map(|record| {
-                let score = Self::cosine_similarity(query_vector, &record.vector);
-                if score >= threshold {
-                    Some(SimilarityResult {
-                        node_id: record.node_id.clone(),
-                        score,
-                        text: record.text.clone(),
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // Selecting the top k rather than ordering every candidate: O(n log k)
-        // against O(n log n), same rows in the same order.
-        let by_score = |a: &SimilarityResult, b: &SimilarityResult| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        };
-        if top_k == 0 {
-            return Ok(Vec::new());
-        }
-        if results.len() > top_k {
-            results.select_nth_unstable_by(top_k - 1, by_score);
-            results.truncate(top_k);
-        }
-        results.sort_by(by_score);
-
-        Ok(results)
+        self.search_vector(query_vector, top_k, node_type, threshold, false)
     }
 
     /// Cosine score for every embedded node, keyed by `type:id`.
     ///
     /// One scan serving both seed selection and the per-node relevance that
-    /// `semantic_multi_hop` blends in, instead of two.
+    /// `semantic_multi_hop` blends in, instead of two. Always the full scan.
     pub fn score_map(&self, query_vector: &[f32]) -> Result<HashMap<String, f32>, EmbeddingError> {
-        self.check_query(query_vector)?;
-        Ok(self
-            .embeddings
-            .iter()
-            .map(|(key, record)| {
-                (
-                    key.clone(),
-                    Self::cosine_similarity(query_vector, &record.vector),
-                )
-            })
-            .collect())
+        self.scan_scores(query_vector)
     }
 
     pub fn count(&self) -> usize {
@@ -976,6 +941,7 @@ impl EmbeddingStore {
     pub fn clear_with(&mut self, reset_dimension: bool) {
         self.embeddings.clear();
         self.model_counts.clear();
+        self.scan_state_mut().reset();
         if reset_dimension {
             self.dimension = None;
         }
@@ -1289,6 +1255,9 @@ pub struct SimilarityOptions<'a> {
     /// Applied *before* `top_k` is taken, so a filtered-out best match does
     /// not cost a slot.
     pub filter: NodeFilter<'a>,
+    /// Force the full scan even when the store has an approximate index
+    /// (`set_ann`); no effect otherwise.
+    pub exact: bool,
 }
 
 impl Default for SimilarityOptions<'_> {
@@ -1298,6 +1267,7 @@ impl Default for SimilarityOptions<'_> {
             node_type: None,
             threshold: 0.0,
             filter: NodeFilter::default(),
+            exact: false,
         }
     }
 }
@@ -1581,6 +1551,46 @@ impl SemanticGraph {
         self.embedding_store.encoder()
     }
 
+    /// Switch the approximate (IVF-flat) index on, with these settings, or off
+    /// with `None`. See `AnnConfig`. Nothing is saved: a saved graph, its
+    /// sidecar and its digest are the same with or without it, and a loaded
+    /// graph builds the index again on its first search.
+    pub fn set_ann(&mut self, config: Option<AnnConfig>) -> Result<(), EmbeddingError> {
+        self.embedding_store.set_ann(config)
+    }
+
+    /// The approximate-index settings, or `None` while search is exact.
+    pub fn ann(&self) -> Option<&AnnConfig> {
+        self.embedding_store.ann()
+    }
+
+    /// Build the approximate index now (see `EmbeddingStore::build_ann_index`).
+    pub fn build_ann_index(&self, force: bool) -> Result<AnnStats, EmbeddingError> {
+        self.embedding_store.build_ann_index(force)
+    }
+
+    /// What the approximate index looks like right now.
+    pub fn ann_stats(&self) -> AnnStats {
+        self.embedding_store.ann_stats()
+    }
+
+    /// Recall@k of the approximate index against the exact scan (see
+    /// `EmbeddingStore::recall_check`).
+    pub fn recall_check<'q, I, Q>(
+        &self,
+        queries: I,
+        k: usize,
+        node_type: Option<&str>,
+        threshold: f32,
+    ) -> Result<RecallReport, EmbeddingError>
+    where
+        I: IntoIterator<Item = Q>,
+        Q: Into<Query<'q>>,
+    {
+        self.embedding_store
+            .recall_check(queries, k, node_type, threshold)
+    }
+
     /// Install an encoder, replacing any current one. Vectors already stored
     /// keep the model that made them; see `stale_embeddings`.
     pub fn set_encoder(&mut self, encoder: Box<dyn EmbeddingEncoder>) {
@@ -1750,8 +1760,13 @@ impl SemanticGraph {
     /// Top-k similarity search among the nodes that pass `gate`.
     ///
     /// With a gate the store cannot truncate first: the best k *unfiltered*
-    /// matches may all be filtered out, so every match is scored, filtered,
-    /// and only then cut to k.
+    /// matches may all be filtered out, so matches are walked best first and
+    /// filtered until k have passed.
+    ///
+    /// With the store's approximate index the candidates are the probed cells
+    /// only. If fewer than k of them pass the gate, the probe is widened (4x
+    /// each step) and the search retried, ending in the full scan, so a
+    /// selective filter costs time rather than results.
     fn seed_search(
         &self,
         query_vector: &[f32],
@@ -1759,27 +1774,38 @@ impl SemanticGraph {
         node_type: Option<&str>,
         threshold: f32,
         gate: Option<&Gate>,
+        exact: bool,
     ) -> Result<Vec<SimilarityResult>, EmbeddingError> {
-        match gate {
-            None => self.embedding_store.similarity_search_vector(
+        let store = &self.embedding_store;
+        let Some(gate) = gate else {
+            return store.search_vector(
                 query_vector,
                 top_k.unwrap_or(usize::MAX),
                 node_type,
                 threshold,
-            ),
-            Some(gate) => {
-                let mut results = self.embedding_store.similarity_search_vector(
-                    query_vector,
-                    usize::MAX,
-                    node_type,
-                    threshold,
-                )?;
-                results.retain(|r| gate.passes(&r.node_id));
-                if let Some(k) = top_k {
-                    results.truncate(k);
+                exact,
+            );
+        };
+        if top_k == Some(0) {
+            return Ok(Vec::new());
+        }
+        let mut scale = (store.ann().is_some() && !exact && top_k.is_some()).then_some(1usize);
+        loop {
+            let (hits, approximate) =
+                store.ranked_hits(query_vector, node_type, threshold, scale)?;
+            let mut results = Vec::new();
+            for hit in hits {
+                if gate.passes(&hit.node_id) {
+                    results.push(hit);
+                    if top_k.is_some_and(|k| results.len() >= k) {
+                        break;
+                    }
                 }
-                Ok(results)
             }
+            if !approximate || top_k.is_some_and(|k| results.len() >= k) {
+                return Ok(results);
+            }
+            scale = scale.map(|s| s.saturating_mul(4));
         }
     }
 
@@ -1802,6 +1828,7 @@ impl SemanticGraph {
             options.node_type,
             options.threshold,
             gate.as_ref(),
+            options.exact,
         )
     }
 
@@ -1887,6 +1914,9 @@ impl SemanticGraph {
             None,
             hops.threshold,
             gate,
+            // Blending scores every node anyway, so seeds come from the same
+            // exact scan rather than from the approximate index.
+            hops.blend > 0.0,
         )?;
         if seeds.is_empty() {
             return Ok(vec![]);
@@ -2180,6 +2210,7 @@ impl SemanticGraph {
             None,
             options.threshold,
             gate.as_ref(),
+            false,
         )?;
 
         let mut best: Option<SemanticSearchResult> = None;

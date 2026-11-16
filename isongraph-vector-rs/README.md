@@ -246,7 +246,8 @@ get back: `vec0` runs an exact brute-force KNN in C, not an approximate index
 — measured identical ordering and scores within 2e-07 of the scan. Measured
 over 20,000 vectors of 384 dimensions, top-10, median of five runs:
 **19.0 ms** for the SQLite scan, **6.9 ms** through the index, and **9.9 ms**
-for the in-memory store. Recall of the index against the exact scan is
+for the in-memory store as it was then (its scan has since been rewritten; see
+*Searching large stores*). Recall of the index against the exact scan is
 **1.000** — the same answers, faster. Below a few thousand vectors the scan
 wins outright, which is why the index is opt-in.
 
@@ -254,6 +255,66 @@ Top-k results come out of `select_nth_unstable_by` rather than sorting all of
 them, which is where a third of the query time used to go. Filtering by node
 type stays exact too: the type is a `vec0` metadata column, so it narrows the
 search rather than filtering its results.
+
+## Searching large stores
+
+Search is exact unless you switch the approximate index on, and the exact path
+is fast. The first search copies the vectors into one contiguous `f32` matrix
+(a second copy in memory: built once, patched in place by writes and deletes,
+never saved) and every search after that is a single pass over it: a SIMD dot
+product per row (AVX2 + FMA when the CPU has them, checked at run time), a
+bounded heap for the top k, and, for a big store, up to eight threads
+(`set_scan_threads(1)` keeps it on one). Equal scores come back in a fixed order
+(by key when the cache is built, then by arrival), so a search gives the same
+answer on every run and for any thread count. Scores are the usual cosine, to
+within a rounding error of the old scan.
+
+For stores past a few hundred thousand vectors there is an opt-in approximate
+index, IVF-flat, matching the Python port:
+
+```rust
+use isongraph_vector_rs::{AnnConfig, EmbeddingStore};
+
+graph.set_ann(Some(AnnConfig::default()))?;      // or store.set_ann(..) / EmbeddingStore::with_ann(..)
+let hits = graph.similarity_search("query", 10, None, 0.0)?;      // from the index
+let exact = graph.similarity_search_with(
+    "query",
+    &SimilarityOptions { exact: true, ..Default::default() },     // the full scan
+)?;
+let report = graph.recall_check(&my_queries, 10, None, 0.0)?;      // measure it on YOUR queries
+println!("recall@10 = {:.3}, nprobe {} of {} cells", report.recall, report.nprobe, report.nlist);
+```
+
+Vectors are clustered into `nlist` cells (default about `4 * sqrt(N)`) by a
+seeded spherical k-means, and a query scores only the `nprobe` nearest cells
+(default 5% of them), with the same cosine as the exact scan. It is built by the
+first search that wants it, is never saved (a saved graph, its sidecar and its
+digest are identical with it on or off), and is used only for a bounded `top_k`
+on a store of at least `AnnConfig::min_size` (default 50,000) vectors. Writes
+are visible at once: new and updated vectors are scored exactly until enough
+have piled up to fold into cells, deletes stop being returned, and heavy churn
+retrains. A `node_type`, `threshold` or `NodeFilter` applies to the probed rows;
+if fewer than `top_k` survive, the probe widens 4x and tries again, ending in
+the full scan. `build_ann_index`, `ann_stats` and `recall_check` are on both
+`EmbeddingStore` and `SemanticGraph`. The SQLite store has no approximate index
+(load its `export_embeddings` into an in-memory store to use one).
+
+Measured with `examples/ann_bench.rs` on a 32-thread i9-14900HX laptop with
+other work running, 384-d unit vectors, top 10, median of 200 queries
+(synthetic clustered data; the index's recall depends entirely on how your data
+clusters, so measure your own):
+
+| vectors | exact, 1 thread | exact, auto threads | index build | IVF at default nprobe | recall@10 |
+|---|---|---|---|---|---|
+| 10,000 | 0.44 ms | 0.30 ms | 0.07 s | 0.043 ms | 1.000 |
+| 100,000 | 6.8 ms | 3.8 ms | 0.6 s | 0.64 ms | 1.000 |
+| 1,000,000 | 68 ms | 28 ms | 8.3 s | 2.4 ms | 0.993 |
+
+On the harder, overlapping "diffuse" data the same default gives 0.986 recall
+at 100,000 vectors (0.62 ms) and 0.991 at 1,000,000 (2.6 ms); lower `nprobe`
+values are faster and much less accurate there (`nprobe = 16` of 4,000 cells is
+0.30 recall), and below 100,000 vectors the exact scan is usually the better
+choice. Run `cargo run --release --example ann_bench -- --help` to reproduce.
 
 ## Embedding over HTTP
 
@@ -341,9 +402,15 @@ store.from_json(&json, false)?;
 
 ## Things that will bite you
 
-- **Search is brute force**, sqlite-vec included: linear in the number of
+- **Search is brute force** unless you switch on the opt-in IVF index (see
+  *Searching large stores*), sqlite-vec included: linear in the number of
   nodes. This is built for an application's own knowledge graph, not as a
-  vector-database replacement.
+  vector-database replacement. The first search also keeps a second, contiguous
+  copy of every vector in memory.
+- **The approximate index is approximate.** A true neighbour in an unprobed cell
+  is missed; recall was measured on synthetic data only. Its k-means uses this
+  port's own seeded generator, so the same `seed` builds a different (equally
+  valid) index than the Python port does.
 - **One embedding per node**, from one text field or a concatenation. No
   multi-vector nodes, no edge embeddings.
 - **`MockEncoder` has no semantic structure.** Use it to test plumbing, never
@@ -353,9 +420,9 @@ store.from_json(&json, false)?;
 - **`NodeId` is string-typed here.** The shared payload format carries an
   `id_type` of `str` or `int`; this port reads and preserves `int` written by
   another, but every id it originates is a string.
-- **Seed order among equal scores is not deterministic.** The store is a
-  `HashMap`, so ties can be broken differently between runs. It only shows up
-  with hand-crafted identical vectors; distinct texts give distinct scores.
+- **Equal scores are ordered by key, then by arrival.** Searches no longer
+  depend on `HashMap` order; the order is fixed when the scan cache is first
+  built (sorted by `type:id`), and vectors stored afterwards come after those.
 - **The graph digest sees integer ids only through the file text.** `NodeId`
   is a string here, so `graph_digest(&graph)` hashes every id as a string (right
   for anything built in Rust); `save` and `load` read the id column's types from
@@ -370,8 +437,8 @@ store.from_json(&json, false)?;
 ## Tests
 
 ```bash
-cargo test                      # 122 unit tests + 2 doctests
-cargo test --features sqlite    # + 22 SQLite tests
+cargo test                      # 127 unit tests + 32 approximate-index tests + 2 doctests
+cargo test --features sqlite    # + 22 SQLite tests + 3 index/SQLite tests
 cargo test --features http-encoder   # + 18 HTTP encoder tests (local mock server)
 cargo clippy --all-targets --features sqlite -- -D warnings
 cargo fmt --check
