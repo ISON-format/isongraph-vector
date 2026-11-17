@@ -1,5 +1,14 @@
 # Competitive benchmark: ISONGraph Vector against the established vector-search libraries
 
+> **Update, 2026-11-16.** Everything below was measured before the Rust engine
+> rework. For Rust, the "no batch or concurrent search" loss, the 2-4x memory
+> loss and the slow first query after writes are addressed; see
+> `benchmarks/rust-stage-a/RESULTS.md` for old-versus-new numbers. The Rust
+> single-thread exact scan is now 0-13% slower than the kernel measured here,
+> and numpy and faiss were not re-run, so the "Rust exact beats numpy / faiss
+> Flat by 6-33%" win below is **unverified for the current build**. The other
+> ports are unchanged.
+
 **One-paragraph answer.** On this machine, with identical vectors and an exact float64 ground truth, ISONGraph Vector is **not** the fastest vector search and the evidence does **not** support calling it the "best vector store". Its approximate index is a plain IVF-flat. At equal recall@10 its IVF is 1.4-2.3x slower than faiss IVFFlat at the same nlist and **1.9x (GloVe 100k) to 4.3x (text 100k) and 14-15x (text 1M) slower than the HNSW libraries** (hnswlib, faiss HNSW) in single-thread QPS; it has no batch or concurrent-query path, so its all-core throughput is 10-50x below faiss/hnswlib; and its only persistence is a JSON file (15-120x slower to save and load than faiss/hnswlib index files, 3-5x larger on disk). What it does well: the Rust exact scan is the fastest single-thread exact scan measured (6-33% ahead of numpy and faiss `IndexFlatIP` at 100k and 1M on text and GloVe, equal within noise at 10k); index build is 8-25x faster than HNSW builds at 100k-1M; the IVF index is maintained incrementally through insert/update/delete (faiss HNSW cannot update or delete; hnswlib/usearch can); and a node-type filter on a 1% subset is among the fastest filtered searches measured (see the filter table). Losses are listed as plainly as wins below.
 
 Everything here was measured on one laptop (i9-14900HX, 24 cores / 32 threads, 47.7 GB, Windows 11), see `results/environment.json`. Nothing in the libraries was changed. All numbers are in `results/raw/*.json`; the tables are generated from those files by `report.py`.

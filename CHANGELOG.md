@@ -181,8 +181,20 @@ JavaScript, Rust and C++.
   unchanged. Seeds do not reproduce across ports (each uses its own generator),
   so indexes differ while recall is comparable. The standalone SQLite stores
   have no index. See `benchmarks/competitive/` for measured speed and recall.
-- **Rust exact search** scans a contiguous `f32` cache with AVX2/FMA kernels
-  and threads, and equal scores no longer depend on `HashMap` order.
+- **Rust engine rework** (design in `isongraph-vector-rs/DESIGN.md`, measured
+  in `benchmarks/rust-stage-a/`): exact search uses AVX2/FMA kernels and
+  threads; searches take `&self` on a persistent pool, with batch search
+  (`similarity_search_vector_batch` and friends) that returns bit-for-bit the
+  same answers as one query at a time; `SharedEmbeddingStore` for threads that
+  read and write together; each vector is held once in a chunked matrix
+  (1.12x raw at 1M x 384, was 2.41x); pending rows are folded into the index
+  in groups of 256 at write time, so the first query after 30k writes into 1M
+  takes about 8 ms (was about 600 ms). Equal scores are ordered by arrival.
+  **Breaking:** `EmbeddingStore::get` and `SemanticGraph::get_embedding` now
+  return an owned `Option<EmbeddingRecord>`; use `get_vector` to borrow.
+  Costs: single-thread exact scan is 0-13% slower, ingest is slower, and
+  updates at 1M are 2-3x slower because index upkeep moved from the first
+  search to the write.
 - **Async encoders in TypeScript / JavaScript** - `AsyncEncoder` and
   `...Async` methods (`addNodeAsync`, `updateNodeAsync`, `embedAllNodesAsync`,
   `reembedStaleAsync`, `similaritySearchAsync`, `semanticMultiHopAsync`, ...)
@@ -217,8 +229,8 @@ JavaScript, Rust and C++.
   minutes at 1M vectors).
 - **Not a vector-database replacement.** Against faiss, hnswlib and usearch
   the ports are 2-4x slower per query at 100k and about 14x slower at 1M text
-  vectors at equal recall; there is no batched or concurrent search; vectors
-  persist as JSON only; and memory is 2-4x higher. Graph-aware retrieval
+  vectors at equal recall; only Rust has batched and concurrent search (the other ports serialise on one lock); vectors
+  persist as JSON only; and memory is 2-4x higher (Rust is now 1.1x raw; the other ports still store vectors twice). Graph-aware retrieval
   beating plain vector search on multi-hop questions is the supported claim,
   and it depends on the graph carrying real structure
   (`benchmarks/multihop/README.md`).

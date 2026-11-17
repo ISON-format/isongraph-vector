@@ -10,11 +10,11 @@ What is deliberately not done yet, in rough priority order. Items marked
    check and `cpp-curl.yml` have run on Linux only through the first PR; the
    server package's tests and its Dockerfile have only run on Windows (the
    Dockerfile has never been built).
-3. **Make Rust the reference engine.** The competitive benchmark
-   (`benchmarks/competitive/`) found concrete defects: no concurrent or
-   batched search, vectors stored twice (2-4x the memory of faiss/hnswlib), a
-   slow first query after heavy writes, and JSON-only persistence. Fix them in
-   Rust, write the design down, then port what proves out to the other ports.
+3. **Make Rust the reference engine.** Done for concurrent and batch search,
+   one copy of the vectors and the post-write stall (`isongraph-vector-rs/
+   DESIGN.md`). Still open: binary persistence, int8 scanning, re-running the
+   exact-scan comparison against numpy/faiss, and porting the design to the
+   other ports.
 4. **HNSW as an optional index** (measure first). IVF is 2-4x slower per query
    than HNSW libraries at 100k and about 14x slower at 1M; HNSW is the only
    route to closing that gap.
