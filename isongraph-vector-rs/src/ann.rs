@@ -1420,9 +1420,9 @@ impl Ivf {
             }
             seen += 1;
         }
-        for slot in 0..n {
+        for (slot, &assigned) in self.assign.iter().enumerate().take(n) {
             let live = table.is_live(slot);
-            match (live, self.assign[slot]) {
+            match (live, assigned) {
                 (false, NO_CELL) => {}
                 (false, a) => return Err(format!("dead slot {slot} assigned {a}")),
                 (true, NO_CELL) => return Err(format!("live slot {slot} is in no cell")),

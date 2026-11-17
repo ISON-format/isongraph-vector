@@ -270,9 +270,9 @@ impl QuantRows {
         }
         let view = self.view(rows.dim);
         let mut fresh = vec![0i8; rows.dim];
-        for slot in 0..n {
+        for (slot, &stored) in self.scales.iter().enumerate().take(n) {
             let scale = quantize(rows.row(slot), &mut fresh);
-            if scale.to_bits() != self.scales[slot].to_bits() || view.row(slot) != &fresh[..] {
+            if scale.to_bits() != stored.to_bits() || view.row(slot) != &fresh[..] {
                 return Err(format!(
                     "int8 row {slot} is not the quantisation of its f32 row"
                 ));

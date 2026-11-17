@@ -98,8 +98,8 @@ fn read_f32(path: &str, start: usize, count: usize, d: usize) -> Vec<f32> {
     f.seek(SeekFrom::Start((start * d * 4) as u64)).unwrap();
     let mut buf = vec![0u8; count * d * 4];
     f.read_exact(&mut buf).unwrap();
-    buf.chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    (0..buf.len() / 4)
+        .map(|i| f32::from_le_bytes(buf[4 * i..4 * i + 4].try_into().unwrap()))
         .collect()
 }
 fn read_i32(path: &str) -> Vec<i32> {
@@ -108,8 +108,8 @@ fn read_i32(path: &str) -> Vec<i32> {
         .unwrap_or_else(|e| panic!("{path}: {e}"))
         .read_to_end(&mut b)
         .unwrap();
-    b.chunks_exact(4)
-        .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    (0..b.len() / 4)
+        .map(|i| i32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap()))
         .collect()
 }
 

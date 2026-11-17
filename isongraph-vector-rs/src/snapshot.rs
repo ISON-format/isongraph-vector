@@ -422,10 +422,8 @@ impl EmbeddingStore {
                 put_u32(&mut buf, model_ix[&*meta.model]);
             }
             for &(_, _, s) in block {
-                let at = buf.len();
-                buf.resize(at + dim * 4, 0);
-                for (dst, f) in buf[at..].chunks_exact_mut(4).zip(table.row(s)) {
-                    dst.copy_from_slice(&f.to_le_bytes());
+                for f in table.row(s) {
+                    buf.extend_from_slice(&f.to_le_bytes());
                 }
             }
             out.write_all(&buf).map_err(werr)?;
@@ -630,11 +628,11 @@ fn read_snapshot(
         bytes.resize(need, 0);
         r.exact(&mut bytes)?;
         floats.clear();
-        floats.extend(
-            bytes
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
-        );
+        floats.extend((0..bytes.len() / 4).map(|i| {
+            let mut four = [0u8; 4];
+            four.copy_from_slice(&bytes[4 * i..4 * i + 4]);
+            f32::from_le_bytes(four)
+        }));
         for (i, (ty, id, text, model)) in meta.iter().enumerate() {
             if !stage.put_snapshot_row(
                 ty,

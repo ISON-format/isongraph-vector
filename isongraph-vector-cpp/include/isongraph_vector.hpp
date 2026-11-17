@@ -1243,6 +1243,17 @@ private:
         }
     }
 
+    // One out-of-line copy on purpose: the exact scan, the approximate path's
+    // re-score and the tests all compare these scores for bit equality, and
+    // two inlined copies are free to be contracted or vectorised differently
+    // by an optimiser (observed as last-bit differences on GCC 15).
+#if defined(__clang__)
+    __attribute__((noinline))
+#elif defined(__GNUC__)
+    __attribute__((noinline, noclone))
+#elif defined(_MSC_VER)
+    __declspec(noinline)
+#endif
     float cosineSimilarity(const std::vector<float>& v1, const std::vector<float>& v2) const {
         float dot = 0.0f;
         float norm1 = 0.0f;
