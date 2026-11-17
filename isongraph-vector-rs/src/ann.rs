@@ -36,6 +36,7 @@
 //!
 //! The behaviour deliberately mirrors the Python port's `ann="ivf"`.
 
+use crate::hnsw::HnswConfig;
 use crate::pool::SearchPool;
 use crate::table::{Rows, VectorTable, CHUNK_ROWS};
 use crate::{EmbeddingEncoder, EmbeddingError, EmbeddingStore, Query, SimilarityResult};
@@ -118,8 +119,25 @@ pub struct AnnConfig {
     /// Below this many vectors search stays exact (an index only pays off on
     /// large stores). Default 50,000.
     pub min_size: usize,
-    /// Seed for the k-means initialisation: the same data gives the same index.
+    /// Seed for the k-means initialisation (IVF) or the level draws (HNSW): the
+    /// same data in the same order gives the same index.
     pub seed: u64,
+    /// Which index answers bounded searches. `Ivf` (the default) keeps every
+    /// pre-existing behaviour; `Hnsw` is the graph index of `hnsw.rs`.
+    pub mode: AnnMode,
+    /// HNSW settings; ignored unless `mode` is `Hnsw`.
+    pub hnsw: HnswConfig,
+}
+
+/// Which approximate index an [`AnnConfig`] asks for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AnnMode {
+    /// IVF-flat: spherical k-means cells (the default).
+    #[default]
+    Ivf,
+    /// A hierarchical navigable small-world graph: slower to build, several
+    /// times faster per query at equal recall on large stores.
+    Hnsw,
 }
 
 impl Default for AnnConfig {
@@ -129,6 +147,8 @@ impl Default for AnnConfig {
             nprobe: None,
             min_size: ANN_MIN_SIZE,
             seed: 0,
+            mode: AnnMode::Ivf,
+            hnsw: HnswConfig::default(),
         }
     }
 }
@@ -145,7 +165,16 @@ impl AnnConfig {
                 "ann nprobe must be at least 1".to_string(),
             ));
         }
-        Ok(())
+        self.hnsw.validate()
+    }
+
+    /// Settings for the HNSW index with its defaults (M 16, ef_construction
+    /// 200, ef_search chosen per query), otherwise as [`AnnConfig::default`].
+    pub fn hnsw() -> Self {
+        Self {
+            mode: AnnMode::Hnsw,
+            ..Self::default()
+        }
     }
 }
 
@@ -189,6 +218,22 @@ pub struct AnnStats {
     pub folds: u64,
     /// Total time those steps took.
     pub fold_seconds: f64,
+    /// Which index is configured (`Ivf` when none is).
+    pub mode: AnnMode,
+    /// HNSW only: the `ef_search` a query uses when it gives none (before the
+    /// `max(k)` rule): the configured value, else the size-based default.
+    pub ef_search: Option<usize>,
+    /// HNSW only: highest layer of the graph.
+    pub max_level: Option<usize>,
+    /// HNSW only: nodes in the graph (live rows plus tombstones awaiting
+    /// compaction).
+    pub graph_nodes: usize,
+    /// HNSW only: tombstones still in the graph.
+    pub graph_dead: usize,
+    /// HNSW only: rows linked into the graph by writes since the build, and the
+    /// time that took.
+    pub inserts: u64,
+    pub insert_seconds: f64,
 }
 
 /// Where a store's memory goes; see [`EmbeddingStore::memory_stats`]. The
@@ -234,6 +279,8 @@ pub struct RecallReport {
     pub nlist: usize,
     pub nprobe: usize,
     pub approximate: bool,
+    /// HNSW only: the effective `ef_search` (0 otherwise).
+    pub ef_search: usize,
     pub ann_ms: f64,
     pub exact_ms: f64,
 }
@@ -244,11 +291,19 @@ pub(crate) struct Counters {
     approximate: AtomicU64,
     exact: AtomicU64,
     widened: AtomicU64,
-    builds: AtomicU64,
+    pub(crate) builds: AtomicU64,
 }
 
 impl Counters {
-    fn snapshot(&self) -> AnnSearchCounts {
+    /// One search answered from the index (`widened` if it needed a wider probe).
+    pub(crate) fn note_approximate(&self, widened: bool) {
+        self.approximate.fetch_add(1, Ordering::Relaxed);
+        if widened {
+            self.widened.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> AnnSearchCounts {
         AnnSearchCounts {
             approximate: self.approximate.load(Ordering::Relaxed),
             exact: self.exact.load(Ordering::Relaxed),
@@ -263,10 +318,10 @@ impl Counters {
 // =============================================================================
 
 /// SplitMix64: tiny, seedable, and the same on every platform.
-struct Rng(u64);
+pub(crate) struct Rng(pub(crate) u64);
 
 impl Rng {
-    fn next_u64(&mut self) -> u64 {
+    pub(crate) fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -275,7 +330,7 @@ impl Rng {
     }
 
     /// Uniform in `0..n` (`n > 0`).
-    fn below(&mut self, n: usize) -> usize {
+    pub(crate) fn below(&mut self, n: usize) -> usize {
         ((self.next_u64() as u128 * n as u128) >> 64) as usize
     }
 
@@ -316,13 +371,13 @@ fn auto_nlist(n: usize) -> usize {
 /// and the pool to run on.
 #[derive(Clone, Copy)]
 pub(crate) struct Par<'a> {
-    configured: usize,
-    pool: &'a Option<Arc<SearchPool>>,
+    pub(crate) configured: usize,
+    pub(crate) pool: &'a Option<Arc<SearchPool>>,
 }
 
 impl Par<'_> {
     /// Threads available: the pool's size.
-    fn size(&self) -> usize {
+    pub(crate) fn size(&self) -> usize {
         self.pool
             .as_ref()
             .map_or_else(SearchPool::default_threads, |p| p.threads())
@@ -332,7 +387,7 @@ impl Par<'_> {
     /// the pool size up to `auto_cap`. A single-query scan is limited by memory
     /// bandwidth, not compute; on the machine this was tuned on eight threads
     /// were within a few percent of thirty-two with a much steadier tail.
-    fn workers(&self, tasks: usize, auto_cap: usize) -> usize {
+    pub(crate) fn workers(&self, tasks: usize, auto_cap: usize) -> usize {
         let want = if self.configured == 0 {
             self.size().min(auto_cap)
         } else {
@@ -341,7 +396,7 @@ impl Par<'_> {
         want.min(tasks).max(1)
     }
 
-    fn run(&self, participants: usize, work: &(dyn Fn(usize) + Sync)) {
+    pub(crate) fn run(&self, participants: usize, work: &(dyn Fn(usize) + Sync)) {
         if participants <= 1 {
             work(0);
             return;
@@ -788,12 +843,12 @@ impl TopK {
 // =============================================================================
 
 pub(crate) struct QueryVec<'a> {
-    v: &'a [f32],
-    norm: f32,
+    pub(crate) v: &'a [f32],
+    pub(crate) norm: f32,
 }
 
 impl<'a> QueryVec<'a> {
-    fn new(v: &'a [f32]) -> Self {
+    pub(crate) fn new(v: &'a [f32]) -> Self {
         Self {
             v,
             norm: dot_f32(v, v).sqrt(),
@@ -801,7 +856,7 @@ impl<'a> QueryVec<'a> {
     }
 
     /// A direction to rank cells by.
-    fn has_direction(&self) -> bool {
+    pub(crate) fn has_direction(&self) -> bool {
         self.norm > 0.0 && self.norm.is_finite()
     }
 }
@@ -809,7 +864,7 @@ impl<'a> QueryVec<'a> {
 /// Cosine from a dot product and the two norms. A zero-length row scores 0, a
 /// tombstone (norm NaN) scores NaN and is dropped by the collector.
 #[inline(always)]
-fn cosine(dot: f32, row_norm: f32, query_norm: f32) -> f32 {
+pub(crate) fn cosine(dot: f32, row_norm: f32, query_norm: f32) -> f32 {
     let denom = row_norm * query_norm;
     if denom == 0.0 {
         0.0
@@ -929,6 +984,32 @@ fn scan_range_impl<const F: bool>(
 
 dispatch! {
     fn scan_range(rows: Rows, q: &QueryVec, code: Option<u32>, lo: usize, hi: usize, top: &mut TopK) = scan_range_impl
+}
+
+/// `out[i]` = cosine of the query with row `slots[i]`, computed exactly as the
+/// scan computes it (one query against four rows at a time, then singly), so a
+/// score from here is bit-identical to the scan's. A tombstone scores NaN.
+#[inline(always)]
+fn score_slots_impl<const F: bool>(rows: Rows, q: &QueryVec, slots: &[u32], out: &mut [f32]) {
+    let row = |i: usize| rows.row(slots[i] as usize);
+    let norm = |i: usize| rows.norms[slots[i] as usize];
+    let mut i = 0;
+    while i + QW <= slots.len() {
+        let d = block::<1, QW, F>([q.v], [row(i), row(i + 1), row(i + 2), row(i + 3)]);
+        for j in 0..QW {
+            out[i + j] = cosine(d[0][j], norm(i + j), q.norm);
+        }
+        i += QW;
+    }
+    while i < slots.len() {
+        let d = block::<1, 1, F>([q.v], [row(i)]);
+        out[i] = cosine(d[0][0], norm(i), q.norm);
+        i += 1;
+    }
+}
+
+dispatch! {
+    pub(crate) fn score_slots(rows: Rows, q: &QueryVec, slots: &[u32], out: &mut [f32]) = score_slots_impl
 }
 
 /// Score every live row (for the score map) and hand `(slot, score)` on.
@@ -1435,6 +1516,7 @@ impl EmbeddingStore {
         }
         self.ann = config;
         *self.ivf_mut() = None;
+        *self.hnsw_mut() = None;
         Ok(())
     }
 
@@ -1487,7 +1569,7 @@ impl EmbeddingStore {
         self.pool.clone().unwrap_or_else(SearchPool::global)
     }
 
-    fn par(&self) -> Par<'_> {
+    pub(crate) fn par(&self) -> Par<'_> {
         Par {
             configured: self.scan_threads,
             pool: &self.pool,
@@ -1507,6 +1589,7 @@ impl EmbeddingStore {
     /// A row was written: it joins `pending`, and a full `pending` is folded
     /// now, by the write that filled it.
     pub(crate) fn index_row_written(&mut self, slot: u32) {
+        self.hnsw_row_written(slot);
         let (table, pool, configured) = (&self.table, &self.pool, self.scan_threads);
         let guard = self.ivf.get_mut().unwrap_or_else(|e| e.into_inner());
         if let Some(ivf) = guard.as_mut() {
@@ -1522,12 +1605,14 @@ impl EmbeddingStore {
         if let Some(ivf) = self.ivf_mut().as_mut() {
             ivf.note_drop(slot);
         }
+        self.hnsw_row_removed();
         if self.table.should_compact() {
             self.compact_now();
         }
         if let Some(cfg) = &self.ann {
             if self.table.live() < cfg.min_size.max(2) {
                 *self.ivf_mut() = None;
+                *self.hnsw_mut() = None;
             }
         }
     }
@@ -1546,6 +1631,7 @@ impl EmbeddingStore {
         if let Some(ivf) = self.ivf_mut().as_mut() {
             ivf.compact(&live);
         }
+        self.hnsw_compact(&live);
     }
 
     // -- the index, as the searches see it ------------------------------------
@@ -1659,6 +1745,9 @@ impl EmbeddingStore {
     ) -> Option<Vec<Hit>> {
         if !q.has_direction() {
             return None;
+        }
+        if cfg.mode == AnnMode::Hnsw {
+            return self.hnsw_ranked(cfg, q, code, threshold, scale);
         }
         let guard = self.ready_index(cfg)?;
         let ivf = guard.as_ref()?;
@@ -1821,6 +1910,19 @@ impl EmbeddingStore {
         threshold: f32,
         exact: bool,
     ) -> Result<Vec<SimilarityResult>, EmbeddingError> {
+        self.search_vector_with(query_vector, top_k, node_type, threshold, exact, None)
+    }
+
+    /// `search_vector` with an optional per-call HNSW `ef_search`.
+    pub(crate) fn search_vector_with(
+        &self,
+        query_vector: &[f32],
+        top_k: usize,
+        node_type: Option<&str>,
+        threshold: f32,
+        exact: bool,
+        ef: Option<usize>,
+    ) -> Result<Vec<SimilarityResult>, EmbeddingError> {
         self.check_query(query_vector)?;
         if top_k == 0 {
             return Ok(Vec::new());
@@ -1833,7 +1935,7 @@ impl EmbeddingStore {
             return Ok(Vec::new());
         }
         let q = QueryVec::new(query_vector);
-        let hits = self.hits_for(&q, code, threshold, top_k, exact);
+        let hits = self.hits_for(&q, code, threshold, top_k, exact, ef);
         Ok(self.materialise(&hits))
     }
 
@@ -1844,15 +1946,23 @@ impl EmbeddingStore {
         threshold: f32,
         top_k: usize,
         exact: bool,
+        ef: Option<usize>,
     ) -> Vec<Hit> {
         if let Some(cfg) = &self.ann {
             if exact || top_k >= self.table.live() {
                 self.counts.exact.fetch_add(1, Ordering::Relaxed);
             } else {
-                let approx = self.ready_index(cfg).and_then(|guard| {
-                    let ivf = guard.as_ref()?;
-                    self.approximate_topk(cfg, ivf, q, code, threshold, top_k, self.par())
-                });
+                let approx = if cfg.mode == AnnMode::Hnsw {
+                    self.ready_hnsw(cfg).and_then(|guard| {
+                        let h = guard.as_ref()?;
+                        self.hnsw_topk(cfg, h, q, code, threshold, top_k, ef)
+                    })
+                } else {
+                    self.ready_index(cfg).and_then(|guard| {
+                        let ivf = guard.as_ref()?;
+                        self.approximate_topk(cfg, ivf, q, code, threshold, top_k, self.par())
+                    })
+                };
                 match approx {
                     Some(hits) => return hits,
                     None => {
@@ -1981,6 +2091,18 @@ impl EmbeddingStore {
                 self.counts
                     .exact
                     .fetch_add(qs.len() as u64, Ordering::Relaxed);
+            } else if cfg.mode == AnnMode::Hnsw {
+                if let Some(guard) = self.ready_hnsw(cfg) {
+                    if let Some(h) = guard.as_ref() {
+                        self.hnsw_batch(cfg, h, qs, code, threshold, top_k, &mut answers);
+                    }
+                    let fallbacks = answers.iter().filter(|a| a.is_none()).count() as u64;
+                    self.counts.exact.fetch_add(fallbacks, Ordering::Relaxed);
+                } else {
+                    self.counts
+                        .exact
+                        .fetch_add(qs.len() as u64, Ordering::Relaxed);
+                }
             } else if let Some(guard) = self.ready_index(cfg) {
                 if let Some(ivf) = guard.as_ref() {
                     self.approximate_batch(cfg, ivf, qs, code, threshold, top_k, &mut answers);
@@ -2280,6 +2402,13 @@ impl EmbeddingStore {
                 "this store has no approximate index; call set_ann first".to_string(),
             ));
         };
+        if cfg.mode == AnnMode::Hnsw {
+            if force {
+                *self.hnsw.write().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+            let _ = self.ready_hnsw(cfg);
+            return Ok(self.ann_stats());
+        }
         if force {
             *self.ivf.write().unwrap_or_else(|e| e.into_inner()) = None;
         }
@@ -2294,6 +2423,9 @@ impl EmbeddingStore {
 
     /// What the approximate index looks like right now. Never builds anything.
     pub fn ann_stats(&self) -> AnnStats {
+        if self.hnsw_is_mode() {
+            return self.hnsw_ann_stats();
+        }
         let guard = self.ivf_read();
         let ivf = guard.as_ref();
         AnnStats {
@@ -2314,6 +2446,13 @@ impl EmbeddingStore {
             searches: self.counts.snapshot(),
             folds: ivf.map_or(0, |i| i.folds),
             fold_seconds: ivf.map_or(0.0, |i| i.fold_seconds),
+            mode: AnnMode::Ivf,
+            ef_search: None,
+            max_level: None,
+            graph_nodes: 0,
+            graph_dead: 0,
+            inserts: 0,
+            insert_seconds: 0.0,
         }
     }
 
@@ -2346,6 +2485,9 @@ impl EmbeddingStore {
         if let Some(ivf) = self.ivf_read().as_ref() {
             ivf.check(&self.table, FOLD_BATCH)?;
         }
+        if let Some(h) = self.hnsw_read().as_ref() {
+            h.check(&self.table)?;
+        }
         Ok(())
     }
 
@@ -2361,7 +2503,8 @@ impl EmbeddingStore {
             matrix_bytes: t.matrix,
             live_vector_bytes: self.table.live() * self.table.dim * 4,
             metadata_bytes: t.per_row + t.keys_and_text + t.key_index,
-            index_bytes: self.ivf_read().as_ref().map_or(0, Ivf::nbytes),
+            index_bytes: self.ivf_read().as_ref().map_or(0, Ivf::nbytes)
+                + self.hnsw_read().as_ref().map_or(0, |h| h.nbytes()),
         }
     }
 
@@ -2440,6 +2583,7 @@ impl EmbeddingStore {
             nlist: stats.nlist.unwrap_or(0),
             nprobe: stats.nprobe.unwrap_or(0),
             approximate: used,
+            ef_search: stats.ef_search.unwrap_or(0),
             ann_ms: 1000.0 * median(ann_times),
             exact_ms: 1000.0 * median(exact_times),
         })
