@@ -111,6 +111,7 @@ pub(crate) fn quantize(x: &[f32], out: &mut [i8]) -> f32 {
 /// operand of the AVX2 kernel) and the scale.
 pub(crate) struct QQuery {
     q: Vec<i8>,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     abs: Vec<i8>,
     scale: f32,
 }
@@ -352,9 +353,9 @@ pub(crate) fn dot_i8_portable(q: &[i8], r: &[i8]) -> i32 {
 /// checked the CPU.
 #[inline(always)]
 fn dots<const R: usize, const F: bool>(qq: &QQuery, rows: [&[i8]; R]) -> [i32; R] {
-    let dim = qq.q.len();
     #[cfg(target_arch = "x86_64")]
     if F {
+        let dim = qq.q.len();
         // the kernel reads `dim` bytes from every operand: make that a fact
         assert!(qq.abs.len() == dim && rows.iter().all(|r| r.len() == dim));
         // SAFETY: `F` is true only in the instantiation reached through a
