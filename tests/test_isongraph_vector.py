@@ -1952,8 +1952,15 @@ def _assert_cache_matches_rebuild(store):
     """The patched cache must equal one built from scratch from the table."""
     np = pytest.importorskip('numpy')
     patched = _cache_snapshot(store)
-    store._cache = None                       # force a rebuild from SQLite
-    fresh = _cache_snapshot(store)
+    if store._sql:
+        store._cache = None                   # force a rebuild from SQLite
+        fresh = _cache_snapshot(store)
+    else:
+        # an in-memory store has no table behind its cache: rebuild a second
+        # store from the export instead (every row written once, in order)
+        twin = EmbeddingStore(db_path=':memory:')
+        twin.import_embeddings(store.export_embeddings())
+        fresh = _cache_snapshot(twin)
     assert patched['refs'] == fresh['refs']
     assert patched['texts'] == fresh['texts']
     assert np.array_equal(patched['matrix'], fresh['matrix'])
@@ -2205,10 +2212,8 @@ class TestIncrementalExactSearch:
         refs_now = {r.node_ref for r in store.similarity_search(
             [1, 0, 0], top_k=None, threshold=-1.0)}
         # whatever the connection kept of the half-done batch, the cache must agree
-        rows = store._get_conn().execute(
-            "SELECT node_type, node_id FROM embeddings").fetchall()
-        assert refs_now == {(r['node_type'], int(r['node_id']) if r['node_id'].isdigit()
-                             else r['node_id']) for r in rows}
+        rows = store.export_embeddings()['embeddings']
+        assert refs_now == {(r['type'], r['id']) for r in rows}
         _assert_cache_matches_rebuild(store)
         store.close()
 
@@ -2303,13 +2308,10 @@ class TestIncrementalExactSearch:
         assert cache is not None and cache.n - cache.dead == store.count()
         _assert_cache_matches_rebuild(store)
         # and the final state agrees with an independent brute-force read of the table
-        rows = store._get_conn().execute(
-            "SELECT node_type, node_id, node_id_type, vector, text FROM embeddings ORDER BY rowid"
-        ).fetchall()
+        rows = store.export_embeddings()['embeddings']
         model = _RefModel()
         for row in rows:
-            ref = (row['node_type'], store._restore_node_id(row['node_id'], row['node_id_type']))
-            model.put(ref, store._bytes_to_vector(row['vector']), row['text'])
+            model.put((row['type'], row['id']), row['vector'], row['text'])
         q = [random.Random(9).uniform(-1, 1) for _ in range(dim)]
         _assert_same_ranking(store.similarity_search(q, top_k=25, threshold=-1.0),
                              model.search(q, 25, None, -1.0))
@@ -2549,10 +2551,11 @@ class TestApproximateIndex:
         builds = store.ann_stats()['searches']['builds']
         extra = draw(700)
         store.add_batch([(('late', i), '', extra[i].tolist()) for i in range(700)])
-        assert store.ann_stats()['pending'] == 700
-        store.similarity_search(extra[0].tolist(), 5)        # >= 512 pending: folded
+        # folded at write time, 256 at a time: 700 = 2 x 256 + 188 still pending
+        assert store.ann_stats()['pending'] == 188
+        store.similarity_search(extra[0].tolist(), 5)        # a search folds nothing
         stats = store.ann_stats()
-        assert stats['pending'] == 0 and stats['searches']['builds'] == builds
+        assert stats['pending'] == 188 and stats['searches']['builds'] == builds
         more = draw(1200)
         store.add_batch([(('later', i), '', more[i].tolist()) for i in range(1200)])
         store.similarity_search(more[0].tolist(), 5)         # churn 1900 > 50% of 3000
