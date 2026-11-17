@@ -24,6 +24,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
 #[repr(C)]
 struct Pmc {
     cb: u32,

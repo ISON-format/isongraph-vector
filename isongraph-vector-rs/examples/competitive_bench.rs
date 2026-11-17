@@ -22,6 +22,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::time::Instant;
 
 // ---- process memory (Windows working set), no extra crates -------------------------------------
+#[cfg(windows)]
 #[repr(C)]
 struct Pmc {
     cb: u32,
