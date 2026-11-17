@@ -1,5 +1,6 @@
 //! Search for [`EmbeddingStore`]: the exact scan, the batched scan, and the
-//! opt-in IVF-flat approximate index built on top of the store's matrix.
+//! opt-in IVF-flat approximate index built on top of the store's matrix (the
+//! opt-in HNSW graph index lives in `hnsw.rs`; `AnnConfig::mode` picks one).
 //! `DESIGN.md` is the specification; this file is its Rust realisation.
 //!
 //! # The matrix
@@ -82,7 +83,8 @@ const PENDING: i32 = -2;
 // Public types
 // =============================================================================
 
-/// Settings for the opt-in approximate (IVF-flat) index.
+/// Settings for the opt-in approximate index (IVF-flat by default; HNSW with
+/// `mode: AnnMode::Hnsw`, see [`AnnConfig::hnsw`]).
 ///
 /// Off unless given to [`EmbeddingStore::set_ann`]; with it off every search
 /// is exact, as before. With it on, a *bounded* top-k search

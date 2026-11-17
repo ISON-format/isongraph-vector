@@ -344,6 +344,22 @@ values are faster and much less accurate there (`nprobe = 16` of 4,000 cells is
 0.30 recall), and below 100,000 vectors the exact scan is usually the better
 choice. Run `cargo run --release --example ann_bench -- --help` to reproduce.
 
+**HNSW (opt-in alternative to IVF).** `AnnConfig::hnsw()` (or `mode: AnnMode::Hnsw`)
+builds a hierarchical navigable small-world graph instead: `m` 16, `ef_construction`
+200, `ef_search` chosen by store size (about 0.95 recall@10 on 384-d text
+embeddings; override with `set_ann_ef_search` or per call with
+`similarity_search_vector_ef`). It stores slot numbers and links only (about 146
+bytes per vector, the whole store 1.18x the raw vectors at 1M x 384), returns the
+exact scan's scores for the hits it finds, links each row as it is written
+(0.5-1.5 ms), tombstones deletes and bridges over them at compaction, and is
+never saved. `AnnConfig::default()` stays IVF, and exact search stays the
+default. The trade: on real text-384 vectors at recall about 0.95 a single query
+is about 4x (100k) to 10x (1M) faster than IVF, but the build is far slower
+(142-170 s at 1M against IVF's 8 s; same graph for any thread count) and IVF's
+big batches stay faster at 100k. `examples/hnsw_bench.rs` sweeps `ef_search`
+(recall against queries per second, build time, memory); `DESIGN.md` section 10
+is the specification.
+
 ## Embedding over HTTP
 
 With the `http-encoder` feature, `HttpEncoder` is an `EmbeddingEncoder` that

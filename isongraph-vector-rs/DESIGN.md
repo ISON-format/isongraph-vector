@@ -154,3 +154,209 @@ matrix product, bit-identity then holds per kernel, not across them; JS:
 searches in numpy outside the GIL; JS single-threaded, workers need
 `SharedArrayBuffer`); the pool (Rust hand-written, one `unsafe` lifetime erasure;
 others use their standard pool); hash map and heap (any).
+
+## 10. HNSW (opt-in, beside IVF)
+
+`AnnConfig.mode = Hnsw` (`AnnConfig::hnsw()`) replaces IVF as the approximate
+index; exact search stays the default and IVF is untouched. Code:
+`src/hnsw.rs`. Like IVF it is built lazily by the first search that wants it (or
+`build_ann_index`), is **never persisted** (a loaded store rebuilds it; the graph
+file, the JSON sidecar and the graph digest are byte-identical with it on or
+off), and is used only for a bounded `top_k` on a store of at least `min_size`
+live rows. `exact`, `recall_check`, `set_scan_threads` and the pool mean what
+they mean for IVF. Why: at equal recall@10 of about 0.95 on real text-384
+vectors, IVF answers a single query about 4x (100k) to 10x (1M) slower than a
+graph walk, because a graph touches far fewer rows per query than the probed
+cells do.
+
+### 10.1 Parameters
+
+| knob | default | meaning |
+|---|---|---|
+| `hnsw.m` | 16 | links per node on layers >= 1; layer 0 holds `2m` (2..64) |
+| `hnsw.ef_construction` | 200 | candidates while linking a row (used as `max(efc, m)`) |
+| `hnsw.ef_search` | auto | candidates per query, `max(ef, k)`; auto by live rows: 64 (<10k), 96 (<200k), 128 (<600k), 192 |
+| `seed` | 0 | seeds the level generator (shared with IVF's k-means seed) |
+| `min_size` | 50,000 | same threshold as IVF: below it, or `top_k >= live`, search is exact |
+
+`ef_search` can be changed without a rebuild (`set_ann_ef_search`) or for one
+call (`similarity_search_vector_ef`).
+
+### 10.2 Layout: links only, no second copy of any vector
+
+Scores are computed from the one stored matrix with the section 2 kernels
+(1 query x 4 rows, then 1 x 1), so a hit's score is **bit-identical** to the
+exact scan's, and ties order by slot as everywhere else. The graph holds, per
+table slot:
+
+* `level[slot]` (u8; 255 = not in the graph),
+* layer 0: one block of `2m + 1` u32 (link count, then links), in chunks of
+  `CHUNK_ROWS` nodes so growth never copies,
+* `upper_at[slot]` (u32) into an arena holding, for a node of level `L`, `L`
+  consecutive blocks of `m + 1` u32 for layers `1..L`,
+* the entry slot and its level.
+
+That is `4(2m+1) + 5` bytes plus about `4(m+1)/m` of upper layers per node:
+**146 B/node at m = 16**, 9.5% of the raw 384-d vectors; the whole store
+(matrix, metadata, graph) measured **1.18x** the raw vector bytes at 1M x 384.
+Searches also use a per-thread visited bitmap (1 bit per slot, cleared by
+touched words, so a query pays for what it visited).
+
+### 10.3 Level draw and search (portable, integers only)
+
+* **Level**: `level = 0; while level < 24 and rng.below(m) == 0: level += 1`
+  with the SplitMix64 generator of the IVF code (`state += 0x9E3779B97F4A7C15`,
+  then the usual mix; `below(n)` = high 64 bits of `next * n`), seeded `seed XOR
+  0x4857535748575357`, one draw sequence in insertion order. So
+  `P(level >= l) = m^-l`, and no logarithm is needed (ports must not use one).
+* **Order** ("better is greater"): higher score, then lower slot. Every heap and
+  every tie in the graph uses it.
+* **Query**: greedy descent (ef = 1) from the entry through layers `top..1`,
+  then a best-first search of layer 0: candidates in a max-heap, the best `ef`
+  *admitted* nodes in a min-heap; pop the best candidate; stop when it is worse
+  than the worst admitted node and `ef` are kept; score its unvisited links
+  (4 at a time) and push those that beat the worst kept (or any, while fewer
+  than `ef` are kept). **Admitted** = live (norm not NaN), type code matches the
+  filter, score >= threshold. Tombstones and non-admitted nodes are routed
+  through but never kept. NaN scores rank last. The answer is the best `k` kept,
+  sorted by (score desc, slot asc).
+* **Filters** (type, threshold, a graph `node_filter` gate): if fewer than `k`
+  are kept, retry with `ef x 4`, repeating; give up to the **exact scan** when
+  `ef >= live` (first try) / `2 ef >= live` (later tries), or when one search
+  scores more than `max(live / 8, 16 ef)` nodes (a filter so selective that
+  scanning is cheaper). The graph-gate path asks for the best `ef x scale`
+  admitted nodes and widens the same way.
+* **Batch**: queries are spread over the pool, each runs the single-query path
+  above, so a batch answer equals the one-query answer bit for bit. (No
+  cell-major sharing exists for a graph: see 10.8.)
+* **Concurrency**: a search takes `&self` plus a shared read lock on the lazily
+  built graph, like IVF; all scratch is per thread. Writes are `&mut self`.
+
+### 10.4 Linking (one routine for build, insert and update)
+
+`link(jobs)`: for each job (a new row with its drawn level, or an existing node
+to relink) **plan** against the graph as it is, then **apply** the plans in job
+order.
+
+* **Plan** (read-only, parallel over jobs): descend greedily to the job's level;
+  on each layer `min(level, top)..0` run the layer search with `ef_construction`
+  admitting only live nodes other than the job itself, and pass the kept set as
+  entry points to the next layer down; add the other *new* jobs of the same
+  batch with level >= the layer as extra candidates (scored by brute force; this
+  is how a batch sees itself); sort candidates best first; pick `m` with the
+  **diversity heuristic**: keep a candidate only if it scores no better with any
+  already-kept node than with the base (`sim(c, kept) > sim(c, base)` rejects);
+  with `<= m` candidates, keep all.
+* **Apply**: write each job's lists (new nodes get their blocks; an update
+  overwrites its own lists); then add the reverse links. Reverse links are
+  grouped by (layer, target) in a fixed order; a target whose list stays within
+  capacity (`2m` on layer 0, `m` above) just appends (deduplicated); an overflow
+  first drops tombstones, and if the list is still over capacity **re-prunes**
+  it with the same heuristic over the old links plus the new ones. Groups are independent, so
+  they run in parallel and are written back in group order. The entry point is
+  the first new node of the highest level.
+* A job with a non-finite norm is not linked (the exact scan never returns it
+  either).
+
+### 10.5 Maintenance
+
+* **Build**: insert live rows in slot order in batches of `size / 16` (1 at the
+  start, at most 512), each batch one `link` call. Because plans read a frozen
+  graph and are applied in order, **the graph depends on the seed, the data and
+  the insertion order, not on the thread count** (checked by the tests). The
+  price is that rows of one batch find each other only by brute force, not
+  through the graph; at most 6% of the graph, this costs no measurable recall
+  (the recall-vs-ef curve equals hnswlib's on text-384 at 100k).
+* **Insert**: the write that stores a row links it (`link` of one job, no
+  parallelism). No pending list, so a search never waits for a fold and never
+  scans an unindexed tail. Cost 0.4-1.5 ms per insert at 100k-1M x 384
+  (dominated by the layer search at `ef_construction` 200 and the re-prunes).
+* **Update** (same slot, new vector): the node keeps its level; its own links
+  are recomputed from the new vector and the new neighbours link back. Links
+  other nodes held to the old position stay: they are only hints, every score
+  comes from the current vector, and a list drops them when it next overflows.
+  Counts as churn.
+* **Delete**: tombstone only (the table's NaN norm already hides the row). The
+  node and its links stay, so routes through it keep working; its floats are
+  still in the matrix until compaction. A tombstone leaves a list when that list
+  is re-pruned. No work at delete time (about a microsecond).
+* **Compaction** (the table's, > 25% dead, or explicit): the graph follows the
+  table's old-slot -> new-slot map in one serial pass: tombstones leave, every
+  link is renumbered, and a node that lost links takes up the links of the
+  tombstones it pointed to ("bridging": walk its lost neighbours in order and
+  append their surviving links not already present, up to capacity, no distance
+  computed). The entry point becomes the first node of the highest level. An
+  O(n x m) pause, the same order as the table's own compaction.
+* **Rebuild**: updates plus deletes since the build exceeding the node count
+  mark the graph stale; the next search that needs it rebuilds it under the
+  write lock (the build time below; searches wait). Call
+  `build_ann_index(true)` off the hot path to choose when. Inserts do not count.
+* Dropping the index when live rows fall below `min_size` (or 2), `clear`, and
+  `set_ann` follow IVF.
+
+### 10.6 Invariants (added to section 7; checked by `verify_invariants`)
+
+8. `level.len() == slots`; every live row with a finite norm is in the graph;
+   tombstoned rows may be (until compaction).
+9. A node's lists exist for layers `0..=level`, hold no more than the layer's
+   capacity, no self link, no duplicate, and every target is in the graph with
+   level >= the layer.
+10. The entry point is in the graph at the top level, and no node is higher.
+
+### 10.7 Measured (real text-384, MiniLM, HotpotQA; `examples/hnsw_bench.rs`)
+
+32-thread laptop with other work running, so **timings are indicative**; recall
+and memory are exact. Single-thread loops pinned to one CPU, `k = 10`, 1,000
+real HotpotQA questions, ground truth the float64 cosine top-10
+(`benchmarks/competitive/`), `m` 16, `ef_construction` 200, build on all 32
+threads. IVF is the default `AnnConfig` with `scan_threads(1)` in the 1T loop.
+
+| | 100,000 rows | 1,000,000 rows |
+|---|---|---|
+| HNSW build | 4.9-6.1 s | 142-170 s |
+| IVF build | 0.6-1.2 s | 8.4 s |
+| graph size | 13.8 MB (145 B/node) | 139 MB (146 B/node) |
+| whole store / raw vectors | 1.18x | 1.18x |
+| insert / update (median, p99) | 0.44 / 0.81 ms | 0.65-1.5 / 1.4-2.7 ms |
+| delete | < 2 us | < 2 us |
+| HNSW recall@10 by `ef` | 64: .915, 96: .948, 128: .963, 192: .980 | 96: .906, 128: .929, 192: .955, 256: .969 |
+| **HNSW** at the auto `ef` (96 / 192): recall, QPS 1T, QPS batch | .948, 5,021, 28,925 | .955, 1,539-1,782, 6,225 |
+| **IVF** near the same recall (`nprobe` 101 / 200): recall, QPS 1T, QPS batch | .943, 1,186, 49,996 | .941, 159, 8,570 |
+| single-thread speed-up over IVF | about 4x | about 10x |
+
+For reference, `benchmarks/competitive/` measured hnswlib at recall 0.949, 3,563
+QPS (100k, `ef` 96) and 1,486 QPS at recall 0.95 (1M) on a quiet machine, and its
+`ef`-vs-recall curve matches the one above (0.916 at 64, 0.964 at 128), so the
+graph quality is the same; the batch column is where IVF is not beaten (10.8).
+
+### 10.8 Not done, on purpose
+
+* **No persistence.** The graph is rebuilt after load, like IVF. A saved graph
+  would change the file format and the digest contract; loading 1M rows takes
+  seconds, rebuilding the graph minutes.
+* **Slow build.** HNSW cannot be built as fast as k-means cells. The batched
+  parallel build is the mitigation; incremental inserts are the other (build once
+  from the loaded rows, then writes keep it current).
+* **Update leaves stale in-links** (10.5) and delete leaves tombstones until
+  compaction; heavy churn rebuilds instead of repairing.
+* **No cell-major batch.** IVF's batch scores each probed cell once for all
+  queries that probe it; a graph has no such shared structure, so a batch is
+  throughput-parallel single queries. At 100k text-384 (recall about 0.95) IVF's
+  batch measured faster than HNSW's; at 1M they are comparable. Choose HNSW for
+  single-query latency and QPS, IVF for fast builds, small memory and big
+  batches.
+* **No quantisation, no filter-aware graph (ACORN style)**: a selective type
+  filter widens `ef` and may end in the scan.
+* **No online graph repair** other than the bridging at compaction.
+
+### 10.9 Portable vs language-specific
+
+*Portable (copy exactly)*: the level draw (integer, seeded), the (score, slot)
+order, the layout sizes, the plan/apply split with in-batch brute-force
+candidates and fixed apply order (this is what makes the build deterministic and
+parallel in any language), the diversity heuristic and overflow re-prune, the
+widening/fallback rules, tombstone-then-bridge compaction, the rebuild rule.
+*Language-specific*: threads and the pool (plans are independent; any parallel
+map with ordered results works; a single-threaded port is just slower), the
+visited set (bitmap per thread, or a stamp array), prefetching, heaps, SIMD
+(section 2: one fixed summation order everywhere).

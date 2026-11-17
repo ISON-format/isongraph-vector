@@ -873,14 +873,13 @@ fn heavy_churn_rebuilds_the_graph() {
     assert_eq!(fx.store.ann_stats().searches.builds, 1);
     let mut rng = Rng(3);
     // rewrite every row once and a half times: churn passes the node count
-    for round in 0..3 {
+    for _round in 0..3 {
         for i in 0..750 {
             let v = fx.clusters.draw(1, &mut rng).remove(0);
             fx.store
                 .add(NodeId::new("doc", i.to_string()), "", Some(v))
                 .unwrap();
         }
-        assert!(round < 3);
     }
     let q = fx.queries(1).remove(0);
     fx.store
