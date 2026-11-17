@@ -331,6 +331,11 @@ jobs:
       # in each file and requires every port to raise its mismatch error. The
       # script builds the Rust, C#, C++ and TypeScript helpers outside the
       # checkout (scripts/cross_port/{rust,csharp,cpp}) and prints a PASS/FAIL
-      # table; any failing pair fails the job.
+      # table; any failing pair fails the job. Each writer also writes the
+      # optional binary snapshot (<graph>.embeddings.snap), and three matrices
+      # run: every reader must accept every writer's snapshot (source must be
+      # 'snapshot'); every reader must still raise its mismatch error for an
+      # edited graph with a stale snapshot beside it; and with the snapshot
+      # deleted the JSON path must give the same observation.
       - name: Graph files and sidecars, all six ports, all pairs
         run: python scripts/cross_port/graph_files.py

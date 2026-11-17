@@ -5,8 +5,10 @@
     graph_py.py mismatch <dir>
 
 `write` saves the shared fixture graph as <dir>/graph.ison plus its
-embeddings sidecar. `read` loads <dir>/graph.ison with on_mismatch="error" and
-writes what it found to <observation.json> for the orchestrator to judge.
+embeddings sidecar and binary snapshot. `read` loads <dir>/graph.ison with
+on_mismatch="error" and writes what it found (and the load source, snapshot or
+json, with the reason a snapshot was skipped) to <observation.json> for the
+orchestrator to judge.
 `mismatch` loads a graph whose file was edited after the save and exits 0 only
 if the load raises GraphEmbeddingMismatchError.
 """
@@ -64,11 +66,11 @@ def write(directory: str) -> None:
     for rel, source, target, props in EDGES:
         graph.add_edge(rel, source, target, **props)
     Path(directory).mkdir(parents=True, exist_ok=True)
-    graph.save(graph_path(directory))
+    graph.save(graph_path(directory), snapshot=True)
     graph.close()
 
 
-def observe(graph: SemanticGraph, encoder: MockEncoder) -> dict:
+def observe(graph: SemanticGraph, encoder: MockEncoder, report) -> dict:
     nodes, missing, worst = [], [], 0.0
     for node in graph.nodes():
         nodes.append({"type": node.type, "id": node.id, "props": dict(node.properties)})
@@ -96,13 +98,15 @@ def observe(graph: SemanticGraph, encoder: MockEncoder) -> dict:
                          "score": float(top.score) if top else None})
     return {"port": "python", "nodes": nodes, "edges": edges,
             "embedding_count": graph.embedding_store.count(),
-            "missing_embeddings": missing, "max_vec_diff": worst, "searches": searches}
+            "missing_embeddings": missing, "max_vec_diff": worst, "searches": searches,
+            "source": report.source, "snapshot_skipped": report.snapshot_skipped}
 
 
 def read(directory: str, out: str) -> None:
     encoder = MockEncoder(DIM)
-    graph = SemanticGraph.load(graph_path(directory), encoder=encoder, on_mismatch="error")
-    observation = observe(graph, encoder)
+    graph, report = SemanticGraph.load_with_report(
+        graph_path(directory), encoder=encoder, on_mismatch="error")
+    observation = observe(graph, encoder, report)
     graph.close()
     Path(out).write_text(json.dumps(observation, ensure_ascii=False), encoding="utf-8")
 

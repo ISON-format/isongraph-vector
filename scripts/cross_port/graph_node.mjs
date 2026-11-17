@@ -11,8 +11,9 @@
  * outside the repository).
  *
  * `write` saves the shared fixture graph as <dir>/graph.ison plus its
- * embeddings sidecar. `read` loads it with onMismatch 'error' and writes what
- * it found to <observation.json>. `mismatch` loads a graph whose file was
+ * embeddings sidecar and binary snapshot. `read` loads it with onMismatch
+ * 'error' and writes what it found (and the load source, snapshot or json, with
+ * the reason a snapshot was skipped) to <observation.json>. `mismatch` loads a graph whose file was
  * edited after the save and exits 0 only if the load throws
  * GraphEmbeddingMismatchError.
  */
@@ -71,10 +72,10 @@ function write(lib, d) {
   for (const [type, id, props] of NODES) graph.addNodeWithEmbed(type, id, props, props.text);
   for (const [rel, source, target, props] of EDGES) graph.addEdge(rel, source, target, props);
   mkdirSync(d, { recursive: true });
-  lib.node.saveGraph(graph, graphPath(d));
+  lib.node.saveGraph(graph, graphPath(d), { snapshot: true });
 }
 
-function observe(graph, encoder) {
+function observe(graph, encoder, report) {
   const nodes = [];
   const missing = [];
   let worst = 0;
@@ -113,6 +114,8 @@ function observe(graph, encoder) {
     missing_embeddings: missing,
     max_vec_diff: worst,
     searches,
+    source: report.source,
+    snapshot_skipped: report.snapshotSkipped,
   };
 }
 
@@ -122,8 +125,8 @@ async function main() {
     write(lib, dir);
   } else if (command === 'read' && dir && out) {
     const encoder = new lib.core.MockEncoder(DIM);
-    const graph = lib.node.loadGraph(graphPath(dir), { encoder, onMismatch: 'error' });
-    writeFileSync(out, JSON.stringify(observe(graph, encoder)), 'utf8');
+    const { graph, report } = lib.node.loadGraphWithReport(graphPath(dir), { encoder, onMismatch: 'error' });
+    writeFileSync(out, JSON.stringify(observe(graph, encoder, report)), 'utf8');
   } else if (command === 'mismatch' && dir) {
     try {
       lib.node.loadGraph(graphPath(dir), { encoder: new lib.core.MockEncoder(DIM), onMismatch: 'error' });
