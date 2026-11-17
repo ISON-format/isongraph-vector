@@ -23,3 +23,7 @@
 *.db    binary
 *.png   binary
 *.ison  text
+
+# Byte-exact fixtures: the snapshot stores the sidecar's length and a hash of its bytes, so
+# any line-ending rewrite on checkout would make it (correctly) stale.
+tests/fixtures/snapshot/* -text
