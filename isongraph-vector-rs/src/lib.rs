@@ -32,8 +32,11 @@ use thiserror::Error;
 mod ann;
 pub use ann::quant::{Int8Recall, ScanPrecision, DEFAULT_RERANK_FACTOR};
 pub use ann::{
-    AnnConfig, AnnSearchCounts, AnnStats, MemoryStats, RecallReport, ANN_MIN_SIZE, FOLD_BATCH,
+    AnnConfig, AnnMode, AnnSearchCounts, AnnStats, MemoryStats, RecallReport, ANN_MIN_SIZE,
+    FOLD_BATCH,
 };
+mod hnsw;
+pub use hnsw::{HnswConfig, HNSW_EF_CONSTRUCTION, HNSW_M};
 mod pool;
 pub use pool::SearchPool;
 mod shared;
@@ -568,6 +571,9 @@ pub struct EmbeddingStore {
     /// is written during a search), maintained by writes through `&mut self`
     /// (no locking), never persisted.
     ivf: ann::IvfSlot,
+    /// The HNSW graph (same life cycle as `ivf`; only one of the two is ever
+    /// built, the one `ann.mode` names).
+    hnsw: hnsw::HnswSlot,
     counts: ann::Counters,
 }
 
@@ -588,6 +594,7 @@ impl EmbeddingStore {
             scan_threads: 0,
             pool: None,
             ivf: RwLock::new(None),
+            hnsw: RwLock::new(None),
             counts: ann::Counters::default(),
         }
     }
@@ -1011,6 +1018,7 @@ impl EmbeddingStore {
         self.table.clear();
         self.model_counts.clear();
         *self.ivf_mut() = None;
+        *self.hnsw_mut() = None;
         if reset_dimension {
             self.dimension = None;
         }
