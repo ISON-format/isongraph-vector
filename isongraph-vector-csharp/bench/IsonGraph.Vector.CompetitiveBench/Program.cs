@@ -202,7 +202,9 @@ if (exps.Contains("core") || exps.Contains("mutation") || exps.Contains("saveloa
         if (refKnob < 0 && (double)p["recall"]! >= 0.95) { refKnob = kn; refRecall = (double)p["recall"]!; }
         pts.Add(p);
     }
-    if (refKnob < 0) refKnob = Knobs().Last();
+    // No knob reached 0.95: use the widest and report ITS recall (the mutation section's "before" figure
+    // used to print 0.000 here because refRecall was only ever assigned when a knob reached 0.95).
+    if (refKnob < 0) { refKnob = Knobs().Last(); refRecall = (double)pts[^1]["recall"]!; }
     iv["sweep"] = pts; iv["ref_knob"] = refKnob; iv["ref_recall_pre"] = refRecall; iv["mem_after_sweep"] = Mem();
 
     if (exps.Contains("mutation"))
@@ -259,6 +261,17 @@ if (exps.Contains("core") || exps.Contains("mutation") || exps.Contains("saveloa
             Search(s2, queries[0], false, null);
             double fq = (Now() - t) * 1000;
             sl["first_query_after_load_ms"] = fq; sl["time_to_ready_s"] = loadS + fq / 1000;
+            // the opt-in binary snapshot of the same store (DESIGN.md section 11)
+            var snap = System.IO.Path.ChangeExtension(path, ".snap");
+            t = Now();
+            st.SaveSnapshot(snap);
+            sl["snap_save_s"] = Now() - t;
+            sl["snap_mb"] = new FileInfo(snap).Length / 1048576.0;
+            var s3 = new EmbeddingStore(ann: AnnMode.Ivf, annMinSize: 0, annNprobe: refKnob);
+            t = Now();
+            s3.LoadSnapshot(snap);
+            sl["snap_load_s"] = Now() - t;
+            File.Delete(snap);
             File.Delete(path);
         }
         catch (Exception e) { sl["error"] = e.Message; }

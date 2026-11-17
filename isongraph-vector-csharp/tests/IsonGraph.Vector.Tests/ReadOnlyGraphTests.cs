@@ -64,7 +64,8 @@ public class ReadOnlyGraphTests
 
         Assert.Equal("Alice", g.Graph.GetNode("person", "1").Properties["name"]);
         Assert.Equal("Alice", g.GetEmbedding(P("1"))!.Text);
-        Assert.Same(before, g.GetEmbedding(P("1")));
+        Assert.Equal(before.Vector, g.GetEmbedding(P("1"))!.Vector);   // the store hands out copies, so equal content, not the same instance
+        Assert.Equal(before.Text, g.GetEmbedding(P("1"))!.Text);
     }
 
     [Fact]

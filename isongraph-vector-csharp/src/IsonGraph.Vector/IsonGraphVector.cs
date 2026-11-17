@@ -39,6 +39,12 @@ public static class IsonGraphVectorVersion
     public const string EmbeddingSidecarSuffix = ".embeddings.json";
 
     /// <summary>
+    /// Suffix appended to a graph path to locate its optional binary
+    /// embeddings snapshot (see <see cref="EmbeddingStore.SaveSnapshot"/>).
+    /// </summary>
+    public const string EmbeddingSnapshotSuffix = ".embeddings.snap";
+
+    /// <summary>
     /// Name of the serialization <see cref="GraphDigest"/> hashes. Written next
     /// to the digest so a reader that computes a different digest (or none) can
     /// tell it is not comparable and skip the check instead of reporting a
@@ -223,7 +229,7 @@ public sealed class MockEncoder : IEmbeddingEncoder
 
 /// <param name="Id">Surrogate key, "type:id".</param>
 /// <param name="NodeRef">The node the vector belongs to.</param>
-/// <param name="Vector">The embedding.</param>
+/// <param name="Vector">The embedding. The store keeps its one copy of every vector in a shared matrix, so a record handed out by <see cref="EmbeddingStore.Get"/> carries a copy of it: changing it does not change the store.</param>
 /// <param name="Text">The text it was made from.</param>
 /// <param name="Model">
 /// Name of the model that made the vector: the encoder's ModelName, "unknown"
@@ -372,626 +378,6 @@ public sealed class ExportedEmbeddings
     [JsonConverter(typeof(LenientStringConverter))]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? GraphDigestBasis { get; set; }
-}
-
-// =============================================================================
-// Embedding Store
-// =============================================================================
-
-/// <summary>
-/// In-memory embedding storage with brute-force cosine similarity search.
-/// </summary>
-public sealed partial class EmbeddingStore
-{
-    private readonly Dictionary<string, EmbeddingRecord> _embeddings = new();
-    private readonly object _lock = new();
-    private IEmbeddingEncoder? _encoder;
-    private int? _dimension;
-    private string? _version;
-    private ModelMismatchMode _onModelMismatch;
-    private Dictionary<string, int>? _modelsCache;
-    private readonly HashSet<string> _warnedMismatch = new();
-    private IReadOnlyDictionary<string, string> _lastImportMeta = new Dictionary<string, string>();
-
-    // Opt-in approximate index (see AnnMode). _ivf is built lazily by the first
-    // search that qualifies, kept current by Put/Remove/Clear, and never saved.
-    private readonly AnnMode _ann;
-    private readonly int? _annNlist;
-    private int? _annNprobe;
-    private readonly int _annMinSize;
-    private readonly int _annSeed;
-    private IvfIndex? _ivf;
-    private long _annApproximate, _annExact, _annWidened, _annBuilds;
-
-    /// <summary>Below this many vectors the index is not used by default.</summary>
-    public const int DefaultAnnMinSize = 50_000;
-
-    /// <param name="encoder">Encoder used when a text is added or queried without a vector.</param>
-    /// <param name="version">
-    /// Free-form version of the encoder/model that made these vectors,
-    /// recorded in the sidecar. Falls back to the encoder's own Version.
-    /// </param>
-    /// <param name="onModelMismatch">
-    /// What a text query does when the encoder's ModelName differs from the
-    /// model that produced the stored vectors. Vectors whose model is
-    /// "unknown"/"provided" never trigger it, and vector queries are never
-    /// checked.
-    /// </param>
-    /// <param name="ann">
-    /// <see cref="AnnMode.None"/> (default) keeps search exact, exactly as it
-    /// always was. <see cref="AnnMode.Ivf"/> answers bounded top-k searches
-    /// from an in-memory IVF-flat index: vectors are clustered into
-    /// <paramref name="annNlist"/> cells and only the <paramref name="annNprobe"/>
-    /// cells nearest the query are scored. It is approximate - a true neighbour
-    /// in an unprobed cell is missed - so measure it with
-    /// <see cref="RecallCheck(IEnumerable{float[]}, int, string?, float)"/>. The
-    /// index is built lazily by the first search, never persisted, and kept
-    /// current through writes and deletes. It holds its own contiguous copy of
-    /// the vectors (about the size of the vectors again).
-    /// </param>
-    /// <param name="annNlist">Cells in the index. Null picks about 4 * sqrt(N) when it is built.</param>
-    /// <param name="annNprobe">
-    /// Cells scanned per query. Null picks about 5% of nlist. More cells = higher
-    /// recall, slower; nprobe &gt;= nlist is the exact scan. Adjustable later via
-    /// <see cref="AnnNprobe"/>.
-    /// </param>
-    /// <param name="annMinSize">Below this many vectors search stays exact. Default 50,000.</param>
-    /// <param name="annSeed">Seed for the k-means initialisation, so the same data gives the same index.</param>
-    public EmbeddingStore(
-        IEmbeddingEncoder? encoder = null,
-        string? version = null,
-        ModelMismatchMode onModelMismatch = ModelMismatchMode.Warn,
-        AnnMode ann = AnnMode.None,
-        int? annNlist = null,
-        int? annNprobe = null,
-        int annMinSize = DefaultAnnMinSize,
-        int annSeed = 0)
-    {
-        CheckMode(onModelMismatch);
-        if (!Enum.IsDefined(ann))
-            throw new ArgumentOutOfRangeException(nameof(ann), ann, "unknown AnnMode");
-        if (annNlist is < 1)
-            throw new ArgumentOutOfRangeException(nameof(annNlist), annNlist, "annNlist must be >= 1");
-        if (annNprobe is < 1)
-            throw new ArgumentOutOfRangeException(nameof(annNprobe), annNprobe, "annNprobe must be >= 1");
-        if (annMinSize < 0)
-            throw new ArgumentOutOfRangeException(nameof(annMinSize), annMinSize, "annMinSize must be >= 0");
-        _encoder = encoder;
-        _version = version;
-        _onModelMismatch = onModelMismatch;
-        _ann = ann;
-        _annNlist = annNlist;
-        _annNprobe = annNprobe;
-        _annMinSize = annMinSize;
-        _annSeed = annSeed;
-    }
-
-    /// <summary>The approximate index in use, or <see cref="AnnMode.None"/> for exact search.</summary>
-    public AnnMode Ann => _ann;
-
-    /// <summary>Cells scanned per query; null means automatic (about 5% of nlist).</summary>
-    public int? AnnNprobe
-    {
-        get { lock (_lock) return _annNprobe; }
-        set
-        {
-            if (value is < 1)
-                throw new ArgumentOutOfRangeException(nameof(value), value, "AnnNprobe must be >= 1");
-            lock (_lock) _annNprobe = value;
-        }
-    }
-
-    private static void CheckMode(ModelMismatchMode mode)
-    {
-        if (!Enum.IsDefined(mode))
-            throw new ArgumentOutOfRangeException(nameof(mode), mode, "unknown ModelMismatchMode");
-    }
-
-    /// <summary>
-    /// Raised with a human-readable message when the store has something to
-    /// warn about (a model mismatch, a version mismatch on load). With no
-    /// subscriber the message goes to standard error.
-    /// </summary>
-    public event Action<string>? Warning;
-
-    internal void RaiseWarning(string message)
-    {
-        var handler = Warning;
-        if (handler is not null) handler(message);
-        else Console.Error.WriteLine("isongraph-vector: warning: " + message);
-    }
-
-    public IEmbeddingEncoder? Encoder
-    {
-        get => _encoder;
-        set => _encoder = value;
-    }
-
-    /// <summary>
-    /// Encoder/model version recorded in the sidecar: the one set explicitly,
-    /// else the encoder's own, else null.
-    /// </summary>
-    public string? Version
-    {
-        get => _version ?? _encoder?.Version;
-        set => _version = value;
-    }
-
-    /// <summary>What a text query does when the encoder's model differs from the stored vectors'.</summary>
-    public ModelMismatchMode OnModelMismatch
-    {
-        get => _onModelMismatch;
-        set { CheckMode(value); _onModelMismatch = value; }
-    }
-
-    /// <summary>
-    /// Metadata (encoder_model, encoder_version, graph_digest,
-    /// graph_digest_basis) of the most recently imported payload; only the
-    /// keys it carried are present, and it is empty before any import.
-    /// </summary>
-    public IReadOnlyDictionary<string, string> LastImportMeta
-    {
-        get { lock (_lock) return _lastImportMeta; }
-    }
-
-    /// <summary>Vector length this store holds, or null while it is empty.</summary>
-    public int? Dimension
-    {
-        get { lock (_lock) return _dimension; }
-    }
-
-    private static string Key(NodeRef nodeRef) => $"{nodeRef.Type}:{nodeRef.Id}";
-
-    /// <summary>
-    /// Keep the best <paramref name="k"/> results without ordering all of them.
-    ///
-    /// Sorting every candidate to return ten is O(n log n) where this is
-    /// O(n·k) with early rejection — for the small k a search actually asks
-    /// for, that is a large saving over 20,000 candidates. Insertion goes
-    /// after equal scores, so the order matches a stable descending sort.
-    /// </summary>
-    internal static List<SimilarityResult> SelectTopK(List<SimilarityResult> results, int k)
-    {
-        if (k <= 0) return new List<SimilarityResult>();
-        if (results.Count <= k)
-            return results.OrderByDescending(r => r.Score).ToList();
-
-        var top = new List<SimilarityResult>(k);
-        foreach (var candidate in results)
-        {
-            if (top.Count == k && candidate.Score <= top[k - 1].Score) continue;
-
-            int i = top.Count < k ? top.Count : k - 1;
-            if (top.Count < k) top.Add(candidate);
-            while (i > 0 && top[i - 1].Score < candidate.Score)
-            {
-                top[i] = top[i - 1];
-                i--;
-            }
-            top[i] = candidate;
-        }
-        return top;
-    }
-
-
-    private void CheckDimension(ReadOnlySpan<float> vector, string what)
-    {
-        if (vector.Length == 0)
-            throw new DimensionMismatchException($"{what} is empty");
-        if (_dimension is null)
-            _dimension = vector.Length;
-        else if (vector.Length != _dimension)
-            throw new DimensionMismatchException(
-                $"{what} has {vector.Length} dimensions, store holds {_dimension}");
-    }
-
-    private void CheckQuery(ReadOnlySpan<float> vector)
-    {
-        if (vector.Length == 0)
-            throw new DimensionMismatchException("query vector is empty");
-        if (_dimension is not null && vector.Length != _dimension)
-            throw new DimensionMismatchException(
-                $"query vector has {vector.Length} dimensions, store holds {_dimension}");
-    }
-
-    /// <summary>
-    /// Cosine similarity over two vectors.
-    ///
-    /// Spans rather than IReadOnlyList: through the interface every element
-    /// access is a dispatch, which measured roughly twenty times slower than
-    /// the Rust and C++ ports scoring the same vectors. The stored vectors are
-    /// float[], so a span costs nothing and the JIT indexes them directly.
-    /// </summary>
-    private static float CosineSimilarity(ReadOnlySpan<float> v1, ReadOnlySpan<float> v2)
-    {
-        float dot = 0f, norm1 = 0f, norm2 = 0f;
-        int n = Math.Min(v1.Length, v2.Length);
-        for (int i = 0; i < n; i++)
-        {
-            dot += v1[i] * v2[i];
-            norm1 += v1[i] * v1[i];
-            norm2 += v2[i] * v2[i];
-        }
-        norm1 = MathF.Sqrt(norm1);
-        norm2 = MathF.Sqrt(norm2);
-        if (norm1 == 0f || norm2 == 0f) return 0f;
-        return dot / (norm1 * norm2);
-    }
-
-    private float[] ResolveQuery(string query)
-    {
-        if (_encoder is null)
-            throw new NoEncoderException("No encoder provided for text query");
-        CheckModelCompat();
-        var vector = _encoder.Encode(query);
-        CheckQuery(vector);
-        return vector;
-    }
-
-    // -- model lifecycle -------------------------------------------------------
-
-    /// <summary>Model name stamped on a vector written now.</summary>
-    private string StampModel() => ModelCompat.Stamp(_encoder);
-
-    /// <summary>The encoder's model name, or null when it has none worth comparing.</summary>
-    private string? CurrentModel() => ModelCompat.Current(_encoder);
-
-    /// <summary>
-    /// Which models produced the stored vectors: model name to count.
-    /// "unknown" and "provided" appear as-is (vectors imported from a port
-    /// that records no model, or handed in with no encoder attached).
-    /// </summary>
-    public IReadOnlyDictionary<string, int> Models()
-    {
-        lock (_lock)
-        {
-            if (_modelsCache is null)
-            {
-                var counts = new Dictionary<string, int>();
-                foreach (var record in _embeddings.Values)
-                    counts[record.Model] = counts.GetValueOrDefault(record.Model) + 1;
-                _modelsCache = counts;
-            }
-            return new Dictionary<string, int>(_modelsCache);
-        }
-    }
-
-    /// <summary>
-    /// Complain when a text query's encoder is not the stored vectors' model.
-    /// Called before a text query is encoded; vector queries skip it.
-    /// </summary>
-    internal void CheckModelCompat()
-    {
-        if (_onModelMismatch == ModelMismatchMode.Ignore) return;
-        var current = CurrentModel();
-        if (current is null) return;
-
-        var foreign = ModelCompat.Foreign(current, Models().Keys);
-        if (foreign.Count == 0) return;
-
-        var message = ModelCompat.Message(current, foreign);
-        if (_onModelMismatch == ModelMismatchMode.Error)
-            throw new ModelMismatchException(message);
-
-        bool first;
-        lock (_lock) first = _warnedMismatch.Add(ModelCompat.WarnKey(current, foreign));
-        if (first) RaiseWarning(message);
-    }
-
-    /// <summary>
-    /// Node refs whose stored vector does not belong to the current encoder.
-    ///
-    /// A vector is stale when its recorded model differs from
-    /// <paramref name="model"/> (default: the encoder's ModelName) or its
-    /// length differs from <paramref name="dimension"/> (default: the
-    /// encoder's Dimension). Vectors whose model is "unknown"/"provided"
-    /// cannot be judged by model and are skipped unless
-    /// <paramref name="includeUnknown"/> is true (a dimension mismatch still
-    /// counts). With no encoder and no arguments nothing can be judged and the
-    /// result is empty.
-    /// </summary>
-    public IReadOnlyList<NodeRef> Stale(string? model = null, int? dimension = null, bool includeUnknown = false)
-    {
-        lock (_lock)
-        {
-            model ??= CurrentModel();
-            dimension ??= _encoder?.Dimension;
-
-            var stale = new List<NodeRef>();
-            foreach (var record in _embeddings.Values)
-            {
-                if (ModelCompat.IsStale(record.Model, record.Vector.Length, model, dimension, includeUnknown))
-                    stale.Add(record.NodeRef);
-            }
-            return stale;
-        }
-    }
-
-    // -- writes -----------------------------------------------------------------
-
-    public string Add(NodeRef nodeRef, string text, float[]? vector = null)
-    {
-        lock (_lock)
-        {
-            if (vector is null)
-            {
-                if (_encoder is null)
-                    throw new NoEncoderException("No encoder provided and no vector given");
-                vector = _encoder.Encode(text);
-            }
-            CheckDimension(vector, "vector");
-            return Put(nodeRef, text, vector, StampModel());
-        }
-    }
-
-    /// <summary>Store a vector under an explicit model name. Caller holds the lock and has checked the dimension.</summary>
-    private string Put(NodeRef nodeRef, string text, float[] vector, string model)
-    {
-        var key = Key(nodeRef);
-        var record = new EmbeddingRecord(key, nodeRef, vector, text, model);
-        _embeddings[key] = record;
-        _modelsCache = null;
-        _ivf?.Put(record);
-        return key;
-    }
-
-    /// <summary>Copy a record in, keeping the model it was made by.</summary>
-    internal string AddRecord(EmbeddingRecord record)
-    {
-        lock (_lock)
-        {
-            CheckDimension(record.Vector, "vector");
-            return Put(record.NodeRef, record.Text, record.Vector, record.Model);
-        }
-    }
-
-    /// <summary>Add many embeddings, encoding their texts in one batched call.</summary>
-    public int AddBatch(IReadOnlyList<(NodeRef NodeRef, string Text)> entries)
-    {
-        if (entries.Count == 0) return 0;
-        if (_encoder is null)
-            throw new NoEncoderException("No encoder provided and no vectors given");
-
-        var vectors = _encoder.EncodeBatch(entries.Select(e => e.Text).ToList());
-        if (vectors.Count != entries.Count)
-            throw new EmbeddingException(
-                $"encoder returned {vectors.Count} vectors for {entries.Count} texts");
-
-        for (int i = 0; i < entries.Count; i++)
-            Add(entries[i].NodeRef, entries[i].Text, vectors[i]);
-        return entries.Count;
-    }
-
-    public EmbeddingRecord? Get(NodeRef nodeRef)
-    {
-        lock (_lock)
-            return _embeddings.TryGetValue(Key(nodeRef), out var record) ? record : null;
-    }
-
-    public bool Remove(NodeRef nodeRef)
-    {
-        lock (_lock)
-        {
-            _modelsCache = null;
-            var key = Key(nodeRef);
-            bool removed = _embeddings.Remove(key);
-            if (removed) _ivf?.Drop(key);
-            return removed;
-        }
-    }
-
-    public int Count
-    {
-        get { lock (_lock) return _embeddings.Count; }
-    }
-
-    /// <summary>
-    /// Clear all embeddings.
-    /// </summary>
-    /// <param name="resetDimension">
-    /// Also forget the pinned vector length, so the next vector may have a
-    /// different one (switching to an encoder of a different dimension). True
-    /// by default, which is how this method has always behaved; pass false to
-    /// keep the store refusing vectors of the wrong length even when empty (the
-    /// Python port's default).
-    /// </param>
-    public void Clear(bool resetDimension = true)
-    {
-        lock (_lock)
-        {
-            _embeddings.Clear();
-            _modelsCache = null;
-            _ivf = null;
-            if (resetDimension) _dimension = null;
-        }
-    }
-
-    /// <summary>
-    /// Find the most similar embeddings to a text query.
-    ///
-    /// With an approximate index (<see cref="Ann"/>) a bounded <paramref name="topK"/>
-    /// on a store of at least the minimum size is answered from the index
-    /// (scores are the same cosine values, but a true neighbour in an unprobed
-    /// cell can be missing). <paramref name="exact"/> forces the full scan.
-    /// </summary>
-    /// <param name="query">Query text.</param>
-    /// <param name="topK">Number of results (null returns every match).</param>
-    /// <param name="nodeType">Keep only embeddings of this node type.</param>
-    /// <param name="threshold">Minimum similarity.</param>
-    /// <param name="exact">Skip the approximate index and scan everything (no effect without one).</param>
-    public IReadOnlyList<SimilarityResult> SimilaritySearch(
-        string query, int? topK = 10, string? nodeType = null, float threshold = 0.0f, bool exact = false)
-        => SimilaritySearchVector(ResolveQuery(query), topK, nodeType, threshold, exact);
-
-    /// <summary>Find the most similar embeddings to a query vector; see <see cref="SimilaritySearch"/>.</summary>
-    public IReadOnlyList<SimilarityResult> SimilaritySearchVector(
-        float[] queryVector, int? topK = 10, string? nodeType = null, float threshold = 0.0f,
-        bool exact = false)
-    {
-        lock (_lock)
-        {
-            CheckQuery(queryVector);
-
-            if (_ann != AnnMode.None)
-            {
-                if (exact || topK is null || topK <= 0)
-                    _annExact++;
-                else
-                {
-                    var answer = AnnSearch(queryVector, topK.Value, nodeType, threshold);
-                    if (answer is not null) return answer;
-                    _annExact++;
-                }
-            }
-
-            var results = new List<SimilarityResult>();
-            foreach (var record in _embeddings.Values)
-            {
-                if (nodeType is not null && record.NodeRef.Type != nodeType) continue;
-                float score = CosineSimilarity(queryVector, record.Vector);
-                if (score >= threshold)
-                    results.Add(new SimilarityResult(record.NodeRef, score, record.Text));
-            }
-
-            if (topK is null)
-                return results.OrderByDescending(r => r.Score).ToList();
-            return SelectTopK(results, topK.Value);
-        }
-    }
-
-    /// <summary>
-    /// Cosine score for every embedded node, keyed by "type:id".
-    ///
-    /// One scan serving both seed selection and the per-node relevance that
-    /// SemanticMultiHop blends in, instead of two.
-    /// </summary>
-    public IReadOnlyDictionary<string, float> ScoreMap(float[] queryVector, string? nodeType = null)
-    {
-        lock (_lock)
-        {
-            CheckQuery(queryVector);
-            var scores = new Dictionary<string, float>();
-            foreach (var (key, record) in _embeddings)
-            {
-                if (nodeType is not null && record.NodeRef.Type != nodeType) continue;
-                scores[key] = CosineSimilarity(queryVector, record.Vector);
-            }
-            return scores;
-        }
-    }
-
-    /// <summary>
-    /// Serialize every embedding into the portable payload.
-    ///
-    /// Besides the embeddings it carries <c>encoder_model</c> (the encoder's
-    /// ModelName) and <c>encoder_version</c> when known and, when
-    /// <paramref name="graphDigest"/> is given, <c>graph_digest</c> and its
-    /// basis. Absent values are omitted, not written as null.
-    /// </summary>
-    public ExportedEmbeddings ExportEmbeddings(string? graphDigest = null)
-    {
-        lock (_lock)
-        {
-            var payload = new ExportedEmbeddings { Dimension = _dimension };
-            foreach (var record in _embeddings.Values.OrderBy(r => r.NodeRef.Type)
-                                                     .ThenBy(r => r.NodeRef.Id, StringComparer.Ordinal))
-            {
-                payload.Embeddings.Add(new ExportedEmbedding
-                {
-                    Type = record.NodeRef.Type,
-                    // C# node ids are always strings; the other ports use this
-                    // to tell a numeric id from a numeric-looking string one.
-                    Id = JsonSerializer.SerializeToElement(record.NodeRef.Id),
-                    IdType = "str",
-                    Text = record.Text,
-                    Model = record.Model,
-                    Vector = record.Vector,
-                });
-            }
-            payload.Count = payload.Embeddings.Count;
-            payload.EncoderModel = CurrentModel();
-            payload.EncoderVersion = Version;
-            if (graphDigest is not null)
-            {
-                payload.GraphDigest = graphDigest;
-                payload.GraphDigestBasis = IsonGraphVectorVersion.GraphDigestBasis;
-            }
-            return payload;
-        }
-    }
-
-    /// <summary>
-    /// Load a payload produced by ExportEmbeddings (in any port). Fields this
-    /// build does not know are ignored; the metadata it does know is exposed as
-    /// <see cref="LastImportMeta"/>.
-    /// </summary>
-    public int ImportEmbeddings(ExportedEmbeddings payload, bool replace = false)
-    {
-        if (payload.Format != IsonGraphVectorVersion.EmbeddingFormat)
-            throw new EmbeddingException(
-                $"not an {IsonGraphVectorVersion.EmbeddingFormat} payload: format={payload.Format}");
-        if (payload.Version != IsonGraphVectorVersion.EmbeddingFormatVersion)
-            throw new EmbeddingException(
-                $"unsupported {IsonGraphVectorVersion.EmbeddingFormat} version {payload.Version} " +
-                $"(this build reads version {IsonGraphVectorVersion.EmbeddingFormatVersion})");
-
-        lock (_lock)
-        {
-            var meta = new Dictionary<string, string>();
-            if (payload.EncoderModel is not null) meta["encoder_model"] = payload.EncoderModel;
-            if (payload.EncoderVersion is not null) meta["encoder_version"] = payload.EncoderVersion;
-            if (payload.GraphDigest is not null) meta["graph_digest"] = payload.GraphDigest;
-            if (payload.GraphDigestBasis is not null) meta["graph_digest_basis"] = payload.GraphDigestBasis;
-            _lastImportMeta = meta;
-
-            if (replace)
-            {
-                Clear(resetDimension: true);
-                _dimension = payload.Dimension;
-            }
-
-            int written = 0;
-            foreach (var item in payload.Embeddings)
-            {
-                var nodeRef = new NodeRef(item.Type, item.IdAsString());
-                CheckDimension(item.Vector, $"embedding for :{item.Type}:{nodeRef.Id}");
-                Put(nodeRef, item.Text, item.Vector, item.Model ?? "unknown");
-                written++;
-            }
-            return written;
-        }
-    }
-
-    /// <summary>Serialize the portable payload to a JSON string.</summary>
-    public string ToJson(string? graphDigest = null) => JsonSerializer.Serialize(ExportEmbeddings(graphDigest));
-
-    /// <summary>Load embeddings from a JSON payload written by any port.</summary>
-    public int FromJson(string json, bool replace = false)
-    {
-        ExportedEmbeddings? payload;
-        try { payload = JsonSerializer.Deserialize<ExportedEmbeddings>(json); }
-        catch (JsonException ex) { throw new EmbeddingException($"unreadable embeddings payload: {ex.Message}"); }
-        if (payload is null) throw new EmbeddingException("payload did not deserialize");
-        return ImportEmbeddings(payload, replace);
-    }
-
-    /// <summary>
-    /// Write every embedding to a JSON sidecar, atomically. Returns the count.
-    ///
-    /// The file is written to a temp file and renamed into place, so a crash
-    /// never leaves a half-written sidecar. <paramref name="graphDigest"/> ties
-    /// the sidecar to one particular graph (see <see cref="GraphDigest"/>).
-    /// </summary>
-    public int SaveEmbeddings(string path, string? graphDigest = null)
-    {
-        var payload = ExportEmbeddings(graphDigest);
-        AtomicFile.WriteText(path, JsonSerializer.Serialize(payload));
-        return payload.Count;
-    }
-
-    /// <summary>Read a JSON sidecar written by <see cref="SaveEmbeddings"/> (or by any port).</summary>
-    public int LoadEmbeddings(string path, bool replace = false) =>
-        FromJson(File.ReadAllText(path, System.Text.Encoding.UTF8), replace);
 }
 
 // =============================================================================
@@ -1972,15 +1358,50 @@ public sealed class SemanticGraph
     ///
     /// With <paramref name="embeddings"/> false an existing sidecar is left in
     /// place (and will fail the digest check on load, as it no longer matches).
+    ///
+    /// With <paramref name="snapshot"/> true a binary snapshot of the
+    /// embeddings is also written to <c>&lt;path&gt;.embeddings.snap</c>, after
+    /// and in addition to the JSON sidecar, which stays the portable copy.
+    /// <see cref="Load"/> uses the snapshot when it provably belongs to the
+    /// graph and sidecar on disk (and its checksum verifies), and the JSON
+    /// otherwise; see <see cref="LoadWithReport"/> to learn which. A save
+    /// without a snapshot deletes any existing one. If the snapshot cannot be
+    /// written the graph and sidecar are saved anyway, a stale snapshot is
+    /// removed, and the error is thrown.
     /// </summary>
-    public void Save(string path, bool embeddings = true)
+    /// <param name="path">Graph file path (.isonl for ISONL, otherwise ISON).</param>
+    /// <param name="embeddings">Write the embeddings sidecar.</param>
+    /// <param name="snapshot">Also write the binary snapshot (needs <paramref name="embeddings"/>).</param>
+    public void Save(string path, bool embeddings = true, bool snapshot = false)
     {
         bool isonl = IsIsonl(path);
         var text = isonl ? _graph.ToIsonl() : _graph.ToIson();
         AtomicFile.WriteText(path, text);
 
-        if (embeddings)
-            _store.SaveEmbeddings(EmbeddingsPathFor(path), GraphDigest.OfText(text, isonl));
+        if (!embeddings) return;
+        var digest = GraphDigest.OfText(text, isonl);
+        var sidecar = EmbeddingsPathFor(path);
+        var snap = SnapshotPathFor(path);
+        if (!snapshot)
+            DeleteQuietly(snap);        // the sidecar is about to change: a snapshot of the old one is stale
+        _store.SaveEmbeddings(sidecar, digest);
+        if (!snapshot) return;
+        try
+        {
+            _store.SaveSnapshot(snap, new SnapshotIdentity(digest, SidecarId.OfFile(sidecar)));
+        }
+        catch
+        {
+            DeleteQuietly(snap);        // the pair is saved; a stale snapshot must not survive
+            throw;
+        }
+    }
+
+    private static void DeleteQuietly(string path)
+    {
+        try { File.Delete(path); }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
     }
 
     /// <summary>
@@ -2043,10 +1464,48 @@ public sealed class SemanticGraph
         int? annNlist = null,
         int? annNprobe = null,
         int annMinSize = EmbeddingStore.DefaultAnnMinSize,
+        int annSeed = 0) =>
+        LoadWithReport(path, encoder, embeddings, autoEmbed, embedFields, onMismatch, version,
+            onModelMismatch, onWarning, ann, annNlist, annNprobe, annMinSize, annSeed).Graph;
+
+    /// <summary>Binary snapshot path for a saved graph (<c>&lt;path&gt;.embeddings.snap</c>).</summary>
+    public static string SnapshotPathFor(string path) =>
+        path + IsonGraphVectorVersion.EmbeddingSnapshotSuffix;
+
+    /// <summary>
+    /// <see cref="Load"/>, also saying where the embeddings came from.
+    ///
+    /// If a binary snapshot (<c>&lt;path&gt;.embeddings.snap</c>, written by
+    /// <see cref="Save"/> with <c>snapshot: true</c>) sits beside the sidecar,
+    /// it is used when its header names this graph's digest and the sidecar
+    /// file as it is now and its checksum verifies; the result is identical to
+    /// loading the JSON. Otherwise the JSON sidecar is read, exactly as before,
+    /// and <see cref="LoadReport.SnapshotSkipped"/> says why the snapshot was
+    /// not used (a snapshot that fails any check never changes the store).
+    /// Parameters are those of <see cref="Load"/>.
+    /// </summary>
+    public static (SemanticGraph Graph, LoadReport Report) LoadWithReport(
+        string path,
+        IEmbeddingEncoder? encoder = null,
+        bool embeddings = true,
+        bool autoEmbed = true,
+        IEnumerable<string>? embedFields = null,
+        GraphMismatchMode onMismatch = GraphMismatchMode.Error,
+        string? version = null,
+        ModelMismatchMode onModelMismatch = ModelMismatchMode.Warn,
+        Action<string>? onWarning = null,
+        AnnMode ann = AnnMode.None,
+        int? annNlist = null,
+        int? annNprobe = null,
+        int annMinSize = EmbeddingStore.DefaultAnnMinSize,
         int annSeed = 0)
     {
         if (!Enum.IsDefined(onMismatch))
             throw new ArgumentOutOfRangeException(nameof(onMismatch), onMismatch, "unknown GraphMismatchMode");
+
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        LoadReport Report(LoadSource source, string? skipped, int count) =>
+            new(source, skipped, count, System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalSeconds);
 
         bool isonl = IsIsonl(path);
         var graphText = File.ReadAllText(path, System.Text.Encoding.UTF8);
@@ -2063,16 +1522,26 @@ public sealed class SemanticGraph
         foreach (var edge in loaded.Edges())
             graph._graph.AddEdge(edge.RelType, edge.Source, edge.Target, edge.Properties);
 
-        if (!embeddings) return graph;
+        if (!embeddings) return (graph, Report(LoadSource.NoEmbeddings, null, 0));
 
         var sidecar = EmbeddingsPathFor(path);
-        if (!File.Exists(sidecar)) return graph;
+        if (!File.Exists(sidecar)) return (graph, Report(LoadSource.NoEmbeddings, null, 0));
+
+        string? snapshotSkipped = null;
+        var snap = SnapshotPathFor(path);
+        if (File.Exists(snap))
+        {
+            if (graph._store.TryAdoptSnapshot(snap, sidecar, GraphDigest.OfText(graphText, isonl), out var info, out snapshotSkipped))
+            {
+                graph.WarnOnVersionSkew();
+                return (graph, Report(LoadSource.Snapshot, null, info!.Count));
+            }
+        }
 
         ExportedEmbeddings? payload;
         try
         {
-            payload = JsonSerializer.Deserialize<ExportedEmbeddings>(
-                File.ReadAllText(sidecar, System.Text.Encoding.UTF8));
+            payload = EmbeddingStore.DeserializePayload(sidecar);
         }
         catch (JsonException ex)
         {
@@ -2105,21 +1574,25 @@ public sealed class SemanticGraph
         if (problem is not null && onMismatch == GraphMismatchMode.Reembed)
         {
             graph.EmbedAllNodes();
-            return graph;
+            return (graph, Report(LoadSource.Json, snapshotSkipped, graph._store.Count));
         }
 
         if (problem is not null) graph._store.RaiseWarning(problem);
         graph._store.ImportEmbeddings(payload);
+        graph.WarnOnVersionSkew();
+        return (graph, Report(LoadSource.Json, snapshotSkipped, graph._store.Count));
+    }
 
-        var storedVersion = graph._store.LastImportMeta.GetValueOrDefault("encoder_version");
-        var currentVersion = graph._store.Version;
+    private void WarnOnVersionSkew()
+    {
+        var storedVersion = _store.LastImportMeta.GetValueOrDefault("encoder_version");
+        var currentVersion = _store.Version;
         if (storedVersion is not null && currentVersion is not null && storedVersion != currentVersion)
         {
-            graph._store.RaiseWarning(
+            _store.RaiseWarning(
                 $"embeddings were made by encoder version '{storedVersion}', " +
                 $"but the encoder in use is version '{currentVersion}'");
         }
-        return graph;
     }
 
     public override string ToString() =>
