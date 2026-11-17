@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use thiserror::Error;
 
 mod ann;
+pub use ann::quant::{Int8Recall, ScanPrecision, DEFAULT_RERANK_FACTOR};
 pub use ann::{
     AnnConfig, AnnSearchCounts, AnnStats, MemoryStats, RecallReport, ANN_MIN_SIZE, FOLD_BATCH,
 };

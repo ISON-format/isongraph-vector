@@ -1672,8 +1672,22 @@ impl EmbeddingStore {
 
     // -- exact scans ----------------------------------------------------------
 
-    /// The full scan: every live row, spread over threads for a big store.
+    /// The full scan, in int8 + exact rerank when that is on and applies.
     fn exact_hits(&self, q: &QueryVec, code: Option<u32>, threshold: f32, k: usize) -> Vec<Hit> {
+        match self.quant_exact(q, code, threshold, k) {
+            Some(hits) => hits,
+            None => self.exact_hits_f32(q, code, threshold, k),
+        }
+    }
+
+    /// The f32 full scan: every live row, spread over threads for a big store.
+    fn exact_hits_f32(
+        &self,
+        q: &QueryVec,
+        code: Option<u32>,
+        threshold: f32,
+        k: usize,
+    ) -> Vec<Hit> {
         let table = &self.table;
         let (n, dim) = (table.slots(), table.dim);
         let rows = table.rows();
@@ -1729,6 +1743,9 @@ impl EmbeddingStore {
         threshold: f32,
         k: usize,
     ) -> Vec<Vec<Hit>> {
+        if let Some(hits) = self.quant_exact_batch(qs, code, threshold, k) {
+            return hits;
+        }
         let table = &self.table;
         let n = table.slots();
         let rows = table.rows();
@@ -1983,7 +2000,17 @@ impl EmbeddingStore {
                     .fetch_add(qs.len() as u64, Ordering::Relaxed);
             } else if let Some(guard) = self.ready_index(cfg) {
                 if let Some(ivf) = guard.as_ref() {
-                    self.approximate_batch(cfg, ivf, qs, code, threshold, top_k, &mut answers);
+                    if !self.quant_approximate_batch(
+                        cfg,
+                        ivf,
+                        qs,
+                        code,
+                        threshold,
+                        top_k,
+                        &mut answers,
+                    ) {
+                        self.approximate_batch(cfg, ivf, qs, code, threshold, top_k, &mut answers);
+                    }
                 }
                 let fallbacks = answers.iter().filter(|a| a.is_none()).count() as u64;
                 self.counts.exact.fetch_add(fallbacks, Ordering::Relaxed);
@@ -2462,6 +2489,9 @@ fn scan_probed(
     par: Par,
 ) -> TopK {
     const CELLS_PER_TASK: usize = 4;
+    if let Some(top) = quant::scan_probed(table, cells, chosen, q, code, threshold, k, par) {
+        return top;
+    }
     let rows = table.rows();
     let live = table.live();
     let candidates: usize = chosen
@@ -2509,6 +2539,11 @@ pub(crate) type IvfSlot = RwLock<Option<Ivf>>;
 
 #[allow(dead_code, clippy::manual_is_multiple_of)]
 const _: () = assert!(CHUNK_ROWS % BLOCK_ROWS == 0 && CHUNK_ROWS % NEAR_BLOCK == 0);
+
+// Opt-in int8 first-pass scan with an exact rerank (see `quant.rs`). Declared
+// after `dispatch!` so the child can use that macro.
+#[path = "quant.rs"]
+pub(crate) mod quant;
 
 #[cfg(test)]
 mod tests {

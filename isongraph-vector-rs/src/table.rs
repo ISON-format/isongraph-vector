@@ -15,6 +15,7 @@
 //!   scan splits into cache-sized blocks that never straddle a chunk.
 
 use crate::ann::dot_f32;
+use crate::ann::quant::QuantRows;
 use crate::{EmbeddingRecord, NodeId};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -47,6 +48,9 @@ pub(crate) struct VectorTable {
     /// Slots in use, tombstones included.
     n: usize,
     dead: usize,
+    /// The opt-in int8 copy of every row (see `ann/quant.rs`), kept slot for
+    /// slot beside the f32 matrix so it follows every write and compaction.
+    quant: Option<QuantRows>,
 }
 
 /// A read-only view of the matrix side, handed to scan kernels.
@@ -90,6 +94,7 @@ impl VectorTable {
             code_of: HashMap::new(),
             n: 0,
             dead: 0,
+            quant: None,
         }
     }
 
@@ -103,6 +108,35 @@ impl VectorTable {
         self.n = 0;
         self.dead = 0;
         self.dim = 0;
+        if let Some(q) = &mut self.quant {
+            q.clear();
+        }
+    }
+
+    /// The int8 copy, when scan precision is `Int8`.
+    pub fn quant(&self) -> Option<&QuantRows> {
+        self.quant.as_ref()
+    }
+
+    /// Keep (or, with `None`, drop) an int8 copy of every row. Building walks
+    /// the whole matrix once.
+    pub fn set_quant(&mut self, rerank_factor: Option<usize>) {
+        match (rerank_factor, self.quant.as_mut()) {
+            (None, _) => self.quant = None,
+            (Some(f), Some(q)) => q.rerank_factor = f,
+            (Some(f), None) => {
+                let mut q = QuantRows::new(f);
+                q.rebuild(&self.rows(), self.n);
+                self.quant = Some(q);
+            }
+        }
+    }
+
+    /// Node type name and id of a live row, borrowed.
+    pub fn type_and_id(&self, slot: usize) -> Option<(&str, &str)> {
+        let meta = self.meta(slot)?;
+        let ty = &*self.types[self.codes[slot] as usize];
+        Some((ty, &meta.key[ty.len() + 1..]))
     }
 
     /// Rows in use, tombstones included. Slots are `0..slots()`.
@@ -222,6 +256,9 @@ impl VectorTable {
             let s = slot as usize;
             let at = (s & CHUNK_MASK) * self.dim;
             self.chunks[s >> CHUNK_SHIFT][at..at + self.dim].copy_from_slice(vector);
+            if let Some(q) = &mut self.quant {
+                q.set(s, vector);
+            }
             self.norms[s] = norm;
             self.codes[s] = code;
             let meta = self.meta[s].as_mut().expect("indexed rows are live");
@@ -243,6 +280,9 @@ impl VectorTable {
             .last_mut()
             .expect("a chunk exists")
             .extend_from_slice(vector);
+        if let Some(q) = &mut self.quant {
+            q.push(slot, vector);
+        }
         self.norms.push(norm);
         self.codes.push(code);
         let key: Arc<str> = Arc::from(key);
@@ -311,6 +351,9 @@ impl VectorTable {
         }
         self.n = kept;
         self.dead = 0;
+        if let Some(q) = &mut self.quant {
+            q.compact(&live, dim);
+        }
         live
     }
 
@@ -371,6 +414,9 @@ impl VectorTable {
                     }
                 }
             }
+        }
+        if let Some(q) = &self.quant {
+            q.check(&self.rows(), n)?;
         }
         Ok(())
     }
