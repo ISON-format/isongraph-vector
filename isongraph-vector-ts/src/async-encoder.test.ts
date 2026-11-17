@@ -174,7 +174,7 @@ describe('SemanticGraph auto-embed over HTTP (openai shape)', () => {
     expect(seen[0].body.input).toEqual(['Alice an engineer']);
     expect(seen[0].headers.authorization).toBe('Bearer sk-test-key');
     const record = graph.getEmbedding(['person', 1])!;
-    expect(record.vector).toEqual(vectorOf('Alice an engineer'));
+    expect(record.vector).toEqual(vectorOf('Alice an engineer').map(Math.fround));   // stored as float32
     expect(record.model).toBe('remote-4');
     expect(graph.embeddingStore.dimension).toBe(4);
 
@@ -219,7 +219,7 @@ describe('SemanticGraph auto-embed over HTTP (openai shape)', () => {
     await graph.updateNodeAsync('person', 1, { name: 'Alice the manager' });
     expect(seen).toHaveLength(2);
     expect(graph.getEmbedding(['person', 1])!.text).toBe('Alice the manager');
-    expect(graph.getEmbedding(['person', 1])!.vector).toEqual(vectorOf('manager'));
+    expect(graph.getEmbedding(['person', 1])!.vector).toEqual(vectorOf('manager').map(Math.fround));   // stored as float32
 
     await graph.updateNodeAsync('person', 1, { name: null });    // nothing left to embed
     expect(graph.getEmbedding(['person', 1])).toBeNull();
