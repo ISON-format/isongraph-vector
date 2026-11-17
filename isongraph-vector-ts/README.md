@@ -251,8 +251,8 @@ index). `annNprobe >= annNlist` is the exact scan.
   (`nodeType`, `threshold`, `nodeFilter`) are applied to the probed cells, and
   the probe widens (4x per step, ending in the exact scan) when too few
   candidates survive, so a selective filter costs time, not results.
-- **Costs memory.** A Float32Array copy of the vectors (4 bytes per component),
-  next to the stored ones, plus about 8 bytes per vector for the cell lists.
+- **Costs little memory.** The index reads the store's single float32 table (it
+  owns no copy of the vectors), plus about 8 bytes per vector for the cell lists.
 - **Faster to query, slow to build.** Without BLAS the exact scan of 384-d
   vectors takes about 5 ms at 10k, 50 ms at 100k and 0.5 s at 1M; the index
   answers in 0.2-3 ms at 10k-100k (recall@10 1.00 at the default probe) and

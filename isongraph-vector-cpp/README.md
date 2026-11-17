@@ -337,11 +337,15 @@ need holds (`nprobe >= nlist` is the exact scan). What stays the same:
   when writes and deletes since training pass half the trained size the index
   retrains.
 
-The index keeps its own contiguous copy of the vectors (`AnnStats::vectorBytes`),
-so an indexed store holds them twice: 1.5 GB more at 1M x 384. It builds on all
+The index owns no vectors (`AnnStats::vectorBytes` is 0): it refers to the rows of
+the store's single chunked matrix, so an indexed store is about 1.12x the raw
+vectors at 1M x 384 (was 2.2x). Pending rows fold into their cells on the write
+that makes 256 of them. It builds on all
 hardware threads by default (`AnnOptions::threads`; the result does not depend on
 the count) and is seeded, so the same data gives the same index however it was
-inserted. Searches on one store take turns on the index.
+inserted. Searches are `const` and share a lock, so any number run at once;
+`similaritySearchBatch` runs a batch of queries on a bounded set of threads and
+returns exactly what one query at a time would.
 
 Measured with `bench/ann_bench.cpp` (build with `-DISONGRAPH_VECTOR_BENCH=ON`;
 384-d synthetic clustered data, top-10, single-threaded queries, a 32-thread

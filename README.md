@@ -322,6 +322,21 @@ graph = SemanticGraph.load("social.isong", encoder=my_encoder)
 Pass the `encoder=` you saved with. Without it, the first text search on a
 loaded graph constructs a `SentenceTransformerEncoder` and downloads a model.
 
+**Large stores: the optional binary snapshot.** The JSON sidecar is portable but
+big and slow at scale (450-810 MB and 4-16 s to write at 100k x 384 vectors, by port;
+past that, JavaScript cannot build the string at all). `graph.save(path,
+snapshot=True)` also writes `<path>.embeddings.snap`, a checksummed binary copy
+of the same embeddings that is about 3-5x smaller and an order of magnitude
+faster to save and load. `load` uses it only when it provably belongs to the
+graph and sidecar on disk, and otherwise reads the JSON, so the JSON stays the
+portable default and nothing about the graph file or its digest changes.
+`load_with_report` says which one it used and why a snapshot was skipped. Every
+port reads and writes the same file (format: `isongraph-vector-rs/DESIGN.md`
+section 11); the ANN index is not in it and is rebuilt after load. Snapshot
+spelling per port: `save(path, snapshot=True)` (Python), `saveGraph(graph, path,
+{ snapshot: true })` (TypeScript / JavaScript), `Save(path, snapshot: true)` (C#),
+`save(path, "auto", true, true)` (C++), `save_with_snapshot(path, None)` (Rust).
+
 The other five ports persist embeddings to SQLite and exchange the portable
 payload, but the graph itself stays in memory there.
 
