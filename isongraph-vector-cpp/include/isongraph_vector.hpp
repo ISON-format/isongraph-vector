@@ -49,6 +49,16 @@
 #include <random>
 #include <cstdio>
 #include <mutex>
+#include <shared_mutex>
+#include <array>
+#include <cstring>
+#include <numeric>
+#include <string_view>
+#if defined(_WIN32)
+#include <io.h>
+#elif defined(__unix__) || defined(__APPLE__)
+#include <unistd.h>
+#endif
 #include "ison_graph.hpp"
 #include "isongraph_vector_ivf.hpp"
 
@@ -301,6 +311,12 @@ public:
 // Embedding Record
 // =============================================================================
 
+/**
+ * A stored embedding as handed out by EmbeddingStore::get(): a *copy* of the row.
+ * The store itself keeps each vector once, in a chunked matrix, and no record
+ * object exists inside it, so there is nothing for a reference to point at (see
+ * EmbeddingStore::vectorData for a zero-copy view).
+ */
 struct EmbeddingRecord {
     std::string id;
     NodeRef node_ref;
@@ -308,12 +324,6 @@ struct EmbeddingRecord {
     std::string text;
     /** Model that produced the vector: the encoder's modelName(), "provided" or "unknown". */
     std::string model = "unknown";
-    /**
-     * Internal: this record's row in the approximate index, valid only while
-     * an index exists (see EmbeddingStore::enableAnn). Not part of the data;
-     * never saved, copied between stores or compared.
-     */
-    mutable uint32_t ann_slot = detail::IvfIndex::kNoSlot;
 };
 
 // =============================================================================
@@ -615,36 +625,87 @@ private:
 
 // -----------------------------------------------------------------------------
 // SHA-256 (FIPS 180-4), self-contained so the graph digest needs no dependency.
+// Streaming, so a multi-gigabyte snapshot can be hashed as it is read or written.
 // -----------------------------------------------------------------------------
 
-inline std::string sha256Hex(const std::string& data) {
-    static const uint32_t K[64] = {
-        0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u, 0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u,
-        0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u, 0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u, 0xc19bf174u,
-        0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu, 0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau,
-        0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u, 0xc6e00bf3u, 0xd5a79147u, 0x06ca6351u, 0x14292967u,
-        0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu, 0x53380d13u, 0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u,
-        0xa2bfe8a1u, 0xa81a664bu, 0xc24b8b70u, 0xc76c51a3u, 0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u,
-        0x19a4c116u, 0x1e376c08u, 0x2748774cu, 0x34b0bcb5u, 0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu, 0x682e6ff3u,
-        0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u, 0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u
-    };
-    uint32_t h[8] = {0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
-                     0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u};
+class Sha256 {
+public:
+    Sha256() { reset(); }
 
-    std::string padded = data;
-    padded.push_back(static_cast<char>(0x80));
-    while (padded.size() % 64 != 56) padded.push_back('\0');
-    const uint64_t bitLength = static_cast<uint64_t>(data.size()) * 8u;
-    for (int shift = 56; shift >= 0; shift -= 8) {
-        padded.push_back(static_cast<char>((bitLength >> shift) & 0xFFu));
+    void reset() {
+        h_[0] = 0x6a09e667u; h_[1] = 0xbb67ae85u; h_[2] = 0x3c6ef372u; h_[3] = 0xa54ff53au;
+        h_[4] = 0x510e527fu; h_[5] = 0x9b05688cu; h_[6] = 0x1f83d9abu; h_[7] = 0x5be0cd19u;
+        buffered_ = 0;
+        total_ = 0;
     }
 
-    auto rotr = [](uint32_t x, unsigned n) { return (x >> n) | (x << (32u - n)); };
+    void update(const void* data, size_t size) {
+        const unsigned char* p = static_cast<const unsigned char*>(data);
+        total_ += size;
+        if (buffered_ > 0) {
+            const size_t take = std::min(size, size_t(64) - buffered_);
+            std::copy(p, p + take, buffer_ + buffered_);
+            buffered_ += take;
+            p += take;
+            size -= take;
+            if (buffered_ < 64) return;
+            compress(buffer_);
+            buffered_ = 0;
+        }
+        while (size >= 64) {
+            compress(p);
+            p += 64;
+            size -= 64;
+        }
+        if (size > 0) {
+            std::copy(p, p + size, buffer_);
+            buffered_ = size;
+        }
+    }
 
-    for (size_t offset = 0; offset < padded.size(); offset += 64) {
+    /** The digest of everything fed so far; the hasher itself is left unchanged. */
+    std::array<unsigned char, 32> digest() const {
+        Sha256 copy = *this;
+        const uint64_t bitLength = copy.total_ * 8u;
+        const unsigned char one = 0x80;
+        copy.update(&one, 1);
+        const unsigned char zero = 0;
+        while (copy.buffered_ != 56) copy.update(&zero, 1);
+        unsigned char length[8];
+        for (int i = 0; i < 8; ++i) length[i] = static_cast<unsigned char>((bitLength >> (56 - 8 * i)) & 0xFFu);
+        copy.update(length, 8);
+        std::array<unsigned char, 32> out{};
+        for (size_t i = 0; i < 8; ++i) {
+            out[4 * i] = static_cast<unsigned char>(copy.h_[i] >> 24);
+            out[4 * i + 1] = static_cast<unsigned char>(copy.h_[i] >> 16);
+            out[4 * i + 2] = static_cast<unsigned char>(copy.h_[i] >> 8);
+            out[4 * i + 3] = static_cast<unsigned char>(copy.h_[i]);
+        }
+        return out;
+    }
+
+private:
+    uint32_t h_[8];
+    unsigned char buffer_[64];
+    size_t buffered_ = 0;
+    uint64_t total_ = 0;
+
+    static uint32_t rotr(uint32_t x, unsigned n) { return (x >> n) | (x << (32u - n)); }
+
+    void compress(const unsigned char* block) {
+        static const uint32_t K[64] = {
+            0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u, 0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u,
+            0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u, 0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u, 0xc19bf174u,
+            0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu, 0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau,
+            0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u, 0xc6e00bf3u, 0xd5a79147u, 0x06ca6351u, 0x14292967u,
+            0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu, 0x53380d13u, 0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u,
+            0xa2bfe8a1u, 0xa81a664bu, 0xc24b8b70u, 0xc76c51a3u, 0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u,
+            0x19a4c116u, 0x1e376c08u, 0x2748774cu, 0x34b0bcb5u, 0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu, 0x682e6ff3u,
+            0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u, 0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u
+        };
         uint32_t w[64];
         for (size_t i = 0; i < 16; ++i) {
-            const unsigned char* p = reinterpret_cast<const unsigned char*>(padded.data()) + offset + i * 4;
+            const unsigned char* p = block + i * 4;
             w[i] = (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
                    (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
         }
@@ -653,7 +714,7 @@ inline std::string sha256Hex(const std::string& data) {
             uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
             w[i] = w[i - 16] + s0 + w[i - 7] + s1;
         }
-        uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+        uint32_t a = h_[0], b = h_[1], c = h_[2], d = h_[3], e = h_[4], f = h_[5], g = h_[6], hh = h_[7];
         for (size_t i = 0; i < 64; ++i) {
             uint32_t S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
             uint32_t ch = (e & f) ^ (~e & g);
@@ -663,17 +724,27 @@ inline std::string sha256Hex(const std::string& data) {
             uint32_t t2 = S0 + maj;
             hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
         }
-        h[0] += a; h[1] += b; h[2] += c; h[3] += d;
-        h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+        h_[0] += a; h_[1] += b; h_[2] += c; h_[3] += d;
+        h_[4] += e; h_[5] += f; h_[6] += g; h_[7] += hh;
     }
+};
 
+inline std::string hexOf(const unsigned char* bytes, size_t n) {
     static const char* const HEX = "0123456789abcdef";
     std::string out;
-    out.reserve(64);
-    for (uint32_t word : h) {
-        for (int shift = 28; shift >= 0; shift -= 4) out.push_back(HEX[(word >> shift) & 0xFu]);
+    out.reserve(n * 2);
+    for (size_t i = 0; i < n; ++i) {
+        out.push_back(HEX[(bytes[i] >> 4) & 0xFu]);
+        out.push_back(HEX[bytes[i] & 0xFu]);
     }
     return out;
+}
+
+inline std::string sha256Hex(const std::string& data) {
+    Sha256 hasher;
+    hasher.update(data.data(), data.size());
+    const auto digest = hasher.digest();
+    return hexOf(digest.data(), digest.size());
 }
 
 // -----------------------------------------------------------------------------
@@ -1071,7 +1142,7 @@ struct AnnStats {
     double buildSeconds = 0.0;
     /** Memory held by the index on top of the vectors it scans. */
     size_t indexBytes = 0;
-    /** Memory of the contiguous copy of the vectors the index scans. */
+    /** Always 0 now: the index keeps no copy of the vectors (kept so existing code still compiles). */
     size_t vectorBytes = 0;
     size_t minSize = 0;
     /** Searches answered from the index, from a widened probe, by the full scan, and index builds, since enableAnn. */
@@ -1101,63 +1172,376 @@ struct RecallReport {
     double exactMs = 0.0;
 };
 
+// =============================================================================
+// Binary snapshot (optional, beside the JSON sidecar)
+// =============================================================================
+
+/** Appended to the graph file's name: `<graph>.embeddings.snap`. */
+constexpr const char* EMBEDDING_SNAPSHOT_SUFFIX = ".embeddings.snap";
+/** The only snapshot layout version this build reads and writes. */
+constexpr uint32_t SNAPSHOT_VERSION = 1;
+
+/**
+ * A cheap identity for a sidecar file: its length and a SHA-256 over that
+ * length, its first and last 64 KiB and 64 probes of 4 KiB spread over the
+ * rest. A serializer rewriting the sidecar changes it; a hand edit that keeps
+ * the length and touches no sampled byte does not, which is why a save that
+ * writes no snapshot deletes the old one. See DESIGN.md section 11.1.
+ */
+struct SidecarId {
+    uint64_t len = 0;
+    std::array<unsigned char, 32> fingerprint{};
+
+    bool operator==(const SidecarId& other) const {
+        return len == other.len && fingerprint == other.fingerprint;
+    }
+    bool operator!=(const SidecarId& other) const { return !(*this == other); }
+};
+
+/** What a snapshot is tied to: the graph (by digest) and the JSON sidecar saved with it. */
+struct SnapshotIdentity {
+    std::optional<std::string> graphDigest;
+    std::optional<SidecarId> sidecar;
+};
+
+/** The header of a snapshot, and its size. */
+struct SnapshotInfo {
+    uint32_t version = SNAPSHOT_VERSION;
+    size_t dimension = 0;
+    size_t count = 0;
+    std::optional<std::string> graphDigest;
+    std::optional<std::string> graphDigestBasis;
+    std::optional<std::string> encoderModel;
+    std::optional<std::string> encoderVersion;
+    std::optional<SidecarId> sidecar;
+    /** File size in bytes. */
+    uint64_t bytes = 0;
+};
+
+/** Where a SemanticGraph::load took its embeddings from. */
+enum class LoadSource {
+    Snapshot,       ///< the binary snapshot
+    Json,           ///< the JSON sidecar
+    NoEmbeddings    ///< nothing was restored (embeddings off, or no sidecar)
+};
+
+/** What SemanticGraph::load did (see its `report` parameter). */
+struct LoadReport {
+    LoadSource source = LoadSource::NoEmbeddings;
+    /**
+     * Why a snapshot that exists was not used (the JSON sidecar was read
+     * instead); nullopt when it was used or there is none.
+     */
+    std::optional<std::string> snapshotSkipped;
+    /** Embeddings restored. */
+    size_t embeddings = 0;
+    /** Wall time of the whole load. */
+    double seconds = 0.0;
+};
+
 namespace detail {
+
+/** The scoring of one row. Strict IEEE float arithmetic, one fixed order; see cosineRows. */
+#if defined(__clang__)
+#define ISONGRAPH_VECTOR_NOINLINE __attribute__((noinline))
+#elif defined(__GNUC__)
+#define ISONGRAPH_VECTOR_NOINLINE __attribute__((noinline, noclone))
+#elif defined(_MSC_VER)
+#define ISONGRAPH_VECTOR_NOINLINE __declspec(noinline)
+#else
+#define ISONGRAPH_VECTOR_NOINLINE
+#endif
+
+/**
+ * The cosine of two n-float rows: dot / (|a| * |b|), 0 when either norm is 0.
+ * The three sums run in ascending order in single-precision accumulators.
+ *
+ * THE one scoring routine. The exact scan, the batch search, the approximate
+ * index's re-score, scoreMap and a store loaded from a snapshot all call this
+ * function and nothing else, so one query/row pair has one score everywhere.
+ * It is out of line on purpose: two inlined copies are free to be contracted
+ * (fused multiply-add) or vectorised differently by an optimiser, which showed
+ * up as last-bit differences on GCC 15. Never compile this with -ffast-math.
+ */
+ISONGRAPH_VECTOR_NOINLINE inline float cosineRows(const float* a, const float* b, size_t n) {
+    float dot = 0.0f;
+    float norm1 = 0.0f;
+    float norm2 = 0.0f;
+
+    for (size_t i = 0; i < n; ++i) {
+        dot += a[i] * b[i];
+        norm1 += a[i] * a[i];
+        norm2 += b[i] * b[i];
+    }
+
+    norm1 = std::sqrt(norm1);
+    norm2 = std::sqrt(norm2);
+
+    if (norm1 == 0.0f || norm2 == 0.0f) return 0.0f;
+    return dot / (norm1 * norm2);
+}
+
+/** Per-slot data that is not the vector. */
+struct SlotMeta {
+    std::string key;      ///< "type:id"
+    std::string text;
+    uint32_t model = 0;   ///< index into Table::models
+};
+
+/**
+ * The whole store: a slot is a row number, and nothing else owns the floats.
+ * Slots are in arrival order; a delete tombstones (alive = 0) and compaction
+ * moves live rows down once a quarter of the slots are dead.
+ */
+struct Table {
+    ChunkedMatrix matrix;                                  ///< the one copy of every vector
+    std::vector<SlotMeta> meta;
+    std::vector<uint32_t> codes;                           ///< node type as an index into `types`
+    std::vector<uint8_t> alive;
+    size_t dead = 0;
+    std::unordered_map<std::string, uint32_t> lookup;      ///< key -> slot
+    std::vector<std::string> types;                        ///< never shrinks
+    std::unordered_map<std::string, uint32_t> typeCodes;
+    std::vector<std::string> models;                       ///< interned model names, never shrinks
+    std::unordered_map<std::string, uint32_t> modelIds;
+    std::vector<size_t> modelCount;                        ///< live rows per model
+
+    Table() = default;
+    Table(const Table&) = default;
+    Table& operator=(const Table&) = default;
+    Table(Table&& other) noexcept { swapWith(other); }
+    Table& operator=(Table&& other) noexcept {
+        if (this != &other) {
+            Table fresh;
+            swapWith(fresh);
+            swapWith(other);
+        }
+        return *this;
+    }
+
+    void swapWith(Table& other) noexcept {
+        std::swap(matrix, other.matrix);
+        meta.swap(other.meta);
+        codes.swap(other.codes);
+        alive.swap(other.alive);
+        std::swap(dead, other.dead);
+        lookup.swap(other.lookup);
+        types.swap(other.types);
+        typeCodes.swap(other.typeCodes);
+        models.swap(other.models);
+        modelIds.swap(other.modelIds);
+        modelCount.swap(other.modelCount);
+    }
+
+    size_t slots() const { return alive.size(); }
+    size_t liveCount() const { return alive.size() - dead; }
+};
+
+/** Warnings already issued by a store (one per distinct model pair); safe to touch from const searches. */
+struct WarnState {
+    std::mutex mutex;
+    std::set<std::string> seen;
+
+    WarnState() = default;
+    WarnState(const WarnState& other) : seen(other.seen) {}
+    WarnState(WarnState&& other) noexcept : seen(std::move(other.seen)) {}
+    WarnState& operator=(const WarnState& other) {
+        if (this != &other) seen = other.seen;
+        return *this;
+    }
+    WarnState& operator=(WarnState&& other) noexcept {
+        if (this != &other) seen = std::move(other.seen);
+        return *this;
+    }
+};
 
 /**
  * Everything the store keeps for approximate search. Copying drops the index
- * (its slot table points into the source's records) and the counters; moving
- * carries the index along, since moving the record map keeps its nodes.
+ * (it is rebuilt lazily from the copy's own rows) and the counters; moving
+ * carries the index along.
+ *
+ * Searches take `mutex` shared; building, retraining, folding and every write
+ * take it exclusively. The counters are relaxed atomics.
  */
 struct AnnState {
-    mutable std::mutex mutex;
+    mutable std::shared_mutex mutex;
     std::optional<AnnOptions> options;
     std::unique_ptr<IvfIndex> index;
-    std::vector<const EmbeddingRecord*> recs;            // slot -> record, null once dropped
-    std::unordered_map<std::string, uint32_t> codes;     // node type -> small integer
-    std::vector<IvfHit> hits;                            // per-query scratch
-    size_t approximate = 0, widened = 0, exact = 0, builds = 0;
+    std::atomic<size_t> approximate{0}, widened{0}, exact{0}, builds{0};
 
     AnnState() = default;
     AnnState(const AnnState& other) : options(other.options) {}
     AnnState(AnnState&& other) noexcept { takeFrom(other); }
     AnnState& operator=(const AnnState& other) {
         if (this != &other) {
-            std::lock_guard<std::mutex> lock(mutex);
-            reset();
+            std::unique_lock<std::shared_mutex> lock(mutex);
+            index.reset();
             options = other.options;
-            approximate = widened = exact = builds = 0;
+            approximate = 0; widened = 0; exact = 0; builds = 0;
         }
         return *this;
     }
     AnnState& operator=(AnnState&& other) noexcept {
         if (this != &other) {
-            std::lock_guard<std::mutex> lock(mutex);
+            std::unique_lock<std::shared_mutex> lock(mutex);
             takeFrom(other);
         }
         return *this;
     }
 
-    void reset() {
-        index.reset();
-        recs.clear();
-        recs.shrink_to_fit();
-        codes.clear();
-        hits.clear();
-    }
+    void reset() { index.reset(); }
 
 private:
     void takeFrom(AnnState& other) {
         options = std::move(other.options);
         index = std::move(other.index);
-        recs = std::move(other.recs);
-        codes = std::move(other.codes);
-        hits = std::move(other.hits);
-        approximate = other.approximate; widened = other.widened;
-        exact = other.exact; builds = other.builds;
+        approximate = other.approximate.load();
+        widened = other.widened.load();
+        exact = other.exact.load();
+        builds = other.builds.load();
         other.options.reset();
-        other.reset();
+        other.index.reset();
     }
 };
+
+/** Is [p, p+n) well-formed UTF-8 (no overlong forms, no surrogates, nothing above U+10FFFF)? */
+inline bool validUtf8(const unsigned char* p, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        const unsigned char c = p[i];
+        if (c < 0x80) { ++i; continue; }
+        size_t len;
+        uint32_t cp;
+        if (c >= 0xC2 && c <= 0xDF) { len = 2; cp = c & 0x1Fu; }
+        else if (c >= 0xE0 && c <= 0xEF) { len = 3; cp = c & 0x0Fu; }
+        else if (c >= 0xF0 && c <= 0xF4) { len = 4; cp = c & 0x07u; }
+        else return false;
+        if (i + len > n) return false;
+        for (size_t k = 1; k < len; ++k) {
+            if ((p[i + k] & 0xC0u) != 0x80u) return false;
+            cp = (cp << 6) | (p[i + k] & 0x3Fu);
+        }
+        if (len == 3 && (cp < 0x800 || (cp >= 0xD800 && cp <= 0xDFFF))) return false;
+        if (len == 4 && (cp < 0x10000 || cp > 0x10FFFF)) return false;
+        i += len;
+    }
+    return true;
+}
+
+inline bool hostIsLittleEndian() {
+    const uint16_t probe = 1;
+    unsigned char first;
+    std::memcpy(&first, &probe, 1);
+    return first == 1;
+}
+
+/** Write n floats as IEEE-754 little-endian bytes. */
+inline void floatsToLe(const float* src, size_t n, unsigned char* dst) {
+    static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559,
+                  "snapshots store IEEE-754 binary32");
+    if (hostIsLittleEndian()) {
+        std::memcpy(dst, src, n * 4);
+        return;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        uint32_t bits;
+        std::memcpy(&bits, src + i, 4);
+        for (int b = 0; b < 4; ++b) dst[4 * i + static_cast<size_t>(b)] = static_cast<unsigned char>(bits >> (8 * b));
+    }
+}
+
+/** Read n floats from IEEE-754 little-endian bytes. */
+inline void floatsFromLe(const unsigned char* src, size_t n, float* dst) {
+    if (hostIsLittleEndian()) {
+        std::memcpy(dst, src, n * 4);
+        return;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        uint32_t bits = 0;
+        for (int b = 0; b < 4; ++b) bits |= static_cast<uint32_t>(src[4 * i + static_cast<size_t>(b)]) << (8 * b);
+        std::memcpy(dst + i, &bits, 4);
+    }
+}
+
+inline void putU32(std::string& out, uint32_t v) {
+    for (int b = 0; b < 4; ++b) out.push_back(static_cast<char>((v >> (8 * b)) & 0xFFu));
+}
+inline void putU64(std::string& out, uint64_t v) {
+    for (int b = 0; b < 8; ++b) out.push_back(static_cast<char>((v >> (8 * b)) & 0xFFu));
+}
+inline void putStr(std::string& out, const std::string& s) {
+    putU32(out, static_cast<uint32_t>(s.size()));
+    out += s;
+}
+inline void putOpt(std::string& out, const std::optional<std::string>& s) {
+    if (s.has_value()) putStr(out, *s); else putU32(out, 0xFFFFFFFFu);
+}
+
+/** Why a snapshot was refused (as opposed to being unreadable): falls back to the JSON sidecar. */
+class SnapshotRejected : public std::runtime_error {
+public:
+    explicit SnapshotRejected(const std::string& what) : std::runtime_error(what) {}
+};
+
+/** Identity of the file at `path`; throws EmbeddingError when it cannot be read. */
+template <typename Err>
+inline SidecarId sidecarIdOf(const std::string& path) {
+    namespace fs = std::filesystem;
+    std::ifstream file(path, std::ios::binary);
+    if (!file) throw Err("cannot open file for reading: " + path);
+    std::error_code ec;
+    const uint64_t len = static_cast<uint64_t>(fs::file_size(fs::path(path), ec));
+    if (ec) throw Err("cannot size " + path + ": " + ec.message());
+
+    constexpr uint64_t kEdge = 64 * 1024, kProbe = 4 * 1024, kProbes = 64;
+    Sha256 hasher;
+    unsigned char lenBytes[8];
+    for (int b = 0; b < 8; ++b) lenBytes[b] = static_cast<unsigned char>((len >> (8 * b)) & 0xFFu);
+    hasher.update(lenBytes, 8);
+    std::vector<char> buf;
+    auto take = [&](uint64_t at, uint64_t n) {
+        n = std::min(n, len > at ? len - at : uint64_t(0));
+        buf.resize(static_cast<size_t>(n));
+        file.clear();
+        file.seekg(static_cast<std::streamoff>(at));
+        file.read(buf.data(), static_cast<std::streamsize>(n));
+        if (static_cast<uint64_t>(file.gcount()) != n) throw Err("short read of " + path);
+        hasher.update(buf.data(), buf.size());
+    };
+    take(0, kEdge);
+    take(len > kEdge ? len - kEdge : 0, kEdge);
+    for (uint64_t i = 1; i <= kProbes; ++i) {
+        // floor(len * i / 65) without overflowing 64 bits
+        const uint64_t at = (len / (kProbes + 1)) * i + ((len % (kProbes + 1)) * i) / (kProbes + 1);
+        take(at, kProbe);
+    }
+    SidecarId id;
+    id.len = len;
+    id.fingerprint = hasher.digest();
+    return id;
+}
+
+/** fopen without the MSVC deprecation warning. */
+inline std::FILE* openFile(const std::string& path, const char* mode) {
+#if defined(_MSC_VER)
+    std::FILE* file = nullptr;
+    if (fopen_s(&file, path.c_str(), mode) != 0) return nullptr;
+    return file;
+#else
+    return std::fopen(path.c_str(), mode);
+#endif
+}
+
+/** Flush a stdio stream's data to the disk where the platform lets us; failure is not an error. */
+inline void syncFile(std::FILE* file) {
+#if defined(_WIN32)
+    _commit(_fileno(file));
+#elif defined(__unix__) || defined(__APPLE__)
+    ::fsync(fileno(file));
+#else
+    (void)file;
+#endif
+}
 
 }  // namespace detail
 
@@ -1165,18 +1549,38 @@ private:
 // Embedding Store
 // =============================================================================
 
+/**
+ * Vectors and their texts, searched by cosine similarity.
+ *
+ * Storage: ONE copy of every vector, in a chunked row matrix (1024 rows per
+ * chunk); a record is a slot number. The approximate index (enableAnn) refers
+ * to the same rows, it does not copy them.
+ *
+ * Thread safety: every const method may be called from any number of threads at
+ * once, including searches that build or maintain the approximate index (that
+ * work is serialised internally). Non-const methods (add, remove, clear,
+ * import*, enableAnn, ...) need exclusive access: do not run one while anything
+ * else touches the store. A search therefore sees the store before a write or
+ * after it, never in the middle.
+ */
 class EmbeddingStore {
 private:
-    std::unordered_map<std::string, EmbeddingRecord> embeddings_;
+    detail::Table t_;
     std::shared_ptr<EmbeddingEncoder> encoder_;
     std::optional<size_t> dimension_;
     std::optional<std::string> version_;
     ModelMismatchMode onModelMismatch_ = ModelMismatchMode::Warn;
-    mutable std::set<std::string> warnedMismatch_;
+    mutable detail::WarnState warned_;
     EmbeddingMeta lastImportMeta_;
     mutable detail::AnnState ann_;
 
-    std::string nodeRefToKey(const NodeRef& ref) const {
+    using Ivf = detail::IvfIndex;
+    using IvfHit = detail::IvfHit;
+
+    /** Pending rows that trigger a fold into the approximate index at write time. */
+    static constexpr size_t kFoldBatch = 256;
+
+    static std::string nodeRefToKey(const NodeRef& ref) {
         return ref.type + ":" + ref.id;
     }
 
@@ -1209,6 +1613,203 @@ private:
         }
     }
 
+    // -- the table --------------------------------------------------------------
+
+    uint32_t typeCodeFor(const std::string& type) {
+        auto it = t_.typeCodes.find(type);
+        if (it != t_.typeCodes.end()) return it->second;
+        const uint32_t code = static_cast<uint32_t>(t_.types.size());
+        t_.types.push_back(type);
+        t_.typeCodes.emplace(type, code);
+        return code;
+    }
+
+    uint32_t modelIdFor(const std::string& model) {
+        auto it = t_.modelIds.find(model);
+        if (it != t_.modelIds.end()) return it->second;
+        const uint32_t id = static_cast<uint32_t>(t_.models.size());
+        t_.models.push_back(model);
+        t_.modelCount.push_back(0);
+        t_.modelIds.emplace(model, id);
+        return id;
+    }
+
+    NodeRef refOf(uint32_t slot) const {
+        const std::string& key = t_.meta[slot].key;
+        const std::string& type = t_.types[t_.codes[slot]];
+        return NodeRef(type, key.substr(type.size() + 1));
+    }
+
+    std::string_view typeOf(uint32_t slot) const { return t_.types[t_.codes[slot]]; }
+    std::string_view idOf(uint32_t slot) const {
+        const std::string& key = t_.meta[slot].key;
+        return std::string_view(key).substr(t_.types[t_.codes[slot]].size() + 1);
+    }
+
+    SimilarityResult resultOf(uint32_t slot, float score) const {
+        return SimilarityResult{refOf(slot), score, t_.meta[slot].text};
+    }
+
+    const float* rowOf(uint32_t slot) const { return t_.matrix.row(slot); }
+
+    /** Live slots in the order the JSON sidecar uses: node type, then id (byte order). */
+    std::vector<uint32_t> liveSlotsByTypeAndId() const {
+        std::vector<uint32_t> slots;
+        slots.reserve(t_.liveCount());
+        for (uint32_t s = 0; s < t_.slots(); ++s) {
+            if (t_.alive[s]) slots.push_back(s);
+        }
+        std::sort(slots.begin(), slots.end(), [this](uint32_t a, uint32_t b) {
+            const std::string_view ta = typeOf(a), tb = typeOf(b);
+            if (ta != tb) return ta < tb;
+            return idOf(a) < idOf(b);
+        });
+        return slots;
+    }
+
+    /**
+     * Insert or replace one row: the only way a vector enters the store. Returns
+     * true when a new slot was added, false when an existing row was overwritten
+     * in place. `v` has `n` floats, which must equal the store's dimension.
+     */
+    bool putRow(const NodeRef& ref, const float* v, size_t n, const std::string& text,
+                const std::string& model) {
+        std::string key = nodeRefToKey(ref);
+        const uint32_t code = typeCodeFor(ref.type);
+        const uint32_t modelId = modelIdFor(model);
+        auto found = t_.lookup.find(key);
+        uint32_t slot;
+        bool added;
+        if (found == t_.lookup.end()) {
+            if (t_.slots() >= std::numeric_limits<uint32_t>::max() - 1) {
+                throw EmbeddingError("the store cannot hold more than 2^32-2 embeddings");
+            }
+            if (t_.matrix.rows() == 0 && t_.matrix.dim() != n) t_.matrix.reset(n);
+            const size_t before = t_.slots();
+            try {
+                t_.meta.push_back(detail::SlotMeta{key, text, modelId});
+                t_.codes.push_back(code);
+                t_.alive.push_back(1);
+                slot = static_cast<uint32_t>(t_.matrix.append(v));
+                t_.lookup.emplace(std::move(key), slot);
+            } catch (...) {
+                t_.meta.resize(before);
+                t_.codes.resize(before);
+                t_.alive.resize(before);
+                if (t_.matrix.rows() > before) t_.matrix.truncate(before);
+                throw;
+            }
+            ++t_.modelCount[modelId];
+            added = true;
+        } else {
+            slot = found->second;
+            t_.matrix.set(slot, v);
+            detail::SlotMeta& meta = t_.meta[slot];
+            --t_.modelCount[meta.model];
+            meta.text = text;
+            meta.model = modelId;
+            ++t_.modelCount[modelId];
+            t_.codes[slot] = code;
+            added = false;
+        }
+        annAfterPut(slot, added);
+        return added;
+    }
+
+    /** Move live rows down over the tombstones (order preserving) and renumber everything slot-indexed. */
+    void compact() {
+        std::unique_lock<std::shared_mutex> lock(ann_.mutex);
+        const size_t n = t_.slots();
+        std::vector<uint32_t> remap(n, Ivf::kNoSlot);
+        size_t kept = 0;
+        for (size_t i = 0; i < n; ++i) {
+            if (!t_.alive[i]) continue;
+            remap[i] = static_cast<uint32_t>(kept);
+            if (kept != i) {
+                t_.matrix.moveRow(i, kept);
+                t_.meta[kept] = std::move(t_.meta[i]);
+                t_.codes[kept] = t_.codes[i];
+                t_.lookup[t_.meta[kept].key] = static_cast<uint32_t>(kept);
+            }
+            ++kept;
+        }
+        t_.matrix.truncate(kept);
+        t_.meta.resize(kept);
+        t_.codes.resize(kept);
+        t_.alive.assign(kept, 1);
+        t_.dead = 0;
+        t_.meta.shrink_to_fit();
+        t_.codes.shrink_to_fit();
+        t_.alive.shrink_to_fit();
+        if (ann_.index) ann_.index->remap(remap, kept);
+    }
+
+    // -- scoring ----------------------------------------------------------------
+
+    /**
+     * Score the live rows [lo, hi) against `q` (dimension n) and keep the best in
+     * `heap`: the best `k` by (score desc, slot asc) - a min-heap whose root is
+     * the worst kept - or, with `all`, every row that passes (the caller sorts).
+     * Rows of another type than `code` (unless kAnyCode) and scores below
+     * `threshold` (NaN included) are skipped.
+     */
+    void scanRows(const float* q, size_t n, size_t lo, size_t hi, uint32_t code, float threshold,
+                  size_t k, bool all, std::vector<IvfHit>& heap) const {
+        // [lo, hi) is one chunk (callers pass chunk bounds), so its rows are contiguous
+        const float* base = t_.matrix.chunkData(lo / detail::kChunkRows);
+        for (size_t slot = lo; slot < hi; ++slot) {
+            if (!t_.alive[slot]) continue;
+            if (code != Ivf::kAnyCode && t_.codes[slot] != code) continue;
+            const float score = detail::cosineRows(q, base + (slot - lo) * n, n);
+            if (!(score >= threshold)) continue;
+            const IvfHit hit{score, static_cast<uint32_t>(slot)};
+            if (all) {
+                heap.push_back(hit);
+            } else if (heap.size() < k) {
+                heap.push_back(hit);
+                std::push_heap(heap.begin(), heap.end(), detail::hitBefore);
+            } else if (detail::hitBefore(hit, heap.front())) {
+                std::pop_heap(heap.begin(), heap.end(), detail::hitBefore);
+                heap.back() = hit;
+                std::push_heap(heap.begin(), heap.end(), detail::hitBefore);
+            }
+        }
+    }
+
+    /** Type filter as a code: false when the type does not exist at all (then nothing matches). */
+    bool typeFilter(const std::string& nodeType, uint32_t& code) const {
+        code = Ivf::kAnyCode;
+        if (nodeType.empty()) return true;
+        auto it = t_.typeCodes.find(nodeType);
+        if (it == t_.typeCodes.end()) return false;
+        code = it->second;
+        return true;
+    }
+
+    std::vector<SimilarityResult> materialize(std::vector<IvfHit>& hits, size_t topK) const {
+        std::sort(hits.begin(), hits.end(), detail::hitBefore);
+        if (hits.size() > topK) hits.resize(topK);
+        std::vector<SimilarityResult> results;
+        results.reserve(hits.size());
+        for (const IvfHit& hit : hits) results.push_back(resultOf(hit.slot, hit.score));
+        return results;
+    }
+
+    std::vector<SimilarityResult> exactSearch(const std::vector<float>& query, size_t topK,
+                                              const std::string& nodeType, float threshold) const {
+        uint32_t code;
+        if (topK == 0 || !typeFilter(nodeType, code)) return {};
+        const bool all = topK >= t_.liveCount();
+        std::vector<IvfHit> heap;
+        if (!all) heap.reserve(topK);
+        for (size_t c = 0; c < t_.matrix.chunks(); ++c) {
+            const size_t lo = c * detail::kChunkRows;
+            scanRows(query.data(), query.size(), lo, lo + t_.matrix.rowsInChunk(c), code, threshold,
+                     topK, all, heap);
+        }
+        return materialize(heap, topK);
+    }
+
     /** Complain when a text query's encoder is not the stored vectors' model. */
     void checkModelCompat() const {
         if (onModelMismatch_ == ModelMismatchMode::Ignore) return;
@@ -1216,9 +1817,10 @@ private:
         if (!current.has_value()) return;
 
         std::set<std::string> foreign;  // sorted, which also orders the message
-        for (const auto& [key, record] : embeddings_) {
-            if (!isUnknownModel(record.model) && record.model != *current) {
-                foreign.insert(record.model);
+        for (size_t id = 0; id < t_.models.size(); ++id) {
+            const std::string& model = t_.models[id];
+            if (t_.modelCount[id] > 0 && !isUnknownModel(model) && model != *current) {
+                foreign.insert(model);
             }
         }
         if (foreign.empty()) return;
@@ -1238,51 +1840,15 @@ private:
         }
         std::string key = *current + "\n";
         for (const std::string& model : foreign) key += model + "\n";
-        if (warnedMismatch_.insert(key).second) {
-            emitWarning(message);
+        bool first;
+        {
+            std::lock_guard<std::mutex> lock(warned_.mutex);
+            first = warned_.seen.insert(key).second;
         }
+        if (first) emitWarning(message);
     }
 
-    // One out-of-line copy on purpose: the exact scan, the approximate path's
-    // re-score and the tests all compare these scores for bit equality, and
-    // two inlined copies are free to be contracted or vectorised differently
-    // by an optimiser (observed as last-bit differences on GCC 15).
-#if defined(__clang__)
-    __attribute__((noinline))
-#elif defined(__GNUC__)
-    __attribute__((noinline, noclone))
-#elif defined(_MSC_VER)
-    __declspec(noinline)
-#endif
-    float cosineSimilarity(const std::vector<float>& v1, const std::vector<float>& v2) const {
-        float dot = 0.0f;
-        float norm1 = 0.0f;
-        float norm2 = 0.0f;
-
-        for (size_t i = 0; i < v1.size() && i < v2.size(); ++i) {
-            dot += v1[i] * v2[i];
-            norm1 += v1[i] * v1[i];
-            norm2 += v2[i] * v2[i];
-        }
-
-        norm1 = std::sqrt(norm1);
-        norm2 = std::sqrt(norm2);
-
-        if (norm1 == 0.0f || norm2 == 0.0f) return 0.0f;
-        return dot / (norm1 * norm2);
-    }
-
-    // -- approximate index upkeep (all of it under ann_.mutex) -----------------
-
-    using Ivf = detail::IvfIndex;
-
-    uint32_t annCodeLocked(const std::string& type) const {
-        auto it = ann_.codes.find(type);
-        if (it != ann_.codes.end()) return it->second;
-        uint32_t code = static_cast<uint32_t>(ann_.codes.size());
-        ann_.codes.emplace(type, code);
-        return code;
-    }
+    // -- approximate index upkeep ---------------------------------------------------
 
     size_t annThreads() const { return ann_.options ? ann_.options->threads : 1; }
 
@@ -1307,115 +1873,101 @@ private:
         return lists * 2 >= ix.nlist ? 0 : lists;
     }
 
-    void annDropIndexLocked() const { ann_.reset(); }
+    bool annTooSmallLocked() const {
+        return t_.liveCount() < std::max<size_t>(2, ann_.options->minSize) || !dimension_.has_value();
+    }
+
+    /** Does the index need building, retraining or dropping before it can answer? */
+    bool annNeedsMaintenanceLocked() const {
+        if (!ann_.options) return false;
+        if (annTooSmallLocked()) return ann_.index != nullptr;
+        if (!ann_.index) return true;
+        return static_cast<double>(ann_.index->churn) > 0.5 * static_cast<double>(ann_.index->trainedN);
+    }
 
     void annBuildLocked() const {
-        std::vector<const EmbeddingRecord*> recs;
-        recs.reserve(embeddings_.size());
-        for (const auto& entry : embeddings_) recs.push_back(&entry.second);
-        // Slots are numbered by key, not by hash-table order, so the same data
-        // gives the same index however (and on whichever standard library) it
-        // was inserted.
-        std::sort(recs.begin(), recs.end(),
-                  [](const EmbeddingRecord* a, const EmbeddingRecord* b) { return a->id < b->id; });
-
-        const size_t n = recs.size();
-        const size_t dim = *dimension_;
-        std::vector<float> data(n * dim);
-        std::vector<uint32_t> codes(n);
-        ann_.codes.clear();
-        for (size_t i = 0; i < n; ++i) {
-            const EmbeddingRecord& r = *recs[i];
-            if (r.vector.size() != dim) {
-                throw EmbeddingError("cannot index " + r.id + ": it has " +
-                                     std::to_string(r.vector.size()) + " dimensions, store holds " +
-                                     std::to_string(dim));
-            }
-            std::copy(r.vector.begin(), r.vector.end(), data.begin() + static_cast<std::ptrdiff_t>(i * dim));
-            codes[i] = annCodeLocked(r.node_ref.type);
-            r.ann_slot = static_cast<uint32_t>(i);
+        std::vector<uint32_t> order;
+        order.reserve(t_.liveCount());
+        for (uint32_t s = 0; s < t_.slots(); ++s) {
+            if (t_.alive[s]) order.push_back(s);
         }
-        size_t nlist = ann_.options->nlist ? ann_.options->nlist : AnnOptions::autoNlist(n);
-        ann_.index = std::make_unique<Ivf>(Ivf::build(dim, std::move(data), std::move(codes), nlist,
+        // Training sees the rows sorted by key, not in arrival (or hash-table)
+        // order, so the same data gives the same index however it was inserted.
+        std::sort(order.begin(), order.end(), [this](uint32_t a, uint32_t b) {
+            return t_.meta[a].key < t_.meta[b].key;
+        });
+        const size_t nlist = ann_.options->nlist ? ann_.options->nlist : AnnOptions::autoNlist(order.size());
+        ann_.index = std::make_unique<Ivf>(Ivf::build(t_.matrix, t_.alive, order, nlist,
                                                       ann_.options->seed, annThreads()));
-        ann_.recs = std::move(recs);
-        ++ann_.builds;
+        ann_.builds.fetch_add(1, std::memory_order_relaxed);
     }
 
     /**
-     * The index for the store as it is now, built or maintained as the policy
-     * says; null means "answer exactly". Policy (as in Python):
+     * Bring the index to the state the policy asks for (caller holds the lock
+     * exclusively). Policy (as in Python):
      *  - built lazily by the first eligible search, never persisted;
-     *  - new and updated rows are scored exactly until max(512, 2%) of the
-     *    indexed rows are pending, then folded into their nearest cell;
+     *  - new and updated rows are scored exactly until kFoldBatch of them are
+     *    pending, and are then folded into their nearest cell by the write that
+     *    reached that number (annAfterPut);
      *  - deletes tombstone; a quarter dead and the arrays are compacted;
      *  - once writes + deletes since training exceed 50% of the trained size
      *    the index is retrained from the current data;
      *  - a store under minSize, a clear() or a dimension change drops it.
      */
-    Ivf* annIndexLocked() const {
-        if (!ann_.options) return nullptr;
-        const size_t live = embeddings_.size();
-        if (live < std::max<size_t>(2, ann_.options->minSize) || !dimension_.has_value()) {
-            annDropIndexLocked();
-            return nullptr;
+    void annMaintainLocked() const {
+        if (!ann_.options) return;
+        if (annTooSmallLocked()) {
+            ann_.reset();
+            return;
         }
         if (ann_.index && static_cast<double>(ann_.index->churn) > 0.5 * static_cast<double>(ann_.index->trainedN)) {
-            annDropIndexLocked();
+            ann_.reset();
         }
-        if (!ann_.index) {
-            annBuildLocked();
-        } else if (static_cast<double>(ann_.index->pendingLive) >=
-                   std::max(512.0, 0.02 * static_cast<double>(ann_.index->trainedN))) {
-            ann_.index->fold(annThreads());
-        }
-        return ann_.index.get();
+        if (!ann_.index) annBuildLocked();
     }
 
-    /** A record was written (inserted or replaced). */
-    void annAfterPut(const EmbeddingRecord& record) {
-        std::lock_guard<std::mutex> lock(ann_.mutex);
-        if (!ann_.index) return;
-        uint32_t code = annCodeLocked(record.node_ref.type);
-        if (record.ann_slot != Ivf::kNoSlot) {
-            ann_.index->overwrite(record.ann_slot, record.vector.data(), code);
-            ann_.recs[record.ann_slot] = &record;
-        } else {
-            record.ann_slot = ann_.index->append(record.vector.data(), code);
-            ann_.recs.push_back(&record);
-        }
-    }
-
-    /** A record is about to be erased. */
-    void annBeforeErase(const EmbeddingRecord& record) {
-        std::lock_guard<std::mutex> lock(ann_.mutex);
-        if (!ann_.index || record.ann_slot == Ivf::kNoSlot) return;
-        ann_.index->drop(record.ann_slot);
-        ann_.recs[record.ann_slot] = nullptr;
-        if (ann_.index->needsCompaction()) {
-            std::vector<uint32_t> remap = ann_.index->compact();
-            std::vector<const EmbeddingRecord*> kept(ann_.index->slots(), nullptr);
-            for (size_t old = 0; old < remap.size(); ++old) {
-                if (remap[old] == Ivf::kNoSlot) continue;
-                kept[remap[old]] = ann_.recs[old];
-                if (kept[remap[old]] != nullptr) kept[remap[old]]->ann_slot = remap[old];
+    /**
+     * The index, ready to search, with a shared lock held on `lock`; null (lock
+     * released) means "answer exactly". Maintenance, when due, runs under the
+     * exclusive lock first, so any number of searches share one lazy build.
+     */
+    const Ivf* annAcquire(std::shared_lock<std::shared_mutex>& lock) const {
+        for (;;) {
+            lock = std::shared_lock<std::shared_mutex>(ann_.mutex);
+            if (!ann_.options) {
+                lock.unlock();
+                return nullptr;
             }
-            ann_.recs = std::move(kept);
+            if (!annNeedsMaintenanceLocked()) {
+                if (!ann_.index) {
+                    lock.unlock();
+                    return nullptr;
+                }
+                return ann_.index.get();
+            }
+            lock.unlock();
+            std::unique_lock<std::shared_mutex> exclusive(ann_.mutex);
+            annMaintainLocked();
         }
     }
 
-    /** Insert or replace the record for `key`, keeping the approximate index in step. */
-    void putRecord(const std::string& key, EmbeddingRecord&& record) {
-        auto it = embeddings_.find(key);
-        uint32_t slot = Ivf::kNoSlot;
-        if (it == embeddings_.end()) {
-            it = embeddings_.emplace(key, std::move(record)).first;
+    /** A row was written (inserted or replaced in place). */
+    void annAfterPut(uint32_t slot, bool added) {
+        std::unique_lock<std::shared_mutex> lock(ann_.mutex);
+        if (!ann_.index) return;
+        const float* v = t_.matrix.row(slot);
+        if (added) {
+            ann_.index->append(v);
         } else {
-            slot = it->second.ann_slot;
-            it->second = std::move(record);
+            ann_.index->overwrite(slot, v);
         }
-        it->second.ann_slot = slot;
-        annAfterPut(it->second);
+        if (ann_.index->pendingLive >= kFoldBatch) ann_.index->fold(t_.matrix, annThreads());
+    }
+
+    /** A row is about to be tombstoned. */
+    void annBeforeErase(uint32_t slot) {
+        std::unique_lock<std::shared_mutex> lock(ann_.mutex);
+        if (ann_.index) ann_.index->drop(slot);
     }
 
     /**
@@ -1430,45 +1982,48 @@ private:
     std::optional<std::vector<SimilarityResult>> annSearch(
         const std::vector<float>& query, size_t topK, const std::string& nodeType,
         float threshold) const {
-        std::lock_guard<std::mutex> lock(ann_.mutex);
         auto fallBack = [&]() -> std::optional<std::vector<SimilarityResult>> {
-            ++ann_.exact;
+            ann_.exact.fetch_add(1, std::memory_order_relaxed);
             return std::nullopt;
         };
-        Ivf* ix = annIndexLocked();
+        std::shared_lock<std::shared_mutex> lock;
+        const Ivf* ix = annAcquire(lock);
         if (ix == nullptr) return fallBack();
         const float norm = std::sqrt(detail::simd::dot(query.data(), query.data(), query.size()));
         if (!(norm > 0.0f)) return fallBack();      // a zero query has no direction to rank cells by
         if (topK >= ix->live()) return fallBack();  // nothing to narrow down
 
-        uint32_t code = Ivf::kAnyCode;
-        if (!nodeType.empty()) {
-            auto found = ann_.codes.find(nodeType);
-            if (found == ann_.codes.end()) return std::vector<SimilarityResult>();  // no such type at all
-            code = found->second;
-        }
+        uint32_t code;
+        if (!typeFilter(nodeType, code)) return std::vector<SimilarityResult>();  // no such type at all
         // The fast scores differ from the exact ones in the last bits: admit
         // rows that close to the threshold and re-check them below.
         const float slack = threshold - 1e-5f;
+        std::vector<IvfHit> hits;
         for (size_t scale = 1;; scale *= 4) {
             size_t lists = annListsLocked(*ix, scale);
             if (lists == 0) return fallBack();
-            ix->search(query.data(), 1.0f / norm, code, slack, lists, topK, ann_.hits);
-            if (ann_.hits.size() < topK) continue;
-            std::vector<SimilarityResult> results;
-            results.reserve(ann_.hits.size());
-            for (const detail::IvfHit& hit : ann_.hits) {
-                const EmbeddingRecord& r = *ann_.recs[hit.slot];
-                float score = cosineSimilarity(query, r.vector);
-                if (score >= threshold) results.push_back(SimilarityResult{r.node_ref, score, r.text});
+            ix->search(t_.matrix, t_.codes.data(), query.data(), 1.0f / norm, code, slack, lists, topK, hits);
+            if (hits.size() < topK) continue;
+            std::vector<IvfHit> exact;
+            exact.reserve(hits.size());
+            for (const IvfHit& hit : hits) {
+                float score = detail::cosineRows(query.data(), rowOf(hit.slot), query.size());
+                if (score >= threshold) exact.push_back(IvfHit{score, hit.slot});
             }
-            if (results.size() >= topK) {
-                std::stable_sort(results.begin(), results.end());
-                ++ann_.approximate;
-                if (scale > 1) ++ann_.widened;
-                return results;
+            if (exact.size() >= topK) {
+                ann_.approximate.fetch_add(1, std::memory_order_relaxed);
+                if (scale > 1) ann_.widened.fetch_add(1, std::memory_order_relaxed);
+                return materialize(exact, topK);
             }
         }
+    }
+
+    /** Threads for a batch: what was asked (0 = one per hardware thread), at most 256 and at most the tasks. */
+    static size_t clampWorkers(size_t requested, size_t tasks) {
+        size_t workers = requested == 0 ? detail::autoThreads() : requested;
+        workers = std::min<size_t>(workers, 256);
+        workers = std::min(workers, tasks);
+        return std::max<size_t>(workers, 1);
     }
 
 public:
@@ -1514,7 +2069,9 @@ public:
      */
     std::map<std::string, size_t> models() const {
         std::map<std::string, size_t> counts;
-        for (const auto& [key, record] : embeddings_) ++counts[record.model];
+        for (size_t id = 0; id < t_.models.size(); ++id) {
+            if (t_.modelCount[id] > 0) counts[t_.models[id]] = t_.modelCount[id];
+        }
         return counts;
     }
 
@@ -1543,11 +2100,13 @@ public:
         if (!dimension.has_value() && encoder_) dimension = encoder_->dimension();
 
         std::vector<NodeRef> out;
-        for (const auto& [key, record] : embeddings_) {
-            bool byModel = model.has_value() && record.model != *model &&
-                           (includeUnknown || !isUnknownModel(record.model));
-            bool byDim = dimension.has_value() && record.vector.size() != *dimension;
-            if (byModel || byDim) out.push_back(record.node_ref);
+        for (uint32_t slot = 0; slot < t_.slots(); ++slot) {
+            if (!t_.alive[slot]) continue;
+            const std::string& recordModel = t_.models[t_.meta[slot].model];
+            bool byModel = model.has_value() && recordModel != *model &&
+                           (includeUnknown || !isUnknownModel(recordModel));
+            bool byDim = dimension.has_value() && t_.matrix.dim() != *dimension;
+            if (byModel || byDim) out.push_back(refOf(slot));
         }
         std::sort(out.begin(), out.end());
         return out;
@@ -1571,18 +2130,19 @@ public:
 
     std::string add(const NodeRef& node_ref, const std::string& text,
                     const std::vector<float>& vector = {}) {
-        std::vector<float> vec = vector;
-        if (vec.empty()) {
+        std::vector<float> encoded;
+        const std::vector<float>* vec = &vector;
+        if (vector.empty()) {
             if (!encoder_) {
                 throw NoEncoderError("No encoder provided and no vector given");
             }
-            vec = encoder_->encode(text);
+            encoded = encoder_->encode(text);
+            vec = &encoded;
         }
-        checkDimension(vec, "vector");
+        checkDimension(*vec, "vector");
 
-        std::string key = nodeRefToKey(node_ref);
-        putRecord(key, EmbeddingRecord{key, node_ref, std::move(vec), text, currentModelStamp()});
-        return key;
+        putRow(node_ref, vec->data(), vec->size(), text, currentModelStamp());
+        return nodeRefToKey(node_ref);
     }
 
     /** Add many embeddings, encoding their texts in one batched call. */
@@ -1610,25 +2170,54 @@ public:
         return entries.size();
     }
 
-    const EmbeddingRecord* get(const NodeRef& node_ref) const {
-        std::string key = nodeRefToKey(node_ref);
-        auto it = embeddings_.find(key);
-        if (it != embeddings_.end()) {
-            return &it->second;
-        }
-        return nullptr;
+    /**
+     * The stored embedding for `node_ref`, or nullopt. The record is a COPY of
+     * the row (the store keeps no record objects); see vectorData() to read the
+     * floats without copying.
+     */
+    std::optional<EmbeddingRecord> get(const NodeRef& node_ref) const {
+        auto it = t_.lookup.find(nodeRefToKey(node_ref));
+        if (it == t_.lookup.end()) return std::nullopt;
+        const uint32_t slot = it->second;
+        const float* row = rowOf(slot);
+        return EmbeddingRecord{t_.meta[slot].key, refOf(slot),
+                               std::vector<float>(row, row + t_.matrix.dim()),
+                               t_.meta[slot].text, t_.models[t_.meta[slot].model]};
+    }
+
+    /** Is there an embedding for `node_ref`? */
+    bool contains(const NodeRef& node_ref) const {
+        return t_.lookup.find(nodeRefToKey(node_ref)) != t_.lookup.end();
+    }
+
+    /**
+     * A view of the stored vector (dimension() floats), or nullptr. Valid only
+     * until the next write to the store (add, remove, clear, import, ...), which
+     * may overwrite or move the row; copy it if you need it longer.
+     */
+    const float* vectorData(const NodeRef& node_ref) const {
+        auto it = t_.lookup.find(nodeRefToKey(node_ref));
+        return it == t_.lookup.end() ? nullptr : rowOf(it->second);
     }
 
     bool remove(const NodeRef& node_ref) {
         std::string key = nodeRefToKey(node_ref);
-        auto it = embeddings_.find(key);
-        if (it == embeddings_.end()) return false;
-        annBeforeErase(it->second);
-        embeddings_.erase(it);
+        auto it = t_.lookup.find(key);
+        if (it == t_.lookup.end()) return false;
+        const uint32_t slot = it->second;
+        annBeforeErase(slot);
+        --t_.modelCount[t_.meta[slot].model];
+        t_.lookup.erase(it);
+        t_.alive[slot] = 0;
+        t_.meta[slot] = detail::SlotMeta{};
+        ++t_.dead;
+        if (t_.dead >= 64 && t_.dead * 4 > t_.slots()) compact();
         return true;
     }
 
     /**
+     * Top-k cosine matches of a text query (needs an encoder).
+     *
      * @param exact skip the approximate index and scan every vector (no effect
      *              unless enableAnn() was called)
      */
@@ -1646,7 +2235,8 @@ public:
     /**
      * Cosine top-k of a query vector. With enableAnn() a bounded topK on a
      * large enough store is answered from the approximate index (see there);
-     * `exact` forces the full scan.
+     * `exact` forces the full scan. Equal scores are ordered by slot (arrival
+     * order), so an answer is reproducible.
      */
     std::vector<SimilarityResult> similaritySearchVector(
         const std::vector<float>& queryVector,
@@ -1659,44 +2249,134 @@ public:
 
         if (topK > 0) {
             // A store without enableAnn() only reads its (empty) options under a
-            // brief lock here; the scan below is what it always was.
+            // brief shared lock here; the scan below is what it always was.
             bool enabled;
             {
-                std::lock_guard<std::mutex> lock(ann_.mutex);
+                std::shared_lock<std::shared_mutex> lock(ann_.mutex);
                 enabled = ann_.options.has_value();
-                if (enabled && exact) ++ann_.exact;
             }
+            if (enabled && exact) ann_.exact.fetch_add(1, std::memory_order_relaxed);
             if (enabled && !exact) {
                 if (auto answer = annSearch(queryVector, topK, nodeType, threshold)) {
                     return std::move(*answer);
                 }
             }
         }
+        return exactSearch(queryVector, topK, nodeType, threshold);
+    }
 
-        std::vector<SimilarityResult> results;
+    /**
+     * Many queries at once, in parallel; entry i of the result is exactly what
+     * similaritySearchVector(queries[i], ...) returns - the same ids, the same
+     * scores bit for bit, in the same order - whatever the number of threads.
+     *
+     * The exact scan is shared across queries block by block (each 1024-row
+     * chunk is scored against a tile of 16 queries while it is in cache); with
+     * the approximate index on (and `exact` false) each query is answered by
+     * the index on its own thread. The calling thread is one of the workers;
+     * the others are started and joined inside this call, so nothing outlives
+     * it, and an exception thrown by any worker is rethrown here after all have
+     * stopped. Every query is validated before any work starts.
+     *
+     * @param threads upper bound on threads used (0 = hardware concurrency;
+     *                never more than 256, or than there is work for)
+     */
+    std::vector<std::vector<SimilarityResult>> similaritySearchBatch(
+        const std::vector<std::vector<float>>& queries,
+        size_t topK = 10,
+        const std::string& nodeType = "",
+        float threshold = 0.0f,
+        bool exact = false,
+        size_t threads = 0
+    ) const {
+        for (const auto& query : queries) checkQuery(query);
+        std::vector<std::vector<SimilarityResult>> out(queries.size());
+        if (queries.empty() || topK == 0) return out;
 
-        for (const auto& [key, record] : embeddings_) {
-            if (!nodeType.empty() && record.node_ref.type != nodeType) {
-                continue;
-            }
+        const bool annOn = annEnabled();
+        const bool everyRow = topK >= t_.liveCount();
 
-            float score = cosineSimilarity(queryVector, record.vector);
-            if (score >= threshold) {
-                results.push_back(SimilarityResult{record.node_ref, score, record.text});
-            }
+        if ((annOn && !exact) || everyRow) {
+            // One query per task, each through the single-query path.
+            std::atomic<size_t> next{0};
+            std::atomic<bool> stop{false};
+            detail::runWorkers(clampWorkers(threads, queries.size()), [&](size_t) {
+                for (;;) {
+                    const size_t i = next.fetch_add(1);
+                    if (i >= queries.size() || stop.load()) break;
+                    try {
+                        out[i] = similaritySearchVector(queries[i], topK, nodeType, threshold, exact);
+                    } catch (...) {
+                        stop = true;
+                        throw;
+                    }
+                }
+            });
+            return out;
         }
 
-        // Selecting the top k rather than ordering every candidate: this is
-        // O(n log k) where a full sort is O(n log n), and returns the same
-        // rows in the same order.
-        if (results.size() > topK) {
-            std::partial_sort(results.begin(), results.begin() + topK, results.end());
-            results.resize(topK);
-        } else {
-            std::sort(results.begin(), results.end());
-        }
+        // (the per-query path above counts its exact scans itself)
+        if (annOn && exact) ann_.exact.fetch_add(queries.size(), std::memory_order_relaxed);
+        uint32_t code;
+        if (!typeFilter(nodeType, code)) return out;
 
-        return results;
+        constexpr size_t kTile = 16;
+        const size_t nq = queries.size();
+        const size_t tiles = (nq + kTile - 1) / kTile;
+        const size_t chunks = t_.matrix.chunks();
+        const size_t tasks = chunks * tiles;
+        const size_t workers = clampWorkers(threads, tasks);
+        const size_t dim = t_.matrix.dim();
+
+        std::vector<std::vector<std::vector<IvfHit>>> perWorker(workers);
+        std::atomic<size_t> next{0};
+        std::atomic<bool> stop{false};
+        detail::runWorkers(workers, [&](size_t w) {
+            std::vector<std::vector<IvfHit>> heaps(nq);
+            try {
+                for (;;) {
+                    const size_t task = next.fetch_add(1);
+                    if (task >= tasks || stop.load()) break;
+                    // chunk-major: a chunk is scored against all tiles while it is cached
+                    const size_t chunk = task / tiles, tile = task % tiles;
+                    const size_t lo = chunk * detail::kChunkRows;
+                    const size_t hi = lo + t_.matrix.rowsInChunk(chunk);
+                    const size_t qa = tile * kTile, qb = std::min(nq, qa + kTile);
+                    for (size_t qi = qa; qi < qb; ++qi) {
+                        scanRows(queries[qi].data(), dim, lo, hi, code, threshold, topK, false, heaps[qi]);
+                    }
+                }
+            } catch (...) {
+                stop = true;
+                throw;
+            }
+            perWorker[w] = std::move(heaps);
+        });
+
+        for (size_t qi = 0; qi < nq; ++qi) {
+            std::vector<IvfHit> merged;
+            for (const auto& heaps : perWorker) {
+                if (heaps.empty()) continue;
+                merged.insert(merged.end(), heaps[qi].begin(), heaps[qi].end());
+            }
+            out[qi] = materialize(merged, topK);
+        }
+        return out;
+    }
+
+    /** similaritySearchBatch() for text queries (encoded one by one, in order, before any search starts). */
+    std::vector<std::vector<SimilarityResult>> similaritySearchTextBatch(
+        const std::vector<std::string>& queries,
+        size_t topK = 10,
+        const std::string& nodeType = "",
+        float threshold = 0.0f,
+        bool exact = false,
+        size_t threads = 0
+    ) const {
+        std::vector<std::vector<float>> vectors;
+        vectors.reserve(queries.size());
+        for (const auto& query : queries) vectors.push_back(encodeQuery(query));
+        return similaritySearchBatch(vectors, topK, nodeType, threshold, exact, threads);
     }
 
     /**
@@ -1710,9 +2390,13 @@ public:
         checkQuery(queryVector);
 
         std::map<std::string, float> scores;
-        for (const auto& [key, record] : embeddings_) {
-            if (!nodeType.empty() && record.node_ref.type != nodeType) continue;
-            scores[key] = cosineSimilarity(queryVector, record.vector);
+        uint32_t code;
+        if (!typeFilter(nodeType, code)) return scores;
+        for (uint32_t slot = 0; slot < t_.slots(); ++slot) {
+            if (!t_.alive[slot]) continue;
+            if (code != Ivf::kAnyCode && t_.codes[slot] != code) continue;
+            scores[t_.meta[slot].key] =
+                detail::cosineRows(queryVector.data(), rowOf(slot), queryVector.size());
         }
         return scores;
     }
@@ -1739,32 +2423,33 @@ public:
      * unbounded topK (one that asks for every row), a zero query vector, or a
      * store under minSize use the exact scan.
      *
-     * The index keeps its own contiguous copy of the vectors (see
-     * AnnStats::vectorBytes), so an indexed store holds them twice.
-     * Concurrent searches are safe; they take turns on the index. Calling this
-     * again replaces the options and drops the current index.
+     * The index holds NO copy of the vectors: it refers to the store's one
+     * matrix (AnnStats::vectorBytes is 0). Pending writes are folded into their
+     * cells by the write that makes 256 of them. Concurrent searches are safe
+     * and run in parallel; a lazy build or retrain makes them wait for it.
+     * Calling this again replaces the options and drops the current index.
      */
     void enableAnn(AnnOptions options = AnnOptions()) {
-        std::lock_guard<std::mutex> lock(ann_.mutex);
+        std::unique_lock<std::shared_mutex> lock(ann_.mutex);
         ann_.reset();
         ann_.options = options;
     }
 
     /** Turn approximate search off and free the index. */
     void disableAnn() {
-        std::lock_guard<std::mutex> lock(ann_.mutex);
+        std::unique_lock<std::shared_mutex> lock(ann_.mutex);
         ann_.reset();
         ann_.options.reset();
     }
 
     bool annEnabled() const {
-        std::lock_guard<std::mutex> lock(ann_.mutex);
+        std::shared_lock<std::shared_mutex> lock(ann_.mutex);
         return ann_.options.has_value();
     }
 
     /** Cells scanned per query from now on (0 = automatic). Takes effect immediately; no rebuild. */
     void setAnnNprobe(size_t nprobe) {
-        std::lock_guard<std::mutex> lock(ann_.mutex);
+        std::unique_lock<std::shared_mutex> lock(ann_.mutex);
         if (!ann_.options) throw EmbeddingError("this store has no approximate index; call enableAnn() first");
         ann_.options->nprobe = nprobe;
     }
@@ -1778,25 +2463,25 @@ public:
      */
     AnnStats buildAnnIndex(bool force = false) {
         {
-            std::lock_guard<std::mutex> lock(ann_.mutex);
+            std::unique_lock<std::shared_mutex> lock(ann_.mutex);
             if (!ann_.options) throw EmbeddingError("this store has no approximate index; call enableAnn() first");
             if (force) ann_.reset();
-            Ivf* ix = annIndexLocked();
-            if (ix != nullptr && ix->pendingLive > 0) ix->fold(annThreads());
+            annMaintainLocked();
+            if (ann_.index && ann_.index->pendingLive > 0) ann_.index->fold(t_.matrix, annThreads());
         }
         return annStats();
     }
 
     /** What the approximate index looks like right now. Never builds anything. */
     AnnStats annStats() const {
-        std::lock_guard<std::mutex> lock(ann_.mutex);
+        std::shared_lock<std::shared_mutex> lock(ann_.mutex);
         AnnStats stats;
         stats.enabled = ann_.options.has_value();
         stats.minSize = ann_.options ? ann_.options->minSize : 0;
-        stats.approximateSearches = ann_.approximate;
-        stats.widenedSearches = ann_.widened;
-        stats.exactSearches = ann_.exact;
-        stats.builds = ann_.builds;
+        stats.approximateSearches = ann_.approximate.load();
+        stats.widenedSearches = ann_.widened.load();
+        stats.exactSearches = ann_.exact.load();
+        stats.builds = ann_.builds.load();
         const Ivf* ix = ann_.index.get();
         stats.active = ix != nullptr;
         if (ix != nullptr) {
@@ -1807,7 +2492,7 @@ public:
             stats.churn = ix->churn;
             stats.buildSeconds = ix->buildSeconds;
             stats.indexBytes = ix->overheadBytes();
-            stats.vectorBytes = ix->vectorBytes();
+            stats.vectorBytes = 0;
         } else if (ann_.options) {
             stats.nprobe = ann_.options->nprobe;
         }
@@ -1890,39 +2575,83 @@ public:
     bool annVisit(const std::vector<float>& query, const std::string& nodeType, float threshold,
                   size_t scale, const std::function<bool(SimilarityResult&&)>& visit) const {
         checkQuery(query);
-        std::vector<const EmbeddingRecord*> order;
+        std::vector<uint32_t> order;
         {
-            std::lock_guard<std::mutex> lock(ann_.mutex);
-            Ivf* ix = annIndexLocked();
+            std::shared_lock<std::shared_mutex> lock;
+            const Ivf* ix = annAcquire(lock);
             if (ix == nullptr) return false;
             const float norm = std::sqrt(detail::simd::dot(query.data(), query.data(), query.size()));
             if (!(norm > 0.0f)) return false;
-            uint32_t code = Ivf::kAnyCode;
-            if (!nodeType.empty()) {
-                auto found = ann_.codes.find(nodeType);
-                if (found == ann_.codes.end()) return true;  // nothing of that type exists
-                code = found->second;
-            }
+            uint32_t code;
+            if (!typeFilter(nodeType, code)) return true;  // nothing of that type exists
             size_t lists = annListsLocked(*ix, scale);
             if (lists == 0) return false;
-            ix->candidates(query.data(), 1.0f / norm, code, threshold - 1e-5f, lists, ann_.hits);
-            order.reserve(ann_.hits.size());
-            for (const detail::IvfHit& hit : ann_.hits) order.push_back(ann_.recs[hit.slot]);
-            ++ann_.approximate;
-            if (scale > 1) ++ann_.widened;
+            std::vector<IvfHit> hits;
+            ix->candidates(t_.matrix, t_.codes.data(), query.data(), 1.0f / norm, code,
+                           threshold - 1e-5f, lists, hits);
+            order.reserve(hits.size());
+            for (const IvfHit& hit : hits) order.push_back(hit.slot);
+            ann_.approximate.fetch_add(1, std::memory_order_relaxed);
+            if (scale > 1) ann_.widened.fetch_add(1, std::memory_order_relaxed);
         }
         // Outside the lock: `visit` is user code and may search this store again.
-        for (const EmbeddingRecord* r : order) {
-            float score = cosineSimilarity(query, r->vector);
+        for (uint32_t slot : order) {
+            float score = detail::cosineRows(query.data(), rowOf(slot), query.size());
             if (!(score >= threshold)) continue;
-            if (!visit(SimilarityResult{r->node_ref, score, r->text})) break;
+            if (!visit(resultOf(slot, score))) break;
         }
         return true;
     }
 
     size_t count() const {
-        return embeddings_.size();
+        return t_.lookup.size();
     }
+
+    /**
+     * Check the store's internal invariants (DESIGN.md section 7): parallel
+     * arrays all hold one entry per slot, the matrix holds exactly that many
+     * rows, `dead` counts the tombstones, the key table has one entry per live
+     * slot and each entry's key is `type:id` of its slot, per-model counts equal
+     * the rows carrying each model, and an approximate index (if any) has one
+     * slot per table slot. Throws EmbeddingError naming the first violation.
+     * For tests and diagnostics; O(n).
+     */
+    void verifyInvariants() const {
+        auto fail = [](const std::string& what) { throw EmbeddingError("invariant violated: " + what); };
+        const size_t n = t_.slots();
+        if (t_.meta.size() != n || t_.codes.size() != n) fail("parallel arrays differ in length");
+        if (t_.matrix.rows() != n) fail("matrix rows != slots");
+        size_t dead = 0;
+        std::vector<size_t> perModel(t_.models.size(), 0);
+        for (size_t slot = 0; slot < n; ++slot) {
+            if (!t_.alive[slot]) { ++dead; continue; }
+            const detail::SlotMeta& meta = t_.meta[slot];
+            auto it = t_.lookup.find(meta.key);
+            if (it == t_.lookup.end() || it->second != slot) fail("key table does not map " + meta.key + " to its slot");
+            if (t_.codes[slot] >= t_.types.size()) fail("type code out of range");
+            const std::string& type = t_.types[t_.codes[slot]];
+            if (meta.key.size() < type.size() + 1 || meta.key.compare(0, type.size(), type) != 0 ||
+                meta.key[type.size()] != ':') {
+                fail("key " + meta.key + " is not type:id of its slot");
+            }
+            if (meta.model >= perModel.size()) fail("model index out of range");
+            ++perModel[meta.model];
+        }
+        if (dead != t_.dead) fail("dead count is wrong");
+        if (t_.lookup.size() != n - dead) fail("key table size != live rows");
+        for (size_t m = 0; m < perModel.size(); ++m) {
+            if (perModel[m] != t_.modelCount[m]) fail("model count of '" + t_.models[m] + "' is wrong");
+        }
+        if (n > 0 && dimension_.has_value() && t_.matrix.dim() != *dimension_) fail("matrix width != dimension");
+        std::shared_lock<std::shared_mutex> lock(ann_.mutex);
+        if (ann_.index) {
+            if (ann_.index->slots() != n) fail("approximate index has a different slot count");
+            if (ann_.index->live() != n - dead) fail("approximate index has a different live count");
+        }
+    }
+
+    /** Bytes held by the vector matrix (the one copy of every vector, tombstoned rows included). */
+    size_t vectorBytes() const { return t_.matrix.bytes(); }
 
     /**
      * Clear all embeddings.
@@ -1935,10 +2664,16 @@ public:
      */
     void clear(bool resetDimension = false) {
         {
-            std::lock_guard<std::mutex> lock(ann_.mutex);
+            std::unique_lock<std::shared_mutex> lock(ann_.mutex);
             ann_.reset();
         }
-        embeddings_.clear();
+        t_.matrix.reset(resetDimension ? 0 : t_.matrix.dim());
+        std::vector<detail::SlotMeta>().swap(t_.meta);
+        std::vector<uint32_t>().swap(t_.codes);
+        std::vector<uint8_t>().swap(t_.alive);
+        t_.dead = 0;
+        std::unordered_map<std::string, uint32_t>().swap(t_.lookup);
+        std::fill(t_.modelCount.begin(), t_.modelCount.end(), size_t(0));
         if (resetDimension) dimension_.reset();
     }
 
@@ -1953,24 +2688,22 @@ public:
         const std::optional<std::string>& graphDigest = std::nullopt) const {
         ExportedEmbeddings payload;
         payload.dimension = dimension_;
-        payload.embeddings.reserve(embeddings_.size());
+        const std::vector<uint32_t> slots = liveSlotsByTypeAndId();
+        payload.embeddings.reserve(slots.size());
 
-        for (const auto& [key, record] : embeddings_) {
+        for (uint32_t slot : slots) {
+            const float* row = rowOf(slot);
             payload.embeddings.push_back(ExportedEmbedding{
-                record.node_ref.type,
-                record.node_ref.id,
+                std::string(typeOf(slot)),
+                std::string(idOf(slot)),
                 // C++ node ids are always strings; the other ports use this to
                 // tell a numeric id from a numeric-looking string one.
                 "str",
-                record.text,
-                record.vector,
-                record.model
+                t_.meta[slot].text,
+                std::vector<float>(row, row + t_.matrix.dim()),
+                t_.models[t_.meta[slot].model]
             });
         }
-        std::sort(payload.embeddings.begin(), payload.embeddings.end(),
-                  [](const ExportedEmbedding& a, const ExportedEmbedding& b) {
-                      return std::tie(a.type, a.id) < std::tie(b.type, b.id);
-                  });
         payload.count = payload.embeddings.size();
 
         payload.meta.encoderModel = currentModel();
@@ -2005,9 +2738,8 @@ public:
         size_t written = 0;
         for (const auto& item : payload.embeddings) {
             checkDimension(item.vector, "embedding for :" + item.type + ":" + item.id);
-            std::string key = nodeRefToKey(NodeRef(item.type, item.id));
-            putRecord(key, EmbeddingRecord{key, NodeRef(item.type, item.id), item.vector,
-                                           item.text, item.model});
+            putRow(NodeRef(item.type, item.id), item.vector.data(), item.vector.size(), item.text,
+                   item.model);
             ++written;
         }
         return written;
@@ -2196,7 +2928,7 @@ public:
     size_t saveEmbeddings(const std::string& path,
                           const std::optional<std::string>& graphDigest = std::nullopt) const {
         detail::atomicWriteText<EmbeddingError>(path, toJson(graphDigest));
-        return embeddings_.size();
+        return count();
     }
 
     /** Read a payload file written by saveEmbeddings (or any port's equivalent). */
@@ -2215,7 +2947,375 @@ public:
         return content.str();
     }
 
+    // -- binary snapshot ------------------------------------------------------
+
+    /**
+     * Identity of the file at `path` (see SidecarId); throws EmbeddingError when
+     * it cannot be read.
+     */
+    static SidecarId sidecarIdOf(const std::string& path) {
+        return detail::sidecarIdOf<EmbeddingError>(path);
+    }
+
+    /**
+     * Write a binary snapshot of every embedding to `path` (DESIGN.md section
+     * 11.2): a temp file beside it is written, flushed to disk and renamed over
+     * `path`, so a failure or crash leaves the previous file untouched and no
+     * temp file behind. Rows go in the order the JSON sidecar uses (node type,
+     * then id), so loading the snapshot gives the same store, slot for slot, as
+     * loading the sidecar. All integers are little-endian whatever the host.
+     *
+     * `identity` ties the snapshot to the graph and sidecar it was saved with;
+     * SemanticGraph::load refuses a snapshot whose identity differs.
+     */
+    SnapshotInfo saveSnapshot(const std::string& path, const SnapshotIdentity& identity = {}) const {
+        namespace fs = std::filesystem;
+        static std::atomic<unsigned long long> counter{0};
+        fs::path target(path);
+        fs::path dir = target.parent_path();
+        std::random_device rd;
+        std::string tmpName = "." + target.filename().string() + "." +
+            std::to_string(static_cast<unsigned long long>(
+                std::chrono::steady_clock::now().time_since_epoch().count())) + "." +
+            std::to_string(rd()) + "." + std::to_string(counter++) + ".tmp";
+        fs::path tmp = dir.empty() ? fs::path(tmpName) : dir / tmpName;
+
+        std::FILE* file = nullptr;
+        try {
+            file = detail::openFile(tmp.string(), "wb");
+            if (file == nullptr) throw EmbeddingError("cannot open snapshot for writing: " + path);
+            std::setvbuf(file, nullptr, _IOFBF, 4u << 20);
+            SnapshotInfo info = writeSnapshot(file, identity);
+            if (std::fflush(file) != 0) throw EmbeddingError("failed writing snapshot: " + path);
+            detail::syncFile(file);
+            const int closed = std::fclose(file);
+            file = nullptr;
+            if (closed != 0) throw EmbeddingError("failed writing snapshot: " + path);
+            std::error_code ec;
+            fs::rename(tmp, target, ec);
+            if (ec) throw EmbeddingError("cannot replace " + path + ": " + ec.message());
+            return info;
+        } catch (...) {
+            if (file != nullptr) std::fclose(file);
+            std::error_code ignored;
+            fs::remove(tmp, ignored);
+            throw;
+        }
+    }
+
+    /**
+     * Replace the store's embeddings with those of the snapshot at `path`.
+     * Nothing changes unless the whole file verifies (structure and checksum):
+     * it is read into a staging store, and a failure throws EmbeddingError with
+     * the store untouched. The encoder, version, model-mismatch mode and ANN
+     * settings are kept (an existing ANN index is dropped and rebuilt lazily).
+     * Does not check identity; SemanticGraph::load does that.
+     */
+    SnapshotInfo loadSnapshot(const std::string& path) {
+        try {
+            EmbeddingStore stage;
+            SnapshotInfo info = readSnapshot(path, nullptr, stage);
+            adopt(std::move(stage), info);
+            return info;
+        } catch (const detail::SnapshotRejected& rejected) {
+            throw EmbeddingError(std::string("invalid snapshot: ") + rejected.what());
+        }
+    }
+
+    /**
+     * Use the snapshot at `snap` for the graph whose digest is `graphDigest` and
+     * whose JSON sidecar is at `sidecar`, if it provably belongs to them (same
+     * digest and basis, same sidecar length and fingerprint) and verifies.
+     * Returns the reason when it was not used (the store is then untouched, and
+     * the caller falls back to the sidecar), or nullopt after adopting it;
+     * `info` receives the header on success.
+     */
+    std::optional<std::string> tryLoadSnapshotFor(const std::string& snap, const std::string& sidecar,
+                                                  const std::string& graphDigest,
+                                                  SnapshotInfo* info = nullptr) {
+        try {
+            SidecarId current;
+            try {
+                current = sidecarIdOf(sidecar);
+            } catch (const EmbeddingError& e) {
+                return std::string("cannot read the sidecar ") + sidecar + ": " + e.what();
+            }
+            EmbeddingStore stage;
+            SnapshotInfo header = readSnapshot(snap, [&](const SnapshotInfo& h) -> std::optional<std::string> {
+                if (!h.graphDigest.has_value() || *h.graphDigest != graphDigest ||
+                    !h.graphDigestBasis.has_value() || *h.graphDigestBasis != std::string(GRAPH_DIGEST_BASIS)) {
+                    return std::string("it was saved for a different graph (digest differs)");
+                }
+                if (!h.sidecar.has_value()) return std::string("it records no sidecar identity");
+                if (*h.sidecar != current) {
+                    return std::string("the JSON sidecar changed since the snapshot was written (stale snapshot)");
+                }
+                return std::nullopt;
+            }, stage);
+            adopt(std::move(stage), header);
+            if (info != nullptr) *info = header;
+            return std::nullopt;
+        } catch (const detail::SnapshotRejected& rejected) {
+            return std::string(rejected.what());
+        } catch (const EmbeddingError& e) {
+            return std::string(e.what());
+        }
+    }
+
 private:
+    /** Install a verified staging store's rows in this store. */
+    void adopt(EmbeddingStore&& stage, const SnapshotInfo& info) {
+        {
+            std::unique_lock<std::shared_mutex> lock(ann_.mutex);
+            ann_.reset();
+        }
+        t_ = std::move(stage.t_);
+        dimension_ = stage.dimension_;
+        lastImportMeta_ = EmbeddingMeta{info.encoderModel, info.encoderVersion, info.graphDigest,
+                                        info.graphDigestBasis};
+    }
+
+    /** Add one snapshot row to a staging store; false for a repeated key. */
+    bool putSnapshotRow(const std::string& type, const std::string& id, const std::string& text,
+                        const std::string& model, const float* v, size_t n) {
+        if (t_.lookup.find(type + ":" + id) != t_.lookup.end()) return false;
+        if (!dimension_.has_value()) dimension_ = n;
+        putRow(NodeRef(type, id), v, n, text, model);
+        return true;
+    }
+
+    SnapshotInfo writeSnapshot(std::FILE* file, const SnapshotIdentity& identity) const {
+        constexpr uint32_t kBlockRows = 1024;
+        const std::vector<uint32_t> rows = liveSlotsByTypeAndId();
+        const size_t count = rows.size();
+        const size_t dim = count > 0 ? t_.matrix.dim() : dimension_.value_or(0);
+
+        // models in order of first use
+        std::vector<std::string> models;
+        std::unordered_map<uint32_t, uint32_t> modelIndex;
+        for (uint32_t slot : rows) {
+            const uint32_t id = t_.meta[slot].model;
+            if (modelIndex.emplace(id, static_cast<uint32_t>(models.size())).second) {
+                models.push_back(t_.models[id]);
+            }
+        }
+
+        SnapshotInfo info;
+        info.version = SNAPSHOT_VERSION;
+        info.dimension = dim;
+        info.count = count;
+        info.graphDigest = identity.graphDigest;
+        if (identity.graphDigest.has_value()) info.graphDigestBasis = std::string(GRAPH_DIGEST_BASIS);
+        info.encoderModel = currentModel();
+        info.encoderVersion = version();
+        info.sidecar = identity.sidecar;
+
+        std::string head = "ISONVSNP";
+        detail::putU32(head, SNAPSHOT_VERSION);
+        detail::putU32(head, identity.sidecar.has_value() ? 1u : 0u);
+        detail::putU32(head, static_cast<uint32_t>(dim));
+        detail::putU32(head, kBlockRows);
+        detail::putU64(head, static_cast<uint64_t>(count));
+        detail::putOpt(head, info.graphDigest);
+        detail::putOpt(head, info.graphDigestBasis);
+        detail::putOpt(head, info.encoderModel);
+        detail::putOpt(head, info.encoderVersion);
+        if (identity.sidecar.has_value()) {
+            detail::putU64(head, identity.sidecar->len);
+            head.append(reinterpret_cast<const char*>(identity.sidecar->fingerprint.data()), 32);
+        }
+        detail::putU32(head, static_cast<uint32_t>(models.size()));
+        for (const std::string& m : models) detail::putStr(head, m);
+
+        detail::Sha256 hasher;
+        uint64_t written = 0;
+        auto emit = [&](const void* data, size_t n) {
+            if (n == 0) return;
+            if (std::fwrite(data, 1, n, file) != n) throw EmbeddingError("failed writing snapshot");
+            hasher.update(data, n);
+            written += n;
+        };
+        emit(head.data(), head.size());
+
+        std::string meta;
+        std::vector<unsigned char> floats;
+        for (size_t start = 0; start < count; start += kBlockRows) {
+            const size_t end = std::min<size_t>(count, start + kBlockRows);
+            meta.clear();
+            for (size_t i = start; i < end; ++i) {
+                const uint32_t slot = rows[i];
+                detail::putStr(meta, std::string(typeOf(slot)));
+                detail::putStr(meta, std::string(idOf(slot)));
+                detail::putStr(meta, t_.meta[slot].text);
+                detail::putU32(meta, modelIndex.at(t_.meta[slot].model));
+            }
+            emit(meta.data(), meta.size());
+            floats.resize((end - start) * dim * 4);
+            for (size_t i = start; i < end; ++i) {
+                detail::floatsToLe(rowOf(rows[i]), dim, floats.data() + (i - start) * dim * 4);
+            }
+            emit(floats.data(), floats.size());
+        }
+        const auto digest = hasher.digest();
+        if (std::fwrite(digest.data(), 1, digest.size(), file) != digest.size()) {
+            throw EmbeddingError("failed writing snapshot");
+        }
+        info.bytes = written + digest.size();
+        return info;
+    }
+
+    /**
+     * Read and fully verify the snapshot at `path` into `stage` (an empty store),
+     * after `accept` (if any) has approved its header. Throws SnapshotRejected for
+     * a file that is not a valid snapshot of the right identity, EmbeddingError
+     * when it cannot be read at all.
+     */
+    static SnapshotInfo readSnapshot(
+        const std::string& path,
+        const std::function<std::optional<std::string>(const SnapshotInfo&)>& accept,
+        EmbeddingStore& stage) {
+        namespace fs = std::filesystem;
+        constexpr uint64_t kTrailer = 32;
+        std::error_code ec;
+        const uint64_t fileLen = static_cast<uint64_t>(fs::file_size(fs::path(path), ec));
+        if (ec) throw EmbeddingError("cannot open snapshot " + path + ": " + ec.message());
+        std::FILE* file = detail::openFile(path, "rb");
+        if (file == nullptr) throw EmbeddingError("cannot open snapshot " + path);
+        struct Closer {
+            std::FILE* f;
+            ~Closer() { if (f != nullptr) std::fclose(f); }
+        } closer{file};
+        std::setvbuf(file, nullptr, _IOFBF, 4u << 20);
+        if (fileLen < kTrailer + 8) throw detail::SnapshotRejected("file too short");
+
+        detail::Sha256 hasher;
+        uint64_t consumed = 0;
+        const uint64_t body = fileLen - kTrailer;
+        auto remaining = [&]() { return body - consumed; };
+        auto exact = [&](void* buf, size_t n) {
+            if (n > remaining()) throw detail::SnapshotRejected("truncated");
+            if (n > 0 && std::fread(buf, 1, n, file) != n) throw detail::SnapshotRejected("truncated");
+            hasher.update(buf, n);
+            consumed += n;
+        };
+        auto u32 = [&]() {
+            unsigned char b[4];
+            exact(b, 4);
+            return static_cast<uint32_t>(b[0]) | (static_cast<uint32_t>(b[1]) << 8) |
+                   (static_cast<uint32_t>(b[2]) << 16) | (static_cast<uint32_t>(b[3]) << 24);
+        };
+        auto u64 = [&]() {
+            unsigned char b[8];
+            exact(b, 8);
+            uint64_t v = 0;
+            for (int i = 7; i >= 0; --i) v = (v << 8) | b[i];
+            return v;
+        };
+        // A length-prefixed string; `optional` lets the length be 0xFFFFFFFF (absent).
+        auto str = [&](bool optional) -> std::optional<std::string> {
+            const uint32_t len = u32();
+            if (len == 0xFFFFFFFFu) {
+                if (optional) return std::nullopt;
+                throw detail::SnapshotRejected("a required string is marked absent");
+            }
+            if (len > remaining()) throw detail::SnapshotRejected("a string is longer than the file");
+            std::string s(len, '\0');
+            exact(s.empty() ? nullptr : &s[0], len);
+            if (!detail::validUtf8(reinterpret_cast<const unsigned char*>(s.data()), s.size())) {
+                throw detail::SnapshotRejected("a string is not UTF-8");
+            }
+            return s;
+        };
+
+        unsigned char magic[8];
+        exact(magic, 8);
+        if (std::memcmp(magic, "ISONVSNP", 8) != 0) throw detail::SnapshotRejected("not a snapshot (bad magic)");
+        const uint32_t version = u32();
+        if (version != SNAPSHOT_VERSION) {
+            throw detail::SnapshotRejected("unsupported snapshot version " + std::to_string(version) +
+                                           " (this build reads " + std::to_string(SNAPSHOT_VERSION) + ")");
+        }
+        const uint32_t flags = u32();
+        if ((flags & ~1u) != 0) throw detail::SnapshotRejected("unknown flags " + std::to_string(flags));
+        const uint64_t dim = u32();
+        const uint64_t blockRows = u32();
+        const uint64_t count = u64();
+        if (blockRows == 0 || blockRows > (uint64_t(1) << 20)) {
+            throw detail::SnapshotRejected("implausible block size " + std::to_string(blockRows));
+        }
+        if (count > 0xFFFFFFFFull || (count > 0 && dim == 0)) {
+            throw detail::SnapshotRejected("implausible shape " + std::to_string(count) + " x " + std::to_string(dim));
+        }
+        // count * dim * 4 > remaining, without overflowing 64 bits
+        if (count > 0 && dim > (remaining() / 4) / count) {
+            throw detail::SnapshotRejected("fewer bytes than the rows need");
+        }
+
+        SnapshotInfo info;
+        info.version = version;
+        info.dimension = static_cast<size_t>(dim);
+        info.count = static_cast<size_t>(count);
+        info.graphDigest = str(true);
+        info.graphDigestBasis = str(true);
+        info.encoderModel = str(true);
+        info.encoderVersion = str(true);
+        if (flags & 1u) {
+            SidecarId id;
+            id.len = u64();
+            exact(id.fingerprint.data(), 32);
+            info.sidecar = id;
+        }
+        const uint32_t modelCount = u32();
+        if (modelCount > remaining() / 4) throw detail::SnapshotRejected("more models than the file can hold");
+        std::vector<std::string> models;
+        models.reserve(modelCount);
+        for (uint32_t i = 0; i < modelCount; ++i) models.push_back(*str(false));
+        info.bytes = fileLen;
+        if (accept) {
+            if (auto why = accept(info)) throw detail::SnapshotRejected(*why);
+        }
+
+        struct RowMeta {
+            std::string type, id, text;
+            uint32_t model;
+        };
+        std::vector<unsigned char> bytes;
+        std::vector<float> row(count > 0 ? static_cast<size_t>(dim) : size_t(0));
+        uint64_t left = count;
+        while (left > 0) {
+            const size_t rows = static_cast<size_t>(std::min<uint64_t>(left, blockRows));
+            std::vector<RowMeta> meta;
+            meta.reserve(rows);
+            for (size_t i = 0; i < rows; ++i) {
+                RowMeta m;
+                m.type = *str(false);
+                m.id = *str(false);
+                m.text = *str(false);
+                m.model = u32();
+                if (m.model >= models.size()) throw detail::SnapshotRejected("a row names a model that is not listed");
+                meta.push_back(std::move(m));
+            }
+            const uint64_t need = static_cast<uint64_t>(rows) * dim * 4;
+            if (need > remaining()) throw detail::SnapshotRejected("truncated");
+            bytes.resize(static_cast<size_t>(need));
+            exact(bytes.data(), bytes.size());
+            for (size_t i = 0; i < rows; ++i) {
+                detail::floatsFromLe(bytes.data() + i * static_cast<size_t>(dim) * 4, static_cast<size_t>(dim), row.data());
+                if (!stage.putSnapshotRow(meta[i].type, meta[i].id, meta[i].text, models[meta[i].model],
+                                          row.data(), row.size())) {
+                    throw detail::SnapshotRejected("the key " + meta[i].type + ":" + meta[i].id + " appears twice");
+                }
+            }
+            left -= rows;
+        }
+        if (remaining() != 0) throw detail::SnapshotRejected("bytes left over after the last block");
+        const auto expected = hasher.digest();
+        unsigned char stored[32];
+        if (std::fread(stored, 1, 32, file) != 32) throw detail::SnapshotRejected("truncated");
+        if (std::memcmp(stored, expected.data(), 32) != 0) throw detail::SnapshotRejected("checksum mismatch");
+        return info;
+    }
+
     static std::string jsonString(const std::string& value) {
         static const char* const HEX = "0123456789abcdef";
         std::string out = "\"";
@@ -2668,7 +3768,8 @@ public:
         return embedding_store_.addBatch(items);
     }
 
-    const EmbeddingRecord* getEmbedding(const NodeRef& nodeRef) const {
+    /** The node's stored embedding as a copy (see EmbeddingStore::get), or nullopt. */
+    std::optional<EmbeddingRecord> getEmbedding(const NodeRef& nodeRef) const {
         return embedding_store_.get(nodeRef);
     }
 
@@ -2807,8 +3908,8 @@ public:
         const std::string& nodeType = "",
         float threshold = 0.0f
     ) const {
-        const EmbeddingRecord* record = embedding_store_.get(nodeRef);
-        if (record == nullptr) return {};
+        std::optional<EmbeddingRecord> record = embedding_store_.get(nodeRef);
+        if (!record.has_value()) return {};
 
         auto results = embedding_store_.similaritySearchVector(
             record->vector, topK + 1, nodeType, threshold);
@@ -3217,8 +4318,8 @@ public:
             const Node& node = graph_.getNode(ref.type, ref.id);
             sub.graph_.addNode(node.type, node.id, node.properties);
 
-            const EmbeddingRecord* record = embedding_store_.get(ref);
-            if (record != nullptr) {
+            std::optional<EmbeddingRecord> record = embedding_store_.get(ref);
+            if (record.has_value()) {
                 sub.embedding_store_.add(ref, record->text, record->vector);
             }
         }
@@ -3243,7 +4344,7 @@ public:
 
         graph_.forEachNode([&](const Node& node) {
             NodeRef ref(node.type, node.id);
-            if (skipExisting && embedding_store_.get(ref) != nullptr) return;
+            if (skipExisting && embedding_store_.contains(ref)) return;
             std::string text = textFn(node);
             if (!text.empty()) {
                 batch.emplace_back(ref, text);
@@ -3302,8 +4403,8 @@ public:
 
         std::vector<std::pair<NodeRef, std::string>> pairs;
         for (const NodeRef& ref : stale) {
-            const EmbeddingRecord* record = embedding_store_.get(ref);
-            if (record == nullptr) continue;
+            std::optional<EmbeddingRecord> record = embedding_store_.get(ref);
+            if (!record.has_value()) continue;
             std::string text = record->text;
             if (text.empty()) {
                 if (graph_.hasNode(ref)) {
@@ -3339,6 +4440,11 @@ public:
         return path + EMBEDDING_SIDECAR_SUFFIX;
     }
 
+    /** Snapshot path next to a graph saved at `path` (`<path>.embeddings.snap`). */
+    static std::string snapshotPathFor(const std::string& path) {
+        return path + EMBEDDING_SNAPSHOT_SUFFIX;
+    }
+
     /**
      * Save the graph to a file, and its embeddings alongside it.
      *
@@ -3361,11 +4467,22 @@ public:
      * With `embeddings` false an existing sidecar is left in place (and will
      * fail the digest check on load, as it no longer matches).
      *
+     * With `snapshot` true a binary snapshot of the embeddings is also written
+     * to `<path>.embeddings.snap` (after the sidecar, which stays the portable
+     * copy; the graph file, the sidecar bytes and the digest are identical with
+     * or without it). load() uses it when it provably belongs to the graph and
+     * the sidecar on disk, and reads the JSON otherwise. If the snapshot cannot
+     * be written the graph and sidecar are saved anyway, a stale snapshot is
+     * removed, and the error is thrown. A save without `snapshot` deletes any
+     * existing snapshot first (the sidecar is about to change). Ignored when
+     * `embeddings` is false.
+     *
      * @param format "auto" (by extension), "ison" or "isonl"
      * @param embeddings write the sidecar (false for a graph-only save)
+     * @param snapshot also write the binary snapshot
      */
     void save(const std::string& path, const std::string& format = "auto",
-              bool embeddings = true) const {
+              bool embeddings = true, bool snapshot = false) const {
         std::string actualFormat = format;
         if (format == "auto") {
             actualFormat = (path.size() >= 6 && path.compare(path.size() - 6, 6, ".isonl") == 0)
@@ -3378,8 +4495,27 @@ public:
 
         if (embeddings) {
             ison::Document reread = isonl ? ison::loads_isonl(text) : ison::loads(text);
-            embedding_store_.saveEmbeddings(embeddingsPathFor(path),
-                                            detail::digestOfDocument(reread));
+            const std::string digest = detail::digestOfDocument(reread);
+            const std::string sidecar = embeddingsPathFor(path);
+            const std::string snap = snapshotPathFor(path);
+            if (!snapshot) {
+                // the sidecar is about to change: a snapshot of the old one is stale
+                std::error_code ignored;
+                std::filesystem::remove(snap, ignored);
+            }
+            embedding_store_.saveEmbeddings(sidecar, digest);
+            if (snapshot) {
+                try {
+                    SnapshotIdentity identity;
+                    identity.graphDigest = digest;
+                    identity.sidecar = EmbeddingStore::sidecarIdOf(sidecar);
+                    embedding_store_.saveSnapshot(snap, identity);
+                } catch (...) {
+                    std::error_code ignored;
+                    std::filesystem::remove(snap, ignored);
+                    throw;
+                }
+            }
         }
     }
 
@@ -3412,6 +4548,16 @@ public:
      * @param ann opt in to approximate search (see EmbeddingStore::enableAnn).
      *        The index is never saved; it is rebuilt lazily from the loaded
      *        vectors on the first search.
+     * @param report if not null, filled with where the embeddings came from.
+     *        When a binary snapshot (`<path>.embeddings.snap`, written by
+     *        save(..., snapshot=true)) sits beside the sidecar it is used if its
+     *        header names this graph's digest and the sidecar file as it is now
+     *        and its checksum verifies; the result equals loading the JSON.
+     *        Otherwise the JSON sidecar is read exactly as before and
+     *        `report->snapshotSkipped` says why the snapshot was not used. A
+     *        snapshot is only ever looked at when the sidecar exists and
+     *        `embeddings` is true; it does not change what `onMismatch` means
+     *        for the JSON path.
      */
     static SemanticGraph load(
         const std::string& path,
@@ -3423,8 +4569,18 @@ public:
         GraphMismatchMode onMismatch = GraphMismatchMode::Error,
         std::optional<std::string> version = std::nullopt,
         ModelMismatchMode onModelMismatch = ModelMismatchMode::Warn,
-        std::optional<AnnOptions> ann = std::nullopt
+        std::optional<AnnOptions> ann = std::nullopt,
+        LoadReport* report = nullptr
     ) {
+        const auto started = std::chrono::steady_clock::now();
+        LoadReport local;
+        auto finish = [&](SemanticGraph&& graph, LoadSource source, size_t restored) {
+            local.source = source;
+            local.embeddings = restored;
+            local.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+            if (report != nullptr) *report = local;
+            return std::move(graph);
+        };
         // Read and parse the text here rather than through ISONGraph::load: the
         // digest has to be taken from the document (it records which ids were
         // integers and which cells were null, and the graph does not).
@@ -3459,57 +4615,83 @@ public:
                              onModelMismatch, std::move(version), std::move(ann));
         result.graph_ = std::move(base);
 
-        if (embeddings) {
-            std::string sidecar = embeddingsPathFor(path);
+        if (!embeddings) return finish(std::move(result), LoadSource::NoEmbeddings, 0);
+
+        std::string sidecar = embeddingsPathFor(path);
+        {
             std::ifstream probe(sidecar, std::ios::binary);
-            if (probe.is_open()) {
-                probe.close();
+            if (!probe.is_open()) return finish(std::move(result), LoadSource::NoEmbeddings, 0);
+        }
 
-                ExportedEmbeddings payload;
-                try {
-                    payload = EmbeddingStore::parseJson(EmbeddingStore::readFile(sidecar));
-                } catch (const EmbeddingError& error) {
-                    throw EmbeddingError("unreadable embeddings sidecar " + sidecar + ": " +
-                                         error.what());
-                }
+        std::optional<std::string> actualDigest;
+        auto graphDigestNow = [&]() -> const std::string& {
+            if (!actualDigest.has_value()) actualDigest = detail::digestOfDocument(doc);
+            return *actualDigest;
+        };
+        auto warnOnVersionSkew = [&]() {
+            const auto& storedVersion = result.embedding_store_.lastImportMeta().encoderVersion;
+            auto currentVersion = result.embedding_store_.version();
+            if (storedVersion.has_value() && currentVersion.has_value() &&
+                *storedVersion != *currentVersion) {
+                emitWarning("embeddings were made by encoder version '" + *storedVersion +
+                            "', but the encoder in use is version '" + *currentVersion + "'");
+            }
+        };
 
-                std::optional<std::string> problem;
-                if (payload.meta.graphDigest.has_value() &&
-                    payload.meta.graphDigestBasis.value_or(GRAPH_DIGEST_BASIS) ==
-                        std::string(GRAPH_DIGEST_BASIS)) {
-                    std::string actual = detail::digestOfDocument(doc);
-                    if (*payload.meta.graphDigest != actual) {
-                        problem = "embeddings sidecar " + sidecar + " does not belong to graph " +
-                                  path + ": it was written for graph digest " +
-                                  *payload.meta.graphDigest + ", but the graph reads as " +
-                                  actual + " (the sidecar is from a different save, or the "
-                                  "graph was edited since). Pass GraphMismatchMode::Reembed to "
-                                  "rebuild the vectors or GraphMismatchMode::Warn to use them "
-                                  "anyway.";
-                    }
+        // The binary snapshot is a cache of the sidecar: take it only when it
+        // provably belongs to this graph and this sidecar, else fall through.
+        const std::string snap = snapshotPathFor(path);
+        {
+            std::error_code ec;
+            if (std::filesystem::is_regular_file(snap, ec)) {
+                SnapshotInfo info;
+                std::optional<std::string> why =
+                    result.embedding_store_.tryLoadSnapshotFor(snap, sidecar, graphDigestNow(), &info);
+                if (!why.has_value()) {
+                    warnOnVersionSkew();
+                    return finish(std::move(result), LoadSource::Snapshot, info.count);
                 }
-
-                if (problem.has_value() && onMismatch == GraphMismatchMode::Error) {
-                    throw GraphEmbeddingMismatchError(*problem);
-                }
-                if (problem.has_value() && onMismatch == GraphMismatchMode::Reembed) {
-                    result.embedAllNodes();
-                } else {
-                    if (problem.has_value()) emitWarning(*problem);
-                    result.embedding_store_.importEmbeddings(payload);
-
-                    const auto& storedVersion = result.embedding_store_.lastImportMeta().encoderVersion;
-                    auto currentVersion = result.embedding_store_.version();
-                    if (storedVersion.has_value() && currentVersion.has_value() &&
-                        *storedVersion != *currentVersion) {
-                        emitWarning("embeddings were made by encoder version '" + *storedVersion +
-                                    "', but the encoder in use is version '" + *currentVersion + "'");
-                    }
-                }
+                local.snapshotSkipped = *why;
             }
         }
 
-        return result;
+        ExportedEmbeddings payload;
+        try {
+            payload = EmbeddingStore::parseJson(EmbeddingStore::readFile(sidecar));
+        } catch (const EmbeddingError& error) {
+            throw EmbeddingError("unreadable embeddings sidecar " + sidecar + ": " +
+                                 error.what());
+        }
+
+        std::optional<std::string> problem;
+        if (payload.meta.graphDigest.has_value() &&
+            payload.meta.graphDigestBasis.value_or(GRAPH_DIGEST_BASIS) ==
+                std::string(GRAPH_DIGEST_BASIS)) {
+            const std::string& actual = graphDigestNow();
+            if (*payload.meta.graphDigest != actual) {
+                problem = "embeddings sidecar " + sidecar + " does not belong to graph " +
+                          path + ": it was written for graph digest " +
+                          *payload.meta.graphDigest + ", but the graph reads as " +
+                          actual + " (the sidecar is from a different save, or the "
+                          "graph was edited since). Pass GraphMismatchMode::Reembed to "
+                          "rebuild the vectors or GraphMismatchMode::Warn to use them "
+                          "anyway.";
+            }
+        }
+
+        if (problem.has_value() && onMismatch == GraphMismatchMode::Error) {
+            throw GraphEmbeddingMismatchError(*problem);
+        }
+        if (problem.has_value() && onMismatch == GraphMismatchMode::Reembed) {
+            result.embedAllNodes();
+        } else {
+            if (problem.has_value()) emitWarning(*problem);
+            result.embedding_store_.importEmbeddings(payload);
+            warnOnVersionSkew();
+        }
+
+        const size_t restored = result.embedding_store_.count();
+        return finish(std::move(result), LoadSource::Json, restored);
     }
 };
 

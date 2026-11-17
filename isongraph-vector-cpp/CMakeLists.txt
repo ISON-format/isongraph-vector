@@ -120,6 +120,12 @@ if(ISONGRAPH_VECTOR_BENCH)
             target_compile_options(ann_bench PRIVATE -march=native)
         endif()
     endif()
+
+    # Resident memory, single/batch search and snapshot-vs-JSON timings
+    # (bench/stage_d_bench.cpp; see its header for the phases).
+    add_executable(stage_d_bench bench/stage_d_bench.cpp)
+    target_link_libraries(stage_d_bench PRIVATE isongraph_vector)
+    target_compile_definitions(stage_d_bench PRIVATE ISONGRAPH_BENCH_NEW=1)
 endif()
 
 # Tests. Skipped when this project is consumed via add_subdirectory.
@@ -128,6 +134,10 @@ enable_testing()
 add_executable(test_isongraph_vector tests/test_isongraph_vector.cpp)
 target_link_libraries(test_isongraph_vector PRIVATE isongraph_vector)
 add_test(NAME test_isongraph_vector COMMAND test_isongraph_vector)
+# The golden snapshot fixture written by the Rust crate lives beside the other
+# ports' fixtures at the repository root.
+target_compile_definitions(test_isongraph_vector PRIVATE
+    ISONGRAPH_VECTOR_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../tests/fixtures/snapshot")
 
 if(ISONGRAPH_VECTOR_SQLITE)
     add_executable(test_isongraph_vector_sqlite tests/test_isongraph_vector_sqlite.cpp)

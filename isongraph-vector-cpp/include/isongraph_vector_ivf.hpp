@@ -7,8 +7,9 @@
  * isongraph_vector.hpp owns the slot <-> record mapping and the policy
  * (when to build, fold, retrain); this file is the arithmetic.
  *
- * Layout (all contiguous, nothing allocated per query):
- *   data       slots x dim floats, the vectors as given (not normalised)
+ * The index holds NO copy of the vectors. The rows live once, in the store's
+ * ChunkedMatrix (below); every method that scores or trains takes that matrix
+ * and the per-slot type codes by reference. Layout of what the index itself keeps:
  *   invNorm    1 / |row| per slot (0 for a zero row, which then scores 0)
  *   assign     cell of each slot, -1 = in no cell yet (new/updated) or dead
  *   order      the slots of every cell, grouped by cell
@@ -22,7 +23,9 @@
  * threads used: every row's cell is independent of the others, and a
  * centroid sums its rows in ascending row order.
  *
- * Not thread-safe by itself; EmbeddingStore serialises access.
+ * Thread safety: search() and candidates() are const and use only per-call
+ * scratch, so any number may run at once; every other method needs exclusive
+ * access, which EmbeddingStore provides with a reader/writer lock.
  */
 
 #ifndef ISONGRAPH_VECTOR_IVF_HPP
@@ -36,6 +39,7 @@
 #include <cstdint>
 #include <exception>
 #include <limits>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <system_error>
@@ -220,6 +224,39 @@ inline size_t autoThreads() {
     return n == 0 ? 1 : n;
 }
 
+/**
+ * Run fn(worker) once on each of `workers` threads (worker 0 is the caller's),
+ * and return when all are done. The first exception any of them throws is
+ * rethrown on the caller's thread after every worker has been joined, so a
+ * failure neither leaks a thread nor terminates the process. If the platform
+ * cannot start a thread the remaining workers simply do not exist: callers
+ * must hand out work from a shared counter, so the workers that did start
+ * finish all of it.
+ */
+template <class F>
+void runWorkers(size_t workers, F&& fn) {
+    if (workers == 0) workers = 1;
+    std::exception_ptr failure;
+    std::atomic<bool> failed{false};
+    auto guarded = [&](size_t w) {
+        try {
+            fn(w);
+        } catch (...) {
+            if (!failed.exchange(true)) failure = std::current_exception();
+        }
+    };
+    std::vector<std::thread> pool;
+    pool.reserve(workers - 1);
+    try {
+        for (size_t w = 1; w < workers; ++w) pool.emplace_back(guarded, w);
+    } catch (const std::system_error&) {
+        // fewer threads than asked for; see above
+    }
+    guarded(0);
+    for (auto& t : pool) t.join();
+    if (failure) std::rethrow_exception(failure);
+}
+
 /** One search hit: higher score first, lower slot first on a tie. */
 struct IvfHit {
     float score;
@@ -229,6 +266,149 @@ struct IvfHit {
 inline bool hitBefore(const IvfHit& a, const IvfHit& b) {
     return a.score > b.score || (a.score == b.score && a.slot < b.slot);
 }
+
+// =============================================================================
+// The vector matrix: one copy of every vector
+// =============================================================================
+
+/** Rows per chunk of the matrix (and per scan block). */
+constexpr size_t kChunkRows = 1024;
+
+/**
+ * Row-major float matrix stored in chunks of kChunkRows rows. Growth never
+ * copies stored rows (a new chunk is allocated; only the first chunk, which
+ * starts small, is regrown while it is still below kChunkRows rows), a deletion
+ * is a row move done by the owner during compaction, and the rows of one chunk
+ * are contiguous, so a scan block never straddles chunks. Chunks are allocated
+ * uninitialised, so memory is only touched when a row is written.
+ *
+ * Row pointers are stable until the next write to the matrix.
+ */
+class ChunkedMatrix {
+public:
+    ChunkedMatrix() = default;
+    ChunkedMatrix(ChunkedMatrix&& other) noexcept { takeFrom(other); }
+    ChunkedMatrix& operator=(ChunkedMatrix&& other) noexcept {
+        if (this != &other) takeFrom(other);
+        return *this;
+    }
+    ChunkedMatrix(const ChunkedMatrix& other) { copyFrom(other); }
+    ChunkedMatrix& operator=(const ChunkedMatrix& other) {
+        if (this != &other) {
+            chunks_.clear();
+            copyFrom(other);
+        }
+        return *this;
+    }
+
+    size_t dim() const { return dim_; }
+    size_t rows() const { return rows_; }
+    size_t chunks() const { return chunks_.size(); }
+    /** Rows held by chunk `c` (kChunkRows except for the last). */
+    size_t rowsInChunk(size_t c) const {
+        return c + 1 < chunks_.size() ? kChunkRows : rows_ - c * kChunkRows;
+    }
+    /** Bytes allocated for rows (not counting the table of chunk pointers). */
+    size_t bytes() const {
+        size_t total = 0;
+        for (size_t c = 0; c < chunks_.size(); ++c) {
+            total += (c == 0 ? firstCap_ : kChunkRows) * dim_ * sizeof(float);
+        }
+        return total;
+    }
+
+    /** Forget everything and set the row width. */
+    void reset(size_t dim) {
+        chunks_.clear();
+        rows_ = 0;
+        firstCap_ = 0;
+        dim_ = dim;
+    }
+
+    const float* row(size_t slot) const {
+        return chunks_[slot / kChunkRows].get() + (slot % kChunkRows) * dim_;
+    }
+    float* row(size_t slot) {
+        return chunks_[slot / kChunkRows].get() + (slot % kChunkRows) * dim_;
+    }
+    const float* chunkData(size_t c) const { return chunks_[c].get(); }
+
+    /** Add a row at the end; returns its slot. */
+    size_t append(const float* v) {
+        const size_t slot = rows_;
+        if (slot % kChunkRows == 0) {
+            if (slot == 0) {
+                growFirst(4);
+            } else {
+                chunks_.emplace_back(new float[kChunkRows * dim_]);
+            }
+        } else if (slot < kChunkRows && slot == firstCap_) {
+            growFirst(std::min(kChunkRows, firstCap_ * 2));
+        }
+        ++rows_;
+        std::copy(v, v + dim_, row(slot));
+        return slot;
+    }
+
+    void set(size_t slot, const float* v) { std::copy(v, v + dim_, row(slot)); }
+
+    /** Copy row `from` over row `to` (from > to). */
+    void moveRow(size_t from, size_t to) {
+        const float* src = row(from);
+        std::copy(src, src + dim_, row(to));
+    }
+
+    /** Keep the first `keep` rows and free the chunks no longer needed. */
+    void truncate(size_t keep) {
+        rows_ = keep;
+        const size_t needed = (keep + kChunkRows - 1) / kChunkRows;
+        while (chunks_.size() > needed) chunks_.pop_back();
+        if (keep == 0) firstCap_ = 0;
+    }
+
+private:
+    std::vector<std::unique_ptr<float[]>> chunks_;
+    size_t dim_ = 0;
+    size_t rows_ = 0;
+    size_t firstCap_ = 0;   // rows the first chunk has room for (<= kChunkRows)
+
+    void takeFrom(ChunkedMatrix& other) noexcept {
+        chunks_ = std::move(other.chunks_);
+        dim_ = other.dim_;
+        rows_ = other.rows_;
+        firstCap_ = other.firstCap_;
+        other.chunks_.clear();
+        other.rows_ = 0;
+        other.firstCap_ = 0;
+    }
+
+    void growFirst(size_t wantRows) {
+        wantRows = std::min(wantRows, kChunkRows);
+        std::unique_ptr<float[]> next(new float[wantRows * dim_]);
+        if (!chunks_.empty()) {
+            const size_t used = std::min(rows_, kChunkRows);
+            std::copy(chunks_[0].get(), chunks_[0].get() + used * dim_, next.get());
+            chunks_[0] = std::move(next);
+        } else {
+            chunks_.push_back(std::move(next));
+        }
+        firstCap_ = wantRows;
+    }
+
+    void copyFrom(const ChunkedMatrix& other) {
+        dim_ = other.dim_;
+        rows_ = other.rows_;
+        firstCap_ = other.firstCap_;
+        chunks_.clear();
+        chunks_.reserve(other.chunks_.size());
+        for (size_t c = 0; c < other.chunks_.size(); ++c) {
+            const size_t cap = c == 0 ? other.firstCap_ : kChunkRows;
+            std::unique_ptr<float[]> mine(new float[cap * dim_]);
+            std::copy(other.chunks_[c].get(), other.chunks_[c].get() + other.rowsInChunk(c) * dim_, mine.get());
+            chunks_.push_back(std::move(mine));
+        }
+    }
+};
 
 // =============================================================================
 // The index
@@ -250,60 +430,63 @@ public:
     size_t dead() const { return dead_; }
 
     /**
-     * Train on `n` rows laid out contiguously in `data` (slot i = row i, all
-     * alive), then put every row in its nearest cell. `codes` gives each row
-     * a small integer type code for filtered searches.
+     * Train on the live rows of `m` and put every one in its nearest cell.
+     * Slot i of the index is row i of the matrix; `alive` says which slots hold a
+     * row. `trainOrder` lists the live slots in the order training should see
+     * them (the store sorts them by key, so the same data gives the same index
+     * however it was inserted).
      */
-    static IvfIndex build(size_t dim, std::vector<float>&& data, std::vector<uint32_t>&& codes,
-                          size_t nlistWanted, uint64_t seed, size_t threads, int iterations = 8) {
+    static IvfIndex build(const ChunkedMatrix& m, const std::vector<uint8_t>& alive,
+                          const std::vector<uint32_t>& trainOrder, size_t nlistWanted,
+                          uint64_t seed, size_t threads, int iterations = 8) {
         auto started = std::chrono::steady_clock::now();
         IvfIndex index;
-        index.dim = dim;
-        index.data_ = std::move(data);
-        index.codes_ = std::move(codes);
-        const size_t n = index.codes_.size();
-        index.alive_.assign(n, 1);
+        index.dim = m.dim();
+        const size_t n = m.rows();
+        index.alive_ = alive;
+        index.dead_ = 0;
+        for (uint8_t a : index.alive_) index.dead_ += a ? 0 : 1;
         index.pend_.assign(n, 0);
         index.assign_.assign(n, -1);
-        index.invNorm_.resize(n);
+        index.invNorm_.assign(n, 0.0f);
         if (threads == 0) threads = autoThreads();
+        const size_t dim = index.dim;
         parallelFor((n + 8191) / 8192, threads, [&](size_t block) {
             size_t lo = block * 8192, hi = std::min(n, lo + 8192);
-            for (size_t i = lo; i < hi; ++i) index.invNorm_[i] = inverseNorm(index.row(i), dim);
+            for (size_t i = lo; i < hi; ++i) {
+                if (index.alive_[i]) index.invNorm_[i] = inverseNorm(m.row(i), dim);
+            }
         });
 
-        index.nlist = std::max<size_t>(1, std::min(nlistWanted, n));
-        index.trainedN = n;
-        index.train(seed, threads, iterations);
-        index.assignAll(threads);
+        const size_t liveRows = trainOrder.size();
+        index.nlist = std::max<size_t>(1, std::min(nlistWanted, liveRows));
+        index.trainedN = liveRows;
+        index.train(m, trainOrder, seed, threads, iterations);
+        index.assignAll(m, threads);
         index.relist();
         index.buildSeconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - started).count();
         return index;
     }
 
-    // -- writes -----------------------------------------------------------------
+    // -- writes (the owner has already written the row to the matrix) -------------
 
-    /** A new row; it is scored exactly by every query until folded into a cell. */
-    uint32_t append(const float* v, uint32_t code) {
+    /** A new row at the next slot; it is scored exactly by every query until folded into a cell. */
+    uint32_t append(const float* v) {
         uint32_t slot = static_cast<uint32_t>(alive_.size());
-        data_.insert(data_.end(), v, v + dim);
         invNorm_.push_back(inverseNorm(v, dim));
         assign_.push_back(-1);
         alive_.push_back(1);
         pend_.push_back(1);
-        codes_.push_back(code);
         pending_.push_back(slot);
         ++pendingLive;
         ++churn;
         return slot;
     }
 
-    /** Replace a row in place: it leaves its cell and is pending again. */
-    void overwrite(uint32_t slot, const float* v, uint32_t code) {
-        std::copy(v, v + dim, data_.begin() + static_cast<std::ptrdiff_t>(slot) * dim);
+    /** A row was replaced in place: it leaves its cell and is pending again. */
+    void overwrite(uint32_t slot, const float* v) {
         invNorm_[slot] = inverseNorm(v, dim);
-        codes_[slot] = code;
         assign_[slot] = -1;
         if (!pend_[slot]) {
             pend_[slot] = 1;
@@ -326,41 +509,30 @@ public:
         ++churn;
     }
 
-    bool needsCompaction() const { return dead_ >= 64 && dead_ * 4 > alive_.size(); }
-
     /**
-     * Squeeze out the tombstones, keeping live rows in slot order and their
-     * cells. Returns, for every old slot, its new slot (kNoSlot when dead);
-     * the owner uses it to renumber its own slot tables.
+     * The owner squeezed the tombstones out of its matrix, keeping live rows in
+     * slot order: `remapTable[old]` is the new slot (kNoSlot for a dead one) and
+     * `kept` the new slot count. Renumber everything slot-indexed to match.
      */
-    std::vector<uint32_t> compact() {
+    void remap(const std::vector<uint32_t>& remapTable, size_t kept) {
         const size_t n = alive_.size();
-        std::vector<uint32_t> remap(n, kNoSlot);
-        size_t kept = 0;
         for (size_t i = 0; i < n; ++i) {
-            if (!alive_[i]) continue;
-            remap[i] = static_cast<uint32_t>(kept);
-            if (kept != i) {
-                std::copy(row(i), row(i) + dim, data_.begin() + static_cast<std::ptrdiff_t>(kept) * dim);
-                invNorm_[kept] = invNorm_[i];
-                assign_[kept] = assign_[i];
-                pend_[kept] = pend_[i];
-                codes_[kept] = codes_[i];
-            }
-            ++kept;
+            const uint32_t to = remapTable[i];
+            if (to == kNoSlot || to == i) continue;
+            invNorm_[to] = invNorm_[i];
+            assign_[to] = assign_[i];
+            pend_[to] = pend_[i];
         }
-        data_.resize(kept * dim);
         invNorm_.resize(kept);
         assign_.resize(kept);
         pend_.resize(kept);
-        codes_.resize(kept);
         alive_.assign(kept, 1);
         dead_ = 0;
         std::vector<uint32_t> pending;
         pending.reserve(pendingLive);
         for (uint32_t old : pending_) {
-            if (old < n && remap[old] != kNoSlot && pend_[remap[old]]) {
-                pending.push_back(remap[old]);
+            if (old < n && remapTable[old] != kNoSlot && pend_[remapTable[old]]) {
+                pending.push_back(remapTable[old]);
             }
         }
         // a slot can be listed twice only if it was dropped and re-listed, which
@@ -369,11 +541,10 @@ public:
         pending.erase(std::unique(pending.begin(), pending.end()), pending.end());
         pending_ = std::move(pending);
         relist();
-        return remap;
     }
 
     /** Put every pending row in its nearest cell and regroup. */
-    void fold(size_t threads) {
+    void fold(const ChunkedMatrix& m, size_t threads) {
         std::vector<uint32_t> ids;
         ids.reserve(pendingLive);
         for (uint32_t slot : pending_) {
@@ -384,7 +555,8 @@ public:
         if (!ids.empty()) {
             std::vector<float> gathered(ids.size() * dim);
             for (size_t i = 0; i < ids.size(); ++i) {
-                std::copy(row(ids[i]), row(ids[i]) + dim, gathered.begin() + static_cast<std::ptrdiff_t>(i) * dim);
+                const float* src = m.row(ids[i]);
+                std::copy(src, src + dim, gathered.begin() + static_cast<std::ptrdiff_t>(i) * static_cast<std::ptrdiff_t>(dim));
             }
             std::vector<int32_t> cells(ids.size());
             if (threads == 0) threads = autoThreads();
@@ -404,45 +576,43 @@ public:
     /**
      * Score the rows of the `lists` cells whose centroids are nearest `q`, plus
      * every pending row, and keep the best `k` that score at least `threshold`
-     * (and have type `code`, unless it is kAnyCode). `out` is filled best
-     * first. Scores are cosine similarities computed from the cached inverse
-     * norms.
+     * (and have type `code` in `codes`, unless it is kAnyCode). `out` is filled
+     * best first. Scores are cosine similarities computed from the cached
+     * inverse norms. const, and all scratch is local to the call: any number of
+     * searches may run at once.
      */
     static constexpr uint32_t kAnyCode = std::numeric_limits<uint32_t>::max();
 
-    void search(const float* q, float invQ, uint32_t code, float threshold, size_t lists,
-                size_t k, std::vector<IvfHit>& out) {
+    void search(const ChunkedMatrix& m, const uint32_t* codes, const float* q, float invQ,
+                uint32_t code, float threshold, size_t lists, size_t k,
+                std::vector<IvfHit>& out) const {
         out.clear();
         if (k == 0 || live() == 0) return;
-        chooseCells(q, lists);
-        heap_.clear();
-        heap_.reserve(k);
-        scan(q, invQ, code, threshold, k, /*collectAll=*/false);
-        out.assign(heap_.begin(), heap_.end());
+        std::vector<uint32_t> chosen;
+        chooseCells(q, lists, chosen);
+        scan(m, codes, q, invQ, code, threshold, k, /*collectAll=*/false, chosen, out);
         std::sort(out.begin(), out.end(), hitBefore);
     }
 
     /** Like search() but returns every candidate that passes the filters, best first. */
-    void candidates(const float* q, float invQ, uint32_t code, float threshold, size_t lists,
-                    std::vector<IvfHit>& out) {
+    void candidates(const ChunkedMatrix& m, const uint32_t* codes, const float* q, float invQ,
+                    uint32_t code, float threshold, size_t lists,
+                    std::vector<IvfHit>& out) const {
         out.clear();
         if (live() == 0) return;
-        chooseCells(q, lists);
-        heap_.clear();
-        scan(q, invQ, code, threshold, 0, /*collectAll=*/true);
-        out.assign(heap_.begin(), heap_.end());
+        std::vector<uint32_t> chosen;
+        chooseCells(q, lists, chosen);
+        scan(m, codes, q, invQ, code, threshold, 0, /*collectAll=*/true, chosen, out);
         std::sort(out.begin(), out.end(), hitBefore);
     }
 
-    /** Bytes held by the index apart from the vectors themselves. */
+    /** Bytes held by the index. It holds no copy of the vectors. */
     size_t overheadBytes() const {
         return centroids_.capacity() * sizeof(float) + assign_.capacity() * sizeof(int32_t) +
                order_.capacity() * sizeof(uint32_t) + offsets_.capacity() * sizeof(uint32_t) +
-               invNorm_.capacity() * sizeof(float) + codes_.capacity() * sizeof(uint32_t) +
+               invNorm_.capacity() * sizeof(float) +
                alive_.capacity() + pend_.capacity() + pending_.capacity() * sizeof(uint32_t);
     }
-    /** Bytes of the contiguous vector copy the index scans. */
-    size_t vectorBytes() const { return data_.capacity() * sizeof(float); }
 
     static float inverseNorm(const float* v, size_t n) {
         float s = simd::dot(v, v, n);
@@ -450,25 +620,15 @@ public:
     }
 
 private:
-    std::vector<float> data_;
     std::vector<float> invNorm_;
     std::vector<int32_t> assign_;
     std::vector<uint8_t> alive_;
     std::vector<uint8_t> pend_;
-    std::vector<uint32_t> codes_;
     std::vector<uint32_t> pending_;
     std::vector<uint32_t> order_;
     std::vector<uint32_t> offsets_;
     std::vector<float> centroids_;
     size_t dead_ = 0;
-
-    // per-query scratch, sized once
-    std::vector<float> cellScore_;
-    std::vector<uint32_t> cellIdx_;
-    std::vector<uint32_t> chosen_;
-    std::vector<IvfHit> heap_;
-
-    const float* row(size_t slot) const { return data_.data() + slot * dim; }
 
     // -- training -----------------------------------------------------------------
 
@@ -492,6 +652,16 @@ private:
         parallelFor((count + kChunk - 1) / kChunk, threads, [&](size_t chunk) {
             size_t lo = chunk * kChunk;
             nearestRange(rows + lo * dim, std::min(kChunk, count - lo), out + lo);
+        });
+    }
+
+    /** nearest() over the first `count` rows of the matrix (256-row blocks never cross a chunk). */
+    void nearestMatrix(const ChunkedMatrix& m, size_t count, int32_t* out, size_t threads) const {
+        constexpr size_t kChunk = 256;
+        static_assert(kChunkRows % kChunk == 0, "a 256-row block must lie inside one chunk");
+        parallelFor((count + kChunk - 1) / kChunk, threads, [&](size_t chunk) {
+            size_t lo = chunk * kChunk;
+            nearestRange(m.row(lo), std::min(kChunk, count - lo), out + lo);
         });
     }
 
@@ -541,8 +711,9 @@ private:
     const float* centroid(size_t c) const { return centroids_.data() + c * dim; }
     float* centroid(size_t c) { return centroids_.data() + c * dim; }
 
-    void train(uint64_t seed, size_t threads, int iterations) {
-        const size_t total = alive_.size();
+    void train(const ChunkedMatrix& m, const std::vector<uint32_t>& trainOrder, uint64_t seed,
+               size_t threads, int iterations) {
+        const size_t total = trainOrder.size();
         std::mt19937_64 rng(seed);
         const size_t sampleN = std::min(total, 40 * nlist);
 
@@ -560,8 +731,9 @@ private:
         parallelFor((sampleN + 4095) / 4096, threads, [&](size_t block) {
             size_t lo = block * 4096, hi = std::min(sampleN, lo + 4096);
             for (size_t i = lo; i < hi; ++i) {
-                const float* src = row(sample[i]);
-                float inv = invNorm_[sample[i]];
+                const uint32_t slot = trainOrder[sample[i]];
+                const float* src = m.row(slot);
+                float inv = invNorm_[slot];
                 float* dst = x.data() + i * dim;
                 for (size_t d = 0; d < dim; ++d) dst[d] = src[d] * inv;
             }
@@ -622,9 +794,9 @@ private:
         }
     }
 
-    void assignAll(size_t threads) {
+    void assignAll(const ChunkedMatrix& m, size_t threads) {
         const size_t n = alive_.size();
-        nearest(data_.data(), n, assign_.data(), threads);
+        nearestMatrix(m, n, assign_.data(), threads);
         for (size_t i = 0; i < n; ++i) {
             if (!alive_[i]) assign_[i] = -1;
         }
@@ -650,60 +822,59 @@ private:
 
     // -- query internals ---------------------------------------------------------
 
-    void chooseCells(const float* q, size_t lists) {
-        if (cellScore_.size() != nlist) {
-            cellScore_.assign(nlist, 0.0f);
-            cellIdx_.resize(nlist);
-        }
-        chosen_.clear();
+    void chooseCells(const float* q, size_t lists, std::vector<uint32_t>& chosen) const {
+        chosen.clear();
         if (lists >= nlist) {
-            for (size_t c = 0; c < nlist; ++c) chosen_.push_back(static_cast<uint32_t>(c));
+            for (size_t c = 0; c < nlist; ++c) chosen.push_back(static_cast<uint32_t>(c));
             return;
         }
+        std::vector<float> cellScore(nlist);
+        std::vector<uint32_t> cellIdx(nlist);
         for (size_t c = 0; c < nlist; ++c) {
-            cellScore_[c] = simd::dot(q, centroid(c), dim);
-            cellIdx_[c] = static_cast<uint32_t>(c);
+            cellScore[c] = simd::dot(q, centroid(c), dim);
+            cellIdx[c] = static_cast<uint32_t>(c);
         }
-        auto better = [this](uint32_t a, uint32_t b) {
-            return cellScore_[a] > cellScore_[b] || (cellScore_[a] == cellScore_[b] && a < b);
+        auto better = [&cellScore](uint32_t a, uint32_t b) {
+            return cellScore[a] > cellScore[b] || (cellScore[a] == cellScore[b] && a < b);
         };
-        std::nth_element(cellIdx_.begin(), cellIdx_.begin() + static_cast<std::ptrdiff_t>(lists - 1),
-                         cellIdx_.end(), better);
-        chosen_.assign(cellIdx_.begin(), cellIdx_.begin() + static_cast<std::ptrdiff_t>(lists));
-        std::sort(chosen_.begin(), chosen_.end());
+        std::nth_element(cellIdx.begin(), cellIdx.begin() + static_cast<std::ptrdiff_t>(lists - 1),
+                         cellIdx.end(), better);
+        chosen.assign(cellIdx.begin(), cellIdx.begin() + static_cast<std::ptrdiff_t>(lists));
+        std::sort(chosen.begin(), chosen.end());
     }
 
-    void scan(const float* q, float invQ, uint32_t code, float threshold, size_t k, bool collectAll) {
-        const float* base = data_.data();
+    void scan(const ChunkedMatrix& m, const uint32_t* codes, const float* q, float invQ,
+              uint32_t code, float threshold, size_t k, bool collectAll,
+              const std::vector<uint32_t>& chosen, std::vector<IvfHit>& heap) const {
         auto take = [&](uint32_t slot) {
-            float s = simd::dot(base + static_cast<size_t>(slot) * dim, q, dim) * invNorm_[slot] * invQ;
+            float s = simd::dot(m.row(slot), q, dim) * invNorm_[slot] * invQ;
             if (!(s >= threshold)) return;
             IvfHit hit{s, slot};
             if (collectAll) {
-                heap_.push_back(hit);
-            } else if (heap_.size() < k) {
-                heap_.push_back(hit);
-                std::push_heap(heap_.begin(), heap_.end(), hitBefore);
-            } else if (hitBefore(hit, heap_.front())) {
-                std::pop_heap(heap_.begin(), heap_.end(), hitBefore);
-                heap_.back() = hit;
-                std::push_heap(heap_.begin(), heap_.end(), hitBefore);
+                heap.push_back(hit);
+            } else if (heap.size() < k) {
+                heap.push_back(hit);
+                std::push_heap(heap.begin(), heap.end(), hitBefore);
+            } else if (hitBefore(hit, heap.front())) {
+                std::pop_heap(heap.begin(), heap.end(), hitBefore);
+                heap.back() = hit;
+                std::push_heap(heap.begin(), heap.end(), hitBefore);
             }
         };
 
-        for (uint32_t c : chosen_) {
+        for (uint32_t c : chosen) {
             const uint32_t lo = offsets_[c], hi = offsets_[c + 1];
             for (uint32_t p = lo; p < hi; ++p) {
-                if (p + 2 < hi) simd::prefetch(base + static_cast<size_t>(order_[p + 2]) * dim);
+                if (p + 2 < hi) simd::prefetch(m.row(order_[p + 2]));
                 uint32_t slot = order_[p];
                 if (assign_[slot] != static_cast<int32_t>(c)) continue;  // moved or deleted since
-                if (code != kAnyCode && codes_[slot] != code) continue;
+                if (code != kAnyCode && codes[slot] != code) continue;
                 take(slot);
             }
         }
         for (uint32_t slot : pending_) {
             if (!alive_[slot] || !pend_[slot]) continue;
-            if (code != kAnyCode && codes_[slot] != code) continue;
+            if (code != kAnyCode && codes[slot] != code) continue;
             take(slot);
         }
     }

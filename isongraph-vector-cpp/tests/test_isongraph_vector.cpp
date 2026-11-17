@@ -20,6 +20,9 @@
 #include <thread>
 #include <atomic>
 #include <limits>
+#include <optional>
+#include <array>
+#include <cstring>
 #include "../include/isongraph_vector.hpp"
 #include "../include/isongraph_vector_http.hpp"
 
@@ -77,15 +80,16 @@ int tests_passed = 0;
         throw std::runtime_error("Assertion failed: " #a " <= " #b); \
     }
 
-#define ASSERT_NULL(ptr) \
-    if ((ptr) != nullptr) { \
-        throw std::runtime_error("Assertion failed: " #ptr " is not null"); \
-    }
+// EmbeddingStore::get() hands out a std::optional copy (it used to hand out a
+// pointer into the store), so "null" means "no value" for either.
+template <class T>
+bool isNullValue(const T& p) { return p == nullptr; }
+template <class T>
+bool isNullValue(const std::optional<T>& o) { return !o.has_value(); }
 
-#define ASSERT_NOT_NULL(ptr) \
-    if ((ptr) == nullptr) { \
-        throw std::runtime_error("Assertion failed: " #ptr " is null"); \
-    }
+#define ASSERT_NULL(ptr)     if (!isNullValue(ptr)) {         throw std::runtime_error("Assertion failed: " #ptr " is not null");     }
+
+#define ASSERT_NOT_NULL(ptr)     if (isNullValue(ptr)) {         throw std::runtime_error("Assertion failed: " #ptr " is null");     }
 
 // =============================================================================
 // MockEncoder Tests
@@ -672,8 +676,8 @@ TEST(add_node_auto_embeds_from_properties) {
     graph.addNode("person", "1", {{"name", "Alice"}, {"description", "engineer"}});
 
     ASSERT_EQ(graph.embeddingStore().count(), 1u);
-    const auto* record = graph.getEmbedding(NodeRef("person", "1"));
-    ASSERT_TRUE(record != nullptr);
+    const auto record = graph.getEmbedding(NodeRef("person", "1"));
+    ASSERT_TRUE(record.has_value());
     ASSERT_EQ(record->text, "Alice engineer");
 }
 
@@ -814,7 +818,7 @@ TEST(imports_a_payload_written_by_the_python_port) {
 
     // and the vectors match what this port encodes for the same text
     auto expected = encoder->encode("Alice");
-    const auto& stored = store.get(NodeRef("person", "1"))->vector;
+    const auto stored = store.get(NodeRef("person", "1"))->vector;  // a copy: get() returns a copy of the row
     ASSERT_EQ(stored.size(), expected.size());
     for (size_t i = 0; i < expected.size(); ++i) {
         ASSERT_NEAR(stored[i], expected[i], 1e-6f);
@@ -835,8 +839,8 @@ TEST(embed_text_is_identical_across_ports) {
         {"text", ison::Value(true)},
     });
 
-    const auto* record = graph.getEmbedding(NodeRef("doc", "1"));
-    ASSERT_TRUE(record != nullptr);
+    const auto record = graph.getEmbedding(NodeRef("doc", "1"));
+    ASSERT_TRUE(record.has_value());
     ASSERT_EQ(record->text, "Report 1.5 true");
 }
 
@@ -940,7 +944,7 @@ TEST(update_node_re_embeds_when_an_embed_field_changes) {
     const Node& node = graph.updateNode("person", "1", {{"name", "Bob"}});
     ASSERT_EQ(node.properties.at("name").as_string(), "Bob");
 
-    const auto* record = graph.getEmbedding(NodeRef("person", "1"));
+    const auto record = graph.getEmbedding(NodeRef("person", "1"));
     ASSERT_NOT_NULL(record);
     ASSERT_EQ(record->text, "Bob");
     ASSERT_TRUE(record->vector != before);
@@ -970,7 +974,7 @@ TEST(update_node_leaves_the_vector_when_no_embed_field_changed) {
     graph.addNode("person", "1", {{"name", "Alice"}});
     graph.updateNode("person", "1", {{"age", ison::Value(int64_t(30))}});
 
-    const auto* record = graph.getEmbedding(NodeRef("person", "1"));
+    const auto record = graph.getEmbedding(NodeRef("person", "1"));
     ASSERT_NOT_NULL(record);
     ASSERT_EQ(record->text, "Alice");
     ASSERT_EQ(graph.graph().getNode("person", "1").properties.at("age").as_int(), int64_t(30));
@@ -1116,7 +1120,7 @@ TEST(sidecar_json_survives_quotes_braces_and_non_ascii_text) {
 
     EmbeddingStore other(encoder);
     ASSERT_EQ(other.fromJson(store.toJson()), 1u);
-    const auto* record = other.get(NodeRef("doc", "r\xc3\xa9sum\xc3\xa9"));
+    const auto record = other.get(NodeRef("doc", "r\xc3\xa9sum\xc3\xa9"));
     ASSERT_NOT_NULL(record);
     ASSERT_EQ(record->text, text);
 }
@@ -1129,7 +1133,7 @@ TEST(reads_a_python_sidecar_with_ascii_escaped_unicode) {
         R"PAYLOAD({"format": "ison-embeddings", "version": 1, "dimension": 2, "count": 1, "embeddings": [{"type": "doc", "id": "r\u00e9sum\u00e9", "id_type": "str", "text": "caf\u00e9 } \ud83d\ude00 end", "model": "mock-2", "vector": [0.25, -0.5]}]})PAYLOAD";
     EmbeddingStore store(std::make_shared<MockEncoder>(2));
     ASSERT_EQ(store.fromJson(payload), 1u);
-    const auto* record = store.get(NodeRef("doc", "r\xc3\xa9sum\xc3\xa9"));
+    const auto record = store.get(NodeRef("doc", "r\xc3\xa9sum\xc3\xa9"));
     ASSERT_NOT_NULL(record);
     ASSERT_EQ(record->text, "caf\xc3\xa9 } \xf0\x9f\x98\x80 end");
     ASSERT_EQ(record->vector.size(), 2u);
@@ -1765,7 +1769,7 @@ TEST(lifecycle_reembed_keeps_custom_embed_text) {
     graph.addNodeWithEmbed("person", "1", {{"name", "A"}}, "a very specific blurb");
     graph.setEncoder(retagged(8, "v2"));
     graph.reembedStale();
-    const auto* record = graph.getEmbedding(NodeRef("person", "1"));
+    const auto record = graph.getEmbedding(NodeRef("person", "1"));
     ASSERT_EQ(record->text, "a very specific blurb");
     ASSERT_EQ(record->model, "v2");
 }
@@ -2055,7 +2059,7 @@ TEST(consistency_reembed_mode_rebuilds_from_the_edited_graph) {
     auto loaded = SemanticGraph::load(path, encoder, "auto", true, true,
                                       {"name", "description", "content", "text"},
                                       GraphMismatchMode::Reembed);
-    const auto* record = loaded.getEmbedding(NodeRef("person", "2"));
+    const auto record = loaded.getEmbedding(NodeRef("person", "2"));
     ASSERT_EQ(record->text, "Robert");
     auto expected = encoder->encode("Robert");
     for (size_t i = 0; i < expected.size(); ++i) ASSERT_NEAR(record->vector[i], expected[i], 1e-6f);
@@ -3243,8 +3247,13 @@ TEST(ann_pending_rows_fold_and_heavy_churn_retrains) {
 
     auto extra = gen.drawMany(700);
     for (size_t i = 0; i < extra.size(); ++i) store.add(NodeRef("late", std::to_string(i)), "", extra[i]);
-    ASSERT_EQ(store.annStats().pending, 700u);
-    store.similaritySearchVector(extra[0], 5);  // >= 512 pending: folded
+    // pending rows are folded into their cells by the write that makes 256 of
+    // them (at write time, not at the next search): 700 = 2 x 256 + 188
+    ASSERT_EQ(store.annStats().pending, 188u);
+    store.similaritySearchVector(extra[0], 5);  // a search does not fold or rebuild
+    ASSERT_EQ(store.annStats().pending, 188u);
+    ASSERT_EQ(store.annStats().builds, 1u);
+    store.buildAnnIndex();                      // an explicit build folds the rest
     ASSERT_EQ(store.annStats().pending, 0u);
     ASSERT_EQ(store.annStats().builds, 1u);
 
@@ -3498,6 +3507,1087 @@ TEST(ann_concurrent_searches_are_safe) {
     for (auto& t : pool) t.join();
     ASSERT_EQ(bad.load(), 0);
     ASSERT_EQ(store.annStats().builds, 1u);  // four threads, one lazy build
+}
+
+// =============================================================================
+// Stage D: one copy of every vector, batch search, binary snapshot
+// =============================================================================
+
+namespace {
+
+uint32_t floatBits(float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, sizeof u);
+    return u;
+}
+
+/// Same ids, same texts and the same scores bit for bit, in the same order.
+bool sameHits(const std::vector<SimilarityResult>& a, const std::vector<SimilarityResult>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (!(a[i].node_ref == b[i].node_ref) || a[i].text != b[i].text ||
+            floatBits(a[i].score) != floatBits(b[i].score)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+struct SdRng {
+    uint64_t state;
+    explicit SdRng(uint64_t seed) : state(seed) {}
+    uint64_t next() {
+        state += 0x9E3779B97F4A7C15ull;
+        uint64_t z = state;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        return z ^ (z >> 31);
+    }
+    float unit() { return static_cast<float>(next() >> 40) / 8388608.0f - 1.0f; }
+    size_t below(size_t n) { return static_cast<size_t>(next() % n); }
+    std::vector<float> vec(size_t dim) {
+        std::vector<float> v(dim);
+        for (auto& x : v) x = unit();
+        return v;
+    }
+};
+
+/// A fresh directory under the system temp directory, removed on destruction.
+class SdTempDir {
+    std::filesystem::path dir_;
+public:
+    explicit SdTempDir(const std::string& tag) {
+        static std::atomic<int> counter{0};
+        std::random_device rd;
+        dir_ = std::filesystem::temp_directory_path() /
+               ("isongraph_vector_cpp_" + tag + "_" + std::to_string(rd()) + "_" + std::to_string(counter++));
+        std::filesystem::create_directories(dir_);
+    }
+    ~SdTempDir() {
+        std::error_code ec;
+        std::filesystem::remove_all(dir_, ec);
+    }
+    SdTempDir(const SdTempDir&) = delete;
+    SdTempDir& operator=(const SdTempDir&) = delete;
+    std::string file(const std::string& name) const { return (dir_ / name).string(); }
+    const std::filesystem::path& path() const { return dir_; }
+};
+
+std::string sdSlurp(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw std::runtime_error("cannot read " + path);
+    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+void sdSpit(const std::string& path, const std::string& bytes) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+}
+
+std::string sdHex(const std::array<unsigned char, 32>& d) { return detail::hexOf(d.data(), d.size()); }
+
+/// Where the Rust crate's golden snapshot fixture lives: the CMake-provided
+/// path, else next to this source file, else found by walking up from the
+/// working directory (so a hand-run binary finds it too).
+std::filesystem::path sdFixtureDir() {
+    std::vector<std::filesystem::path> candidates;
+#if defined(ISONGRAPH_VECTOR_FIXTURE_DIR)
+    candidates.emplace_back(ISONGRAPH_VECTOR_FIXTURE_DIR);
+#endif
+    candidates.push_back(std::filesystem::path(__FILE__).parent_path().parent_path().parent_path() / "tests" / "fixtures" / "snapshot");
+    std::error_code ec;
+    std::filesystem::path up = std::filesystem::current_path(ec);
+    for (int i = 0; i < 6 && !up.empty(); ++i) {
+        candidates.push_back(up / "tests" / "fixtures" / "snapshot");
+        up = up.parent_path();
+    }
+    for (const auto& c : candidates) {
+        if (std::filesystem::exists(c / "golden.ison", ec)) return c;
+    }
+    return candidates.front();
+}
+
+/// Copy of the golden fixture (graph, JSON sidecar, snapshot) in a temp dir.
+void sdCopyGolden(const SdTempDir& dir, bool withSnapshot = true) {
+    const auto src = sdFixtureDir();
+    if (!std::filesystem::exists(src / "golden.ison")) {
+        throw std::runtime_error("golden snapshot fixture not found at " + src.string());
+    }
+    sdSpit(dir.file("golden.ison"), sdSlurp((src / "golden.ison").string()));
+    sdSpit(dir.file("golden.ison.embeddings.json"), sdSlurp((src / "golden.ison.embeddings.json").string()));
+    if (withSnapshot) sdSpit(dir.file("golden.ison.embeddings.snap"), sdSlurp((src / "golden.ison.embeddings.snap").string()));
+}
+
+/// Every key, text, model and vector (bit for bit) of two stores, and some searches, agree.
+void sdExpectSameStore(const EmbeddingStore& a, const EmbeddingStore& b) {
+    ASSERT_EQ(a.count(), b.count());
+    ASSERT_TRUE(a.dimension() == b.dimension());
+    ASSERT_TRUE(a.models() == b.models());
+    auto pa = a.exportEmbeddings();
+    auto pb = b.exportEmbeddings();
+    ASSERT_EQ(pa.embeddings.size(), pb.embeddings.size());
+    for (size_t i = 0; i < pa.embeddings.size(); ++i) {
+        const auto& x = pa.embeddings[i];
+        const auto& y = pb.embeddings[i];
+        ASSERT_EQ(x.type, y.type);
+        ASSERT_EQ(x.id, y.id);
+        ASSERT_EQ(x.text, y.text);
+        ASSERT_EQ(x.model, y.model);
+        ASSERT_EQ(x.vector.size(), y.vector.size());
+        for (size_t j = 0; j < x.vector.size(); ++j) ASSERT_EQ(floatBits(x.vector[j]), floatBits(y.vector[j]));
+    }
+    if (a.dimension().has_value() && a.count() > 0) {
+        SdRng rng(99);
+        for (int q = 0; q < 12; ++q) {
+            auto query = rng.vec(*a.dimension());
+            ASSERT_TRUE(sameHits(a.similaritySearchVector(query, 10, "", -1.0f), b.similaritySearchVector(query, 10, "", -1.0f)));
+            ASSERT_TRUE(sameHits(a.similaritySearchVector(query, 5, "doc", 0.0f), b.similaritySearchVector(query, 5, "doc", 0.0f)));
+        }
+    }
+}
+
+}  // namespace
+
+// ---- SHA-256 -----------------------------------------------------------------
+
+TEST(sha256_matches_the_nist_vectors_and_streams) {
+    ASSERT_EQ(detail::sha256Hex("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    ASSERT_EQ(detail::sha256Hex(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    ASSERT_EQ(detail::sha256Hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+              "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+
+    // a million 'a', fed in awkward chunk sizes, equals one call
+    const std::string million(1000000, 'a');
+    detail::Sha256 streamed;
+    size_t at = 0, step = 1;
+    while (at < million.size()) {
+        size_t n = std::min(step, million.size() - at);
+        streamed.update(million.data() + at, n);
+        at += n;
+        step = step * 3 + 1;
+        if (step > 70000) step = 1;
+    }
+    const auto digest = streamed.digest();
+    ASSERT_EQ(sdHex(digest), "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+    ASSERT_EQ(detail::sha256Hex(million), sdHex(digest));
+
+    // digest() leaves the hasher usable
+    detail::Sha256 h;
+    h.update("ab", 2);
+    (void)h.digest();
+    h.update("c", 1);
+    ASSERT_EQ(sdHex(h.digest()), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+}
+
+// ---- one copy of every vector --------------------------------------------------
+
+TEST(store_keeps_one_copy_of_every_vector) {
+    constexpr size_t N = 5000, DIM = 64;
+    SdRng rng(1);
+    EmbeddingStore store;
+    for (size_t i = 0; i < N; ++i) store.add(NodeRef("doc", std::to_string(i)), "t", rng.vec(DIM));
+    const size_t raw = N * DIM * sizeof(float);
+    ASSERT_GE(store.vectorBytes(), raw);
+    // the last chunk is allocated whole (1024 rows); nothing else is stored twice
+    ASSERT_TRUE(store.vectorBytes() <= raw + 1024 * DIM * sizeof(float));
+    store.verifyInvariants();
+
+    // with the approximate index on, the vectors are still held once
+    AnnOptions o;
+    o.nlist = 32; o.nprobe = 4; o.minSize = 0;
+    store.enableAnn(o);
+    AnnStats built = store.buildAnnIndex();
+    ASSERT_TRUE(built.active);
+    ASSERT_EQ(built.vectorBytes, 0u);
+    ASSERT_TRUE(built.indexBytes < raw / 4);
+    ASSERT_TRUE(store.vectorBytes() <= raw + 1024 * DIM * sizeof(float));
+    store.verifyInvariants();
+
+    // a small store does not reserve a whole chunk
+    EmbeddingStore tiny;
+    for (size_t i = 0; i < 10; ++i) tiny.add(NodeRef("d", std::to_string(i)), "", rng.vec(DIM));
+    ASSERT_TRUE(tiny.vectorBytes() <= 16 * DIM * sizeof(float));
+}
+
+TEST(get_returns_a_copy_and_vector_data_a_view) {
+    EmbeddingStore store;
+    store.add(NodeRef("a", "1"), "one", {1.0f, 2.0f, 3.0f});
+    store.add(NodeRef("a", "2"), "two", {4.0f, 5.0f, 6.0f});
+    auto record = store.get(NodeRef("a", "1"));
+    ASSERT_TRUE(record.has_value());
+    ASSERT_EQ(record->id, "a:1");
+    ASSERT_EQ(record->model, "provided");
+    store.add(NodeRef("a", "1"), "uno", {7.0f, 8.0f, 9.0f});          // overwrite in place
+    ASSERT_EQ(record->vector[0], 1.0f);                                 // the copy did not change
+    ASSERT_EQ(record->text, "one");
+    ASSERT_EQ(store.get(NodeRef("a", "1"))->vector[0], 7.0f);
+    const float* view = store.vectorData(NodeRef("a", "2"));
+    ASSERT_TRUE(view != nullptr);
+    ASSERT_EQ(view[2], 6.0f);
+    ASSERT_TRUE(store.vectorData(NodeRef("a", "nope")) == nullptr);
+    ASSERT_TRUE(store.contains(NodeRef("a", "2")));
+    ASSERT_FALSE(store.contains(NodeRef("a", "3")));
+}
+
+TEST(store_matches_a_model_through_random_writes_deletes_and_compaction) {
+    constexpr size_t DIM = 12;
+    SdRng rng(7);
+    EmbeddingStore store;
+    std::vector<std::string> order;                          // live keys in slot (arrival) order
+    std::map<std::string, std::vector<float>> truth;
+    auto drop = [&](const std::string& key) {
+        order.erase(std::find(order.begin(), order.end(), key));
+        truth.erase(key);
+    };
+    for (int op = 0; op < 9000; ++op) {
+        const size_t what = rng.below(10);
+        const NodeRef ref(rng.below(2) ? "x" : "y", std::to_string(rng.below(1500)));
+        const std::string full = ref.type + ":" + ref.id;
+        if (what < 6) {
+            std::vector<float> v = rng.below(40) == 0 ? std::vector<float>(DIM, 0.0f) : rng.vec(DIM);
+            store.add(ref, "text " + full, v);
+            if (!truth.count(full)) order.push_back(full);
+            truth[full] = v;
+        } else if (what < 8) {
+            const bool had = truth.count(full) > 0;
+            ASSERT_EQ(store.remove(ref), had);
+            if (had) drop(full);
+        } else if (!order.empty()) {
+            // a burst of deletes, enough to cross the compaction threshold now and then
+            for (int k = 0; k < 40 && !order.empty(); ++k) {
+                const std::string victim = order[rng.below(order.size())];
+                const size_t colon = victim.find(':');
+                ASSERT_TRUE(store.remove(NodeRef(victim.substr(0, colon), victim.substr(colon + 1))));
+                drop(victim);
+            }
+        }
+        if (op % 450 == 0) {
+            store.verifyInvariants();
+            ASSERT_EQ(store.count(), truth.size());
+            auto query = rng.vec(DIM);
+            // reference: score every live row in arrival order, best first, ties by arrival
+            std::vector<std::pair<float, size_t>> scored;
+            for (size_t i = 0; i < order.size(); ++i) {
+                scored.emplace_back(detail::cosineRows(query.data(), truth[order[i]].data(), DIM), i);
+            }
+            std::stable_sort(scored.begin(), scored.end(),
+                             [](const auto& a, const auto& b) { return a.first > b.first; });
+            auto got = store.similaritySearchVector(query, 15, "", -2.0f);
+            ASSERT_EQ(got.size(), std::min<size_t>(15, order.size()));
+            for (size_t i = 0; i < got.size(); ++i) {
+                ASSERT_EQ(floatBits(got[i].score), floatBits(scored[i].first));
+                ASSERT_EQ(got[i].node_ref.type + ":" + got[i].node_ref.id, order[scored[i].second]);
+            }
+        }
+    }
+    store.verifyInvariants();
+    for (const auto& [key, v] : truth) {
+        const size_t colon = key.find(':');
+        auto record = store.get(NodeRef(key.substr(0, colon), key.substr(colon + 1)));
+        ASSERT_TRUE(record.has_value());
+        ASSERT_TRUE(record->vector == v);
+        ASSERT_EQ(record->text, "text " + key);
+    }
+}
+
+TEST(equal_scores_are_ordered_by_arrival) {
+    EmbeddingStore store;
+    for (int i = 0; i < 30; ++i) store.add(NodeRef("d", std::to_string(i)), "", {1.0f, 0.0f});
+    store.add(NodeRef("d", "other"), "", {0.0f, 1.0f});
+    auto hits = store.similaritySearchVector({1.0f, 0.0f}, 8, "", 0.5f);
+    ASSERT_EQ(hits.size(), 8u);
+    for (int i = 0; i < 8; ++i) ASSERT_EQ(hits[static_cast<size_t>(i)].node_ref.id, std::to_string(i));
+    // delete enough to compact; the survivors keep their order
+    for (int i = 0; i < 30; i += 2) store.remove(NodeRef("d", std::to_string(i)));
+    hits = store.similaritySearchVector({1.0f, 0.0f}, 4, "", 0.5f);
+    ASSERT_EQ(hits[0].node_ref.id, "1");
+    ASSERT_EQ(hits[1].node_ref.id, "3");
+    ASSERT_EQ(hits[3].node_ref.id, "7");
+}
+
+// ---- batch search ---------------------------------------------------------------
+
+namespace {
+
+/// A store with three chunks of rows, two types, zero rows, exact duplicates,
+/// updates and deletes (so tombstones and compaction are in play).
+EmbeddingStore sdBatchStore(size_t dim, bool withAnn) {
+    SdRng rng(21);
+    EmbeddingStore store;
+    if (withAnn) {
+        AnnOptions o;
+        o.nlist = 24; o.nprobe = 6; o.minSize = 0; o.seed = 3;
+        store.enableAnn(o);
+    }
+    const size_t n = 2600;
+    std::vector<std::vector<float>> data;
+    for (size_t i = 0; i < n; ++i) {
+        std::vector<float> v = rng.vec(dim);
+        if (i % 97 == 5) v.assign(dim, 0.0f);
+        if (i % 61 == 3 && i > 10) v = data[i - 3];          // exact duplicate: an equal score
+        data.push_back(v);
+        store.add(NodeRef(i % 4 == 0 ? "a" : "b", std::to_string(i)), "t" + std::to_string(i), v);
+    }
+    for (size_t i = 1; i < n; i += 13) store.add(NodeRef(i % 4 == 0 ? "a" : "b", std::to_string(i)), "updated", rng.vec(dim));
+    for (size_t i = 2; i < n; i += 9) store.remove(NodeRef(i % 4 == 0 ? "a" : "b", std::to_string(i)));
+    return store;
+}
+
+}  // namespace
+
+TEST(batch_search_is_bit_identical_to_single_search) {
+    constexpr size_t DIM = 24;
+    EmbeddingStore store = sdBatchStore(DIM, false);
+    SdRng rng(5);
+    std::vector<std::vector<float>> queries;
+    for (int q = 0; q < 37; ++q) queries.push_back(rng.vec(DIM));      // 37 = two full tiles and a partial one
+    queries.push_back(std::vector<float>(DIM, 0.0f));                  // a zero query scores 0 everywhere
+    queries.push_back(store.get(NodeRef("b", "1"))->vector);           // an exact stored vector
+    for (size_t k : {size_t(1), size_t(10), size_t(500), size_t(100000)}) {
+        for (const char* type : {"", "a", "nope"}) {
+            for (float threshold : {-1.0f, 0.2f}) {
+                std::vector<std::vector<SimilarityResult>> single;
+                for (const auto& q : queries) single.push_back(store.similaritySearchVector(q, k, type, threshold));
+                for (size_t threads : {size_t(1), size_t(2), size_t(3), size_t(8), size_t(64), size_t(0)}) {
+                    auto batch = store.similaritySearchBatch(queries, k, type, threshold, false, threads);
+                    ASSERT_EQ(batch.size(), single.size());
+                    for (size_t i = 0; i < queries.size(); ++i) ASSERT_TRUE(sameHits(batch[i], single[i]));
+                }
+            }
+        }
+    }
+    store.verifyInvariants();
+}
+
+TEST(batch_search_with_the_approximate_index_equals_single_search) {
+    constexpr size_t DIM = 24;
+    EmbeddingStore store = sdBatchStore(DIM, true);
+    SdRng rng(6);
+    std::vector<std::vector<float>> queries;
+    for (int q = 0; q < 40; ++q) queries.push_back(rng.vec(DIM));
+    for (bool exact : {false, true}) {
+        std::vector<std::vector<SimilarityResult>> single;
+        for (const auto& q : queries) single.push_back(store.similaritySearchVector(q, 10, "", -1.0f, exact));
+        for (size_t threads : {size_t(1), size_t(4), size_t(16)}) {
+            auto batch = store.similaritySearchBatch(queries, 10, "", -1.0f, exact, threads);
+            for (size_t i = 0; i < queries.size(); ++i) ASSERT_TRUE(sameHits(batch[i], single[i]));
+        }
+    }
+    ASSERT_TRUE(store.annStats().active);
+    store.verifyInvariants();
+}
+
+TEST(one_scoring_routine_gives_one_score_everywhere) {
+    constexpr size_t DIM = 24;
+    EmbeddingStore store = sdBatchStore(DIM, true);
+    SdRng rng(8);
+    std::vector<std::vector<float>> queries;
+    for (int q = 0; q < 20; ++q) queries.push_back(rng.vec(DIM));
+    auto batch = store.similaritySearchBatch(queries, 25, "", -2.0f, true, 4);
+    for (size_t qi = 0; qi < queries.size(); ++qi) {
+        const auto& q = queries[qi];
+        auto single = store.similaritySearchVector(q, 25, "", -2.0f, true);
+        auto viaIndex = store.similaritySearchVector(q, 25, "", -2.0f);        // approximate path: re-scored exactly
+        auto map = store.scoreMap(q);                                          // the generic one-pass path
+        ASSERT_TRUE(sameHits(batch[qi], single));
+        for (const auto& hit : viaIndex) {
+            ASSERT_EQ(floatBits(map.at(hit.node_ref.type + ":" + hit.node_ref.id)), floatBits(hit.score));
+        }
+        for (const auto& hit : single) {
+            const std::string key = hit.node_ref.type + ":" + hit.node_ref.id;
+            ASSERT_EQ(floatBits(map.at(key)), floatBits(hit.score));
+            const float* row = store.vectorData(hit.node_ref);
+            ASSERT_EQ(floatBits(detail::cosineRows(q.data(), row, DIM)), floatBits(hit.score));
+        }
+    }
+}
+
+TEST(batch_search_validates_and_handles_edge_cases) {
+    EmbeddingStore store;
+    for (int i = 0; i < 50; ++i) store.add(NodeRef("d", std::to_string(i)), "", {static_cast<float>(i + 1), 1.0f, 0.5f});
+    ASSERT_TRUE(store.similaritySearchBatch({}, 5).empty());
+    auto none = store.similaritySearchBatch({{1.0f, 1.0f, 1.0f}, {2.0f, 1.0f, 0.0f}}, 0);
+    ASSERT_EQ(none.size(), 2u);
+    ASSERT_TRUE(none[0].empty() && none[1].empty());
+    // one wrong-width query fails the whole batch before any search starts
+    ASSERT_THROWS(store.similaritySearchBatch({{1.0f, 1.0f, 1.0f}, {1.0f, 1.0f}}, 5), DimensionMismatchError);
+    ASSERT_THROWS(store.similaritySearchBatch({{}}, 5), DimensionMismatchError);
+    // an empty store answers every query with nothing
+    EmbeddingStore empty;
+    auto r = empty.similaritySearchBatch({{1.0f, 2.0f}}, 3);
+    ASSERT_EQ(r.size(), 1u);
+    ASSERT_TRUE(r[0].empty());
+    // text queries
+    auto encoder = std::make_shared<MockEncoder>(16);
+    EmbeddingStore texts(encoder);
+    for (int i = 0; i < 40; ++i) texts.add(NodeRef("d", std::to_string(i)), "doc " + std::to_string(i));
+    auto byText = texts.similaritySearchTextBatch({"doc 3", "doc 17", "other"}, 5, "", -1.0f, false, 2);
+    ASSERT_EQ(byText.size(), 3u);
+    ASSERT_TRUE(sameHits(byText[1], texts.similaritySearch("doc 17", 5, "", -1.0f)));
+    ASSERT_EQ(byText[0][0].node_ref.id, "3");
+}
+
+TEST(run_workers_rethrows_the_first_failure_after_joining_every_thread) {
+    std::atomic<int> finished{0};
+    bool threw = false;
+    try {
+        detail::runWorkers(6, [&](size_t w) {
+            if (w == 2) throw std::runtime_error("worker failed");
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            ++finished;
+        });
+    } catch (const std::runtime_error& e) {
+        threw = std::string(e.what()) == "worker failed";
+    }
+    ASSERT_TRUE(threw);
+    ASSERT_EQ(finished.load(), 5);     // every other worker ran to completion before the throw
+    int ran = 0;
+    detail::runWorkers(1, [&](size_t) { ++ran; });
+    ASSERT_EQ(ran, 1);
+}
+
+TEST(concurrent_const_searches_and_batches_agree_with_a_serial_run) {
+    constexpr size_t DIM = 24;
+    EmbeddingStore store = sdBatchStore(DIM, true);
+    SdRng rng(11);
+    std::vector<std::vector<float>> queries;
+    for (int q = 0; q < 24; ++q) queries.push_back(rng.vec(DIM));
+    std::vector<std::vector<SimilarityResult>> expect, expectExact;
+    for (const auto& q : queries) {
+        expect.push_back(store.similaritySearchVector(q, 7, "", -1.0f));
+        expectExact.push_back(store.similaritySearchVector(q, 7, "", -1.0f, true));
+    }
+    std::atomic<int> bad{0};
+    auto worker = [&](int id) {
+        for (int round = 0; round < 6; ++round) {
+            if ((id + round) % 3 == 0) {
+                auto batch = store.similaritySearchBatch(queries, 7, "", -1.0f, round % 2 == 0, 3);
+                const auto& want = (round % 2 == 0) ? expectExact : expect;
+                for (size_t i = 0; i < queries.size(); ++i) bad += sameHits(batch[i], want[i]) ? 0 : 1;
+            } else {
+                for (size_t i = 0; i < queries.size(); ++i) {
+                    bad += sameHits(store.similaritySearchVector(queries[i], 7, "", -1.0f), expect[i]) ? 0 : 1;
+                    bad += sameHits(store.similaritySearchVector(queries[i], 7, "", -1.0f, true), expectExact[i]) ? 0 : 1;
+                }
+            }
+        }
+    };
+    std::vector<std::thread> pool;
+    for (int t = 0; t < 6; ++t) pool.emplace_back(worker, t);
+    for (auto& t : pool) t.join();
+    ASSERT_EQ(bad.load(), 0);
+}
+
+TEST(pending_rows_fold_at_write_time_and_writes_stay_visible) {
+    ClusteredData gen(30, 24, 31);
+    auto data = gen.drawMany(3000);
+    EmbeddingStore store;
+    store.enableAnn(annOptions(32, 4, 0));
+    fillStore(store, data);
+    store.buildAnnIndex();
+    auto fresh = gen.drawMany(600);
+    size_t folds = 0, lastPending = 0;
+    for (size_t i = 0; i < fresh.size(); ++i) {
+        store.add(NodeRef("new", std::to_string(i)), "", fresh[i]);
+        const size_t pending = store.annStats().pending;
+        ASSERT_TRUE(pending < 256);                                   // never reaches the fold batch between writes
+        if (pending < lastPending) ++folds;
+        lastPending = pending;
+        if (i % 97 == 0) {                                           // visible at once, folded or not
+            auto top = store.similaritySearchVector(fresh[i], 1);
+            ASSERT_EQ(top[0].node_ref.type, "new");
+        }
+    }
+    ASSERT_EQ(folds, 2u);
+    ASSERT_EQ(store.annStats().builds, 1u);
+    store.verifyInvariants();
+}
+
+// ---- snapshot: layout, identity, fallback -----------------------------------------
+
+TEST(snapshot_smallest_example_is_byte_exact_per_the_spec) {
+    EmbeddingStore store;
+    store.add(NodeRef("t", "a"), "x", {1.0f, -2.0f});
+    SdTempDir dir("snapmin");
+    const std::string path = dir.file("min.snap");
+    SnapshotInfo info = store.saveSnapshot(path);
+    ASSERT_EQ(info.bytes, 123u);
+    ASSERT_EQ(info.count, 1u);
+    ASSERT_EQ(info.dimension, 2u);
+    const std::string bytes = sdSlurp(path);
+    ASSERT_EQ(bytes.size(), 123u);
+    std::string expected = "ISONVSNP";
+    detail::putU32(expected, 1);        // version
+    detail::putU32(expected, 0);        // flags
+    detail::putU32(expected, 2);        // dim
+    detail::putU32(expected, 1024);     // block rows
+    detail::putU64(expected, 1);        // count
+    for (int i = 0; i < 4; ++i) detail::putU32(expected, 0xFFFFFFFFu);
+    detail::putU32(expected, 1);
+    detail::putStr(expected, "provided");
+    detail::putStr(expected, "t");
+    detail::putStr(expected, "a");
+    detail::putStr(expected, "x");
+    detail::putU32(expected, 0);
+    expected += std::string("\x00\x00\x80\x3f\x00\x00\x00\xc0", 8);
+    ASSERT_EQ(expected.size(), 91u);
+    ASSERT_EQ(bytes.substr(0, 91), expected);
+    // the trailer is the SHA-256 of those 91 bytes (value computed independently with Python's hashlib)
+    ASSERT_EQ(detail::hexOf(reinterpret_cast<const unsigned char*>(bytes.data()) + 91, 32),
+              "a9c5f4584064d7e0f5bc89bc6173fe062db3439d65a500f01179d4e56ee69df2");
+
+    EmbeddingStore back;
+    SnapshotInfo loaded = back.loadSnapshot(path);
+    ASSERT_EQ(loaded.count, 1u);
+    ASSERT_EQ(back.get(NodeRef("t", "a"))->vector[1], -2.0f);
+    ASSERT_EQ(back.get(NodeRef("t", "a"))->model, "provided");
+    ASSERT_EQ(back.get(NodeRef("t", "a"))->text, "x");
+}
+
+TEST(float_bytes_are_ieee_754_little_endian) {
+    const float v[3] = {1.0f, -2.0f, 0.15625f};
+    unsigned char out[12];
+    detail::floatsToLe(v, 3, out);
+    const unsigned char want[12] = {0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x20, 0x3e};
+    ASSERT_TRUE(std::memcmp(out, want, 12) == 0);
+    float back[3];
+    detail::floatsFromLe(want, 3, back);
+    ASSERT_TRUE(back[0] == 1.0f && back[1] == -2.0f && back[2] == 0.15625f);
+}
+
+TEST(sidecar_fingerprint_matches_an_independent_implementation) {
+    SdTempDir dir("fp");
+    // value of the fingerprint for byte i = (i * 31 + 7) & 255, computed with Python's hashlib
+    const std::pair<size_t, const char*> cases[] = {
+        {0, "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc"},
+        {10, "c69cf557f7d1ea5716f1050a37be05c27bce7eb531cdd411b64343b4e8229cb5"},
+        {100000, "41bc372b8f7d3ece400b9ab6ebedf055df23935990d8b9ae5527de1c467fafdf"},
+        {300000, "689a231bf532d7bc20d8b6a2d04ce8325433314759f00bbebb4754c8958ae920"},
+    };
+    for (const auto& [len, hex] : cases) {
+        std::string bytes(len, '\0');
+        for (size_t i = 0; i < len; ++i) bytes[i] = static_cast<char>((i * 31 + 7) & 255);
+        sdSpit(dir.file("f.bin"), bytes);
+        SidecarId id = EmbeddingStore::sidecarIdOf(dir.file("f.bin"));
+        ASSERT_EQ(id.len, len);
+        ASSERT_EQ(sdHex(id.fingerprint), hex);
+    }
+    ASSERT_THROWS(EmbeddingStore::sidecarIdOf(dir.file("missing.bin")), EmbeddingError);
+}
+
+namespace {
+
+struct SnapRow {
+    std::string type, id, text;
+    uint32_t model = 0;
+    std::vector<float> v;
+};
+
+/// Builds snapshot bytes by hand (with a correct trailer unless asked otherwise),
+/// so the rejection rules can be tested one at a time.
+struct SnapSpec {
+    std::string magic = "ISONVSNP";
+    uint32_t version = 1, flags = 0, dim = 2, blockRows = 1024;
+    std::optional<uint64_t> count;                 // default: rows.size()
+    std::optional<std::string> digest, basis, encModel, encVersion;
+    std::optional<SidecarId> sidecar;
+    std::vector<std::string> models{"m"};
+    std::vector<SnapRow> rows;
+    std::string beforeTrailer;                     // junk between the last block and the trailer
+    bool badTrailer = false;
+
+    std::string build() const {
+        std::string out = magic;
+        detail::putU32(out, version);
+        detail::putU32(out, flags);
+        detail::putU32(out, dim);
+        detail::putU32(out, blockRows);
+        detail::putU64(out, count.value_or(rows.size()));
+        detail::putOpt(out, digest);
+        detail::putOpt(out, basis);
+        detail::putOpt(out, encModel);
+        detail::putOpt(out, encVersion);
+        if ((flags & 1u) && sidecar) {
+            detail::putU64(out, sidecar->len);
+            out.append(reinterpret_cast<const char*>(sidecar->fingerprint.data()), 32);
+        }
+        detail::putU32(out, static_cast<uint32_t>(models.size()));
+        for (const auto& m : models) detail::putStr(out, m);
+        const size_t step = blockRows == 0 ? std::max<size_t>(rows.size(), 1) : blockRows;
+        for (size_t start = 0; start < rows.size(); start += step) {
+            const size_t end = std::min<size_t>(rows.size(), start + step);
+            for (size_t i = start; i < end; ++i) {
+                detail::putStr(out, rows[i].type);
+                detail::putStr(out, rows[i].id);
+                detail::putStr(out, rows[i].text);
+                detail::putU32(out, rows[i].model);
+            }
+            for (size_t i = start; i < end; ++i) {
+                std::string f(rows[i].v.size() * 4, '\0');
+                detail::floatsToLe(rows[i].v.data(), rows[i].v.size(), reinterpret_cast<unsigned char*>(&f[0]));
+                out += f;
+            }
+        }
+        out += beforeTrailer;
+        return withTrailer(out, badTrailer);
+    }
+
+    static std::string withTrailer(const std::string& body, bool bad = false) {
+        auto digest = detail::Sha256();
+        digest.update(body.data(), body.size());
+        auto d = digest.digest();
+        if (bad) d[5] ^= 0x40;
+        return body + std::string(reinterpret_cast<const char*>(d.data()), 32);
+    }
+};
+
+SnapSpec sdGoodSpec() {
+    SnapSpec s;
+    s.digest = "sha256:abc";
+    s.basis = GRAPH_DIGEST_BASIS;
+    s.models = {"m0", "m1"};
+    s.rows = {SnapRow{"doc", "1", "first", 0, {1.0f, 2.0f}},
+              SnapRow{"doc", "2", "second \xc3\xa9 \xf0\x9f\x98\x80", 1, {-0.5f, 4.0f}},
+              SnapRow{"note", "x:y", "", 0, {0.0f, 0.0f}}};
+    return s;
+}
+
+/// A store that must come through a refused load unchanged.
+EmbeddingStore sdBaseStore() {
+    EmbeddingStore base;
+    base.add(NodeRef("keep", "1"), "kept text", {3.0f, 4.0f});
+    base.add(NodeRef("keep", "2"), "kept too", {-1.0f, 0.5f});
+    return base;
+}
+
+void sdExpectRefused(const SdTempDir& dir, const std::string& bytes, const std::string& why) {
+    sdSpit(dir.file("bad.snap"), bytes);
+    EmbeddingStore store = sdBaseStore();
+    bool threw = false;
+    try {
+        store.loadSnapshot(dir.file("bad.snap"));
+    } catch (const EmbeddingError&) {
+        threw = true;
+    }
+    if (!threw) throw std::runtime_error("a snapshot with " + why + " was accepted");
+    sdExpectSameStore(store, sdBaseStore());        // untouched
+    store.verifyInvariants();
+}
+
+}  // namespace
+
+TEST(snapshot_reader_accepts_a_hand_built_valid_file) {
+    SdTempDir dir("snapok");
+    SnapSpec spec = sdGoodSpec();
+    sdSpit(dir.file("ok.snap"), spec.build());
+    EmbeddingStore store = sdBaseStore();
+    SnapshotInfo info = store.loadSnapshot(dir.file("ok.snap"));
+    ASSERT_EQ(info.count, 3u);
+    ASSERT_EQ(store.count(), 3u);                    // replaced, not merged
+    ASSERT_FALSE(store.contains(NodeRef("keep", "1")));
+    ASSERT_EQ(store.get(NodeRef("doc", "2"))->model, "m1");
+    ASSERT_EQ(store.get(NodeRef("doc", "2"))->text, "second \xc3\xa9 \xf0\x9f\x98\x80");
+    ASSERT_EQ(store.get(NodeRef("note", "x:y"))->model, "m0");
+    ASSERT_EQ(store.lastImportMeta().graphDigest.value(), "sha256:abc");
+    store.verifyInvariants();
+    // the same rows over several blocks
+    spec.blockRows = 2;
+    sdSpit(dir.file("ok2.snap"), spec.build());
+    EmbeddingStore blocks;
+    blocks.loadSnapshot(dir.file("ok2.snap"));
+    sdExpectSameStore(store, blocks);
+    // no rows at all is a valid snapshot
+    SnapSpec none;
+    none.dim = 0;
+    sdSpit(dir.file("none.snap"), none.build());
+    EmbeddingStore emptied = sdBaseStore();
+    emptied.loadSnapshot(dir.file("none.snap"));
+    ASSERT_EQ(emptied.count(), 0u);
+}
+
+TEST(snapshot_reader_applies_every_rejection_rule) {
+    SdTempDir dir("snaprej");
+    { SnapSpec s = sdGoodSpec(); s.magic = "ISONVSNQ"; sdExpectRefused(dir, s.build(), "a bad magic"); }
+    { SnapSpec s = sdGoodSpec(); s.version = 2; sdExpectRefused(dir, s.build(), "version 2"); }
+    { SnapSpec s = sdGoodSpec(); s.flags = 2; sdExpectRefused(dir, s.build(), "an unknown flag"); }
+    { SnapSpec s = sdGoodSpec(); s.flags = 3; s.sidecar = SidecarId{}; sdExpectRefused(dir, s.build(), "unknown flag bit 1 alongside bit 0"); }
+    { SnapSpec s = sdGoodSpec(); s.blockRows = 0; sdExpectRefused(dir, s.build(), "block_rows 0"); }
+    { SnapSpec s = sdGoodSpec(); s.blockRows = (1u << 20) + 1; sdExpectRefused(dir, s.build(), "block_rows above 2^20"); }
+    { SnapSpec s = sdGoodSpec(); s.dim = 0; sdExpectRefused(dir, s.build(), "dim 0 and rows"); }
+    { SnapSpec s = sdGoodSpec(); s.count = 1000000; sdExpectRefused(dir, s.build(), "a count the file cannot hold"); }
+    { SnapSpec s = sdGoodSpec(); s.count = 0x100000000ull; sdExpectRefused(dir, s.build(), "a count above 2^32-1"); }
+    { SnapSpec s = sdGoodSpec(); s.count = 4; sdExpectRefused(dir, s.build(), "a count larger than the rows present"); }
+    { SnapSpec s = sdGoodSpec(); s.count = 2; sdExpectRefused(dir, s.build(), "bytes left after the last counted block"); }
+    { SnapSpec s = sdGoodSpec(); s.dim = 4000000; sdExpectRefused(dir, s.build(), "a dimension the file cannot hold"); }
+    { SnapSpec s = sdGoodSpec(); s.rows[1].model = 2; sdExpectRefused(dir, s.build(), "a model index past the model list"); }
+    { SnapSpec s = sdGoodSpec(); s.rows[2] = s.rows[0]; sdExpectRefused(dir, s.build(), "a repeated key"); }
+    {
+        // ("a", "b:c") and ("a:b", "c") are the same key "a:b:c"
+        SnapSpec s = sdGoodSpec();
+        s.rows[0] = SnapRow{"a", "b:c", "", 0, {1.0f, 0.0f}};
+        s.rows[2] = SnapRow{"a:b", "c", "", 0, {0.0f, 1.0f}};
+        sdExpectRefused(dir, s.build(), "a repeated key made of different type/id splits");
+    }
+    { SnapSpec s = sdGoodSpec(); s.beforeTrailer = "xx"; sdExpectRefused(dir, s.build(), "bytes between the last block and the trailer"); }
+    { SnapSpec s = sdGoodSpec(); s.badTrailer = true; sdExpectRefused(dir, s.build(), "a wrong checksum"); }
+    { SnapSpec s = sdGoodSpec(); s.rows[0].text = "bad \xff utf8"; sdExpectRefused(dir, s.build(), "invalid UTF-8 (a lone 0xff)"); }
+    { SnapSpec s = sdGoodSpec(); s.rows[0].text = "overlong \xc0\x80"; sdExpectRefused(dir, s.build(), "an overlong UTF-8 form"); }
+    { SnapSpec s = sdGoodSpec(); s.rows[0].text = "surrogate \xed\xa0\x80"; sdExpectRefused(dir, s.build(), "a UTF-8 encoded surrogate"); }
+    { SnapSpec s = sdGoodSpec(); s.models = {"\xff"}; s.rows[1].model = 0; sdExpectRefused(dir, s.build(), "an invalid UTF-8 model name"); }
+
+    // string lengths: past the end of the file, and "absent" where a string is required
+    {
+        std::string good = sdGoodSpec().build();
+        std::string body = good.substr(0, good.size() - 32);
+        const size_t digestLen = std::string("sha256:abc").size();
+        // header: 8 + 4*4 + 8 = 32, then the digest string
+        std::string longLen = body;
+        for (int i = 0; i < 4; ++i) longLen[32 + static_cast<size_t>(i)] = static_cast<char>(i == 3 ? 0x7f : 0xff);
+        sdExpectRefused(dir, SnapSpec::withTrailer(longLen), "a string longer than the file");
+        // first row's type length: after digest(4+10) basis(4+19) enc model(4) enc version(4) n_models(4) m0(4+2) m1(4+2)
+        const size_t firstRow = 32 + 4 + digestLen + 4 + std::string(GRAPH_DIGEST_BASIS).size() + 4 + 4 + 4 + 6 + 6;
+        std::string absent = body;
+        for (int i = 0; i < 4; ++i) absent[firstRow + static_cast<size_t>(i)] = static_cast<char>(0xff);
+        sdExpectRefused(dir, SnapSpec::withTrailer(absent), "an absent string where one is required");
+    }
+}
+
+TEST(snapshot_reader_rejects_every_truncation_and_every_flipped_byte) {
+    SdTempDir dir("snapfuzz");
+    const std::string good = sdGoodSpec().build();
+    {
+        EmbeddingStore ok;
+        sdSpit(dir.file("good.snap"), good);
+        ok.loadSnapshot(dir.file("good.snap"));
+        ASSERT_EQ(ok.count(), 3u);
+    }
+    for (size_t len = 0; len < good.size(); ++len) {
+        sdExpectRefused(dir, good.substr(0, len), "a file cut to " + std::to_string(len) + " bytes");
+    }
+    for (size_t at = 0; at < good.size(); ++at) {
+        std::string flipped = good;
+        flipped[at] = static_cast<char>(flipped[at] ^ 0x01);
+        sdExpectRefused(dir, flipped, "byte " + std::to_string(at) + " flipped");
+    }
+    sdExpectRefused(dir, good + "x", "a byte after the trailer");
+    {
+        EmbeddingStore store = sdBaseStore();
+        ASSERT_THROWS(store.loadSnapshot(dir.file("does-not-exist.snap")), EmbeddingError);
+        sdExpectSameStore(store, sdBaseStore());
+    }
+}
+
+// ---- snapshot: the Rust golden fixture --------------------------------------------
+
+TEST(golden_snapshot_is_used_and_equals_the_json_only_load) {
+    SdTempDir withSnap("goldsnap"), jsonOnly("goldjson");
+    sdCopyGolden(withSnap, true);
+    sdCopyGolden(jsonOnly, false);
+    auto encoder = std::make_shared<MockEncoder>(12);
+
+    LoadReport snapReport, jsonReport;
+    SemanticGraph fromSnap = SemanticGraph::load(withSnap.file("golden.ison"), encoder, "auto", true, true,
+                                                 {"name"}, GraphMismatchMode::Error, std::nullopt,
+                                                 ModelMismatchMode::Ignore, std::nullopt, &snapReport);
+    SemanticGraph fromJson = SemanticGraph::load(jsonOnly.file("golden.ison"), encoder, "auto", true, true,
+                                                 {"name"}, GraphMismatchMode::Error, std::nullopt,
+                                                 ModelMismatchMode::Ignore, std::nullopt, &jsonReport);
+    ASSERT_TRUE(snapReport.source == LoadSource::Snapshot);
+    ASSERT_FALSE(snapReport.snapshotSkipped.has_value());
+    ASSERT_TRUE(jsonReport.source == LoadSource::Json);
+    ASSERT_FALSE(jsonReport.snapshotSkipped.has_value());
+    ASSERT_EQ(snapReport.embeddings, 36u);
+    ASSERT_EQ(jsonReport.embeddings, 36u);
+    ASSERT_TRUE(snapReport.seconds >= 0.0);
+
+    sdExpectSameStore(fromSnap.embeddingStore(), fromJson.embeddingStore());
+    ASSERT_EQ(fromSnap.embeddingStore().count(), 36u);
+    ASSERT_EQ(*fromSnap.embeddingStore().dimension(), 12u);
+    ASSERT_EQ(fromSnap.embeddingStore().models().size(), 2u);
+    ASSERT_EQ(fromSnap.graph().nodeCount(), fromJson.graph().nodeCount());
+    const auto& a = fromSnap.embeddingStore().lastImportMeta();
+    const auto& b = fromJson.embeddingStore().lastImportMeta();
+    ASSERT_TRUE(a.encoderModel == b.encoderModel);
+    ASSERT_TRUE(a.encoderVersion == b.encoderVersion);
+    ASSERT_TRUE(a.graphDigest == b.graphDigest);
+    ASSERT_TRUE(a.graphDigestBasis == b.graphDigestBasis);
+    ASSERT_EQ(a.graphDigest.value_or(""), "sha256:a33458853f63a977962395b84c42fb347ed0f6ed66bc00eabb92ef69bb83026c");
+    fromSnap.embeddingStore().verifyInvariants();
+
+    // the fixture has an exact duplicate vector (a tie) and a zero vector: same order from both
+    auto dup = fromJson.embeddingStore().get(NodeRef("a:b", "00002"));
+    ASSERT_TRUE(dup.has_value());
+    auto tied = fromSnap.embeddingStore().similaritySearchVector(dup->vector, 3, "", 0.5f);
+    ASSERT_TRUE(sameHits(tied, fromJson.embeddingStore().similaritySearchVector(dup->vector, 3, "", 0.5f)));
+    ASSERT_EQ(floatBits(tied[0].score), floatBits(tied[1].score));
+}
+
+TEST(golden_snapshot_is_reproduced_byte_for_byte) {
+    SdTempDir dir("goldre");
+    sdCopyGolden(dir, true);
+    auto encoder = std::make_shared<MockEncoder>(12);
+    encoder->setModelName("second-model");             // the Rust fixture's encoder at save time
+    SemanticGraph graph = SemanticGraph::load(dir.file("golden.ison"), encoder);
+    SnapshotIdentity identity;
+    identity.graphDigest = "sha256:a33458853f63a977962395b84c42fb347ed0f6ed66bc00eabb92ef69bb83026c";
+    identity.sidecar = EmbeddingStore::sidecarIdOf(dir.file("golden.ison.embeddings.json"));
+    graph.embeddingStore().saveSnapshot(dir.file("again.snap"), identity);
+    const std::string golden = sdSlurp((sdFixtureDir() / "golden.ison.embeddings.snap").string());
+    const std::string ours = sdSlurp(dir.file("again.snap"));
+    ASSERT_EQ(ours.size(), golden.size());
+    ASSERT_TRUE(ours == golden);
+}
+
+TEST(snapshot_that_does_not_fit_falls_back_to_the_json_sidecar) {
+    auto encoder = std::make_shared<MockEncoder>(12);
+    struct Case {
+        const char* name;
+        std::function<void(const SdTempDir&)> damage;
+        const char* reason;            // substring of snapshotSkipped
+    };
+    const std::string snapName = "golden.ison.embeddings.snap";
+    auto patchSnap = [&](const SdTempDir& d, const std::function<void(std::string&)>& f) {
+        std::string bytes = sdSlurp(d.file(snapName));
+        f(bytes);
+        sdSpit(d.file(snapName), bytes);
+    };
+    std::vector<Case> cases;
+    cases.push_back({"corrupt vector byte", [&](const SdTempDir& d) {
+        patchSnap(d, [](std::string& b) { b[b.size() - 200] = static_cast<char>(b[b.size() - 200] ^ 0x10); }); }, "checksum"});
+    cases.push_back({"truncated", [&](const SdTempDir& d) {
+        patchSnap(d, [](std::string& b) { b.resize(b.size() - 100); }); }, ""});
+    cases.push_back({"trailing garbage", [&](const SdTempDir& d) {
+        patchSnap(d, [](std::string& b) { b += "garbage"; }); }, ""});
+    cases.push_back({"not a snapshot", [&](const SdTempDir& d) {
+        patchSnap(d, [](std::string& b) { b = std::string(5000, 'z'); }); }, "magic"});
+    cases.push_back({"empty file", [&](const SdTempDir& d) {
+        patchSnap(d, [](std::string& b) { b.clear(); }); }, ""});
+    cases.push_back({"stale: sidecar rewritten (same length)", [&](const SdTempDir& d) {
+        std::string json = sdSlurp(d.file("golden.ison.embeddings.json"));
+        const size_t at = json.find("0.8050792");
+        json[at + 8] = '3';                                     // 0.8050793: one digit, same length
+        sdSpit(d.file("golden.ison.embeddings.json"), json); }, "stale"});
+    cases.push_back({"stale: sidecar longer", [&](const SdTempDir& d) {
+        std::string json = sdSlurp(d.file("golden.ison.embeddings.json"));
+        sdSpit(d.file("golden.ison.embeddings.json"), json + " "); }, "stale"});
+    cases.push_back({"wrong graph digest in the header", [&](const SdTempDir& d) {
+        // a valid snapshot of the same rows, tied to another graph
+        EmbeddingStore tmp;
+        tmp.loadEmbeddings(d.file("golden.ison.embeddings.json"));
+        SnapshotIdentity id;
+        id.graphDigest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        id.sidecar = EmbeddingStore::sidecarIdOf(d.file("golden.ison.embeddings.json"));
+        tmp.saveSnapshot(d.file(snapName), id); }, "different graph"});
+    cases.push_back({"header has no sidecar identity", [&](const SdTempDir& d) {
+        EmbeddingStore tmp;
+        tmp.loadEmbeddings(d.file("golden.ison.embeddings.json"));
+        SnapshotIdentity id;
+        id.graphDigest = "sha256:a33458853f63a977962395b84c42fb347ed0f6ed66bc00eabb92ef69bb83026c";
+        tmp.saveSnapshot(d.file(snapName), id); }, "no sidecar identity"});
+    cases.push_back({"header has no graph digest", [&](const SdTempDir& d) {
+        EmbeddingStore tmp;
+        tmp.loadEmbeddings(d.file("golden.ison.embeddings.json"));
+        SnapshotIdentity id;
+        id.sidecar = EmbeddingStore::sidecarIdOf(d.file("golden.ison.embeddings.json"));
+        tmp.saveSnapshot(d.file(snapName), id); }, "different graph"});
+
+    SdTempDir reference("goldref");
+    sdCopyGolden(reference, false);
+    SemanticGraph expected = SemanticGraph::load(reference.file("golden.ison"), encoder);
+
+    for (const auto& c : cases) {
+        SdTempDir dir("goldbad");
+        sdCopyGolden(dir, true);
+        c.damage(dir);
+        LoadReport report;
+        SemanticGraph loaded = SemanticGraph::load(dir.file("golden.ison"), encoder, "auto", true, true,
+                                                   {"name"}, GraphMismatchMode::Error, std::nullopt,
+                                                   ModelMismatchMode::Ignore, std::nullopt, &report);
+        if (report.source != LoadSource::Json) throw std::runtime_error(std::string(c.name) + ": snapshot was used");
+        if (!report.snapshotSkipped.has_value()) throw std::runtime_error(std::string(c.name) + ": no reason given");
+        if (report.snapshotSkipped->find(c.reason) == std::string::npos) {
+            throw std::runtime_error(std::string(c.name) + ": reason was '" + *report.snapshotSkipped + "'");
+        }
+        ASSERT_EQ(report.embeddings, 36u);
+        loaded.embeddingStore().verifyInvariants();
+        // what was loaded is what the JSON says (a rewritten sidecar shows through)
+        SemanticGraph fromJson = [&] {
+            std::error_code ec;
+            std::filesystem::remove(dir.file(snapName), ec);
+            return SemanticGraph::load(dir.file("golden.ison"), encoder);
+        }();
+        sdExpectSameStore(loaded.embeddingStore(), fromJson.embeddingStore());
+    }
+    ASSERT_EQ(expected.embeddingStore().count(), 36u);
+}
+
+TEST(snapshot_is_never_used_without_its_sidecar_and_never_with_embeddings_off) {
+    auto encoder = std::make_shared<MockEncoder>(12);
+    SdTempDir dir("goldnone");
+    sdCopyGolden(dir, true);
+    LoadReport report;
+    SemanticGraph off = SemanticGraph::load(dir.file("golden.ison"), encoder, "auto", /*embeddings=*/false, true,
+                                            {"name"}, GraphMismatchMode::Error, std::nullopt,
+                                            ModelMismatchMode::Ignore, std::nullopt, &report);
+    ASSERT_TRUE(report.source == LoadSource::NoEmbeddings);
+    ASSERT_EQ(off.embeddingStore().count(), 0u);
+
+    std::filesystem::remove(dir.file("golden.ison.embeddings.json"));
+    SemanticGraph missing = SemanticGraph::load(dir.file("golden.ison"), encoder, "auto", true, true,
+                                                {"name"}, GraphMismatchMode::Error, std::nullopt,
+                                                ModelMismatchMode::Ignore, std::nullopt, &report);
+    ASSERT_TRUE(report.source == LoadSource::NoEmbeddings);
+    ASSERT_FALSE(report.snapshotSkipped.has_value());
+    ASSERT_EQ(missing.embeddingStore().count(), 0u);
+}
+
+TEST(snapshot_of_an_edited_graph_is_refused_and_the_json_mismatch_policy_applies) {
+    auto encoder = std::make_shared<MockEncoder>(12);
+    SdTempDir dir("goldedit");
+    sdCopyGolden(dir, true);
+    std::string graph = sdSlurp(dir.file("golden.ison"));
+    const size_t at = graph.find("Alice");
+    graph.replace(at, 5, "Alicia");
+    sdSpit(dir.file("golden.ison"), graph);
+
+    LoadReport report;
+    ASSERT_THROWS(SemanticGraph::load(dir.file("golden.ison"), encoder), GraphEmbeddingMismatchError);
+
+    std::vector<std::string> warnings;
+    setWarningHandler([&](const std::string& m) { warnings.push_back(m); });
+    SemanticGraph warned = SemanticGraph::load(dir.file("golden.ison"), encoder, "auto", true, true, {"name"},
+                                               GraphMismatchMode::Warn, std::nullopt, ModelMismatchMode::Ignore,
+                                               std::nullopt, &report);
+    setWarningHandler(nullptr);
+    ASSERT_TRUE(report.source == LoadSource::Json);
+    ASSERT_TRUE(report.snapshotSkipped.has_value());
+    ASSERT_TRUE(report.snapshotSkipped->find("different graph") != std::string::npos);
+    ASSERT_EQ(warned.embeddingStore().count(), 36u);
+    ASSERT_EQ(warnings.size(), 1u);
+}
+
+// ---- snapshot: our own save -> load ------------------------------------------------
+
+TEST(save_with_snapshot_round_trips_and_the_other_files_are_unchanged) {
+    SdTempDir dir("snaprt"), plain("snapplain");
+    auto encoder = std::make_shared<MockEncoder>(16);
+    auto build = [&]() {
+        SemanticGraph g("persist", encoder);
+        for (int i = 0; i < 300; ++i) {
+            g.addNode(i % 2 ? "doc" : "note", std::to_string(i),
+                      {{"name", "item " + std::to_string(i)}, {"text", "line\n\"quoted\" \xc3\xa9 " + std::to_string(i)}});
+        }
+        g.addEdge("REL", NodeRef("doc", "1"), NodeRef("note", "2"));
+        for (int i = 0; i < 300; i += 7) g.embeddingStore().add(NodeRef("doc", std::to_string(i)), "updated " + std::to_string(i),
+                                                                 SdRng(static_cast<uint64_t>(i)).vec(16));
+        for (int i = 3; i < 300; i += 11) g.removeNode(i % 2 ? "doc" : "note", std::to_string(i));
+        return g;
+    };
+    SemanticGraph graph = build();
+    const std::string path = dir.file("g.ison");
+    graph.save(path, "auto", true, /*snapshot=*/true);
+    ASSERT_TRUE(std::filesystem::exists(path + ".embeddings.snap"));
+    SemanticGraph twin = build();
+    twin.save(plain.file("g.ison"));
+    ASSERT_FALSE(std::filesystem::exists(plain.file("g.ison.embeddings.snap")));
+    // graph file and JSON sidecar are byte-identical with or without the snapshot
+    ASSERT_TRUE(sdSlurp(path) == sdSlurp(plain.file("g.ison")));
+    ASSERT_TRUE(sdSlurp(path + ".embeddings.json") == sdSlurp(plain.file("g.ison.embeddings.json")));
+
+    LoadReport report;
+    SemanticGraph loaded = SemanticGraph::load(path, encoder, "auto", true, true, {"name", "text"},
+                                               GraphMismatchMode::Error, std::nullopt, ModelMismatchMode::Warn,
+                                               std::nullopt, &report);
+    ASSERT_TRUE(report.source == LoadSource::Snapshot);
+    SemanticGraph viaJson = SemanticGraph::load(plain.file("g.ison"), encoder);
+    sdExpectSameStore(loaded.embeddingStore(), viaJson.embeddingStore());
+    sdExpectSameStore(loaded.embeddingStore(), graph.embeddingStore());
+    ASSERT_EQ(report.embeddings, graph.embeddingStore().count());
+    // text search through the loaded graph answers like the original's
+    ASSERT_TRUE(sameHits(loaded.similaritySearch("item 41", 5, "", -1.0f), graph.similaritySearch("item 41", 5, "", -1.0f)));
+    loaded.embeddingStore().verifyInvariants();
+
+    // a loaded store keeps working: writes, deletes, ANN
+    AnnOptions o;
+    o.nlist = 16; o.nprobe = 4; o.minSize = 0;
+    loaded.embeddingStore().enableAnn(o);
+    loaded.embeddingStore().add(NodeRef("new", "1"), "n", SdRng(5).vec(16));
+    ASSERT_EQ(loaded.embeddingStore().similaritySearchVector(SdRng(5).vec(16), 1)[0].node_ref.type, "new");
+    loaded.embeddingStore().verifyInvariants();
+
+    // saving again WITHOUT a snapshot deletes the old one (the sidecar is about to change)
+    graph.save(path);
+    ASSERT_FALSE(std::filesystem::exists(path + ".embeddings.snap"));
+    graph.save(path, "auto", true, true);
+    ASSERT_TRUE(std::filesystem::exists(path + ".embeddings.snap"));
+    // and a graph-only save leaves things alone but the old snapshot can no longer match
+    graph.removeNode("doc", "1");
+    graph.save(path, "auto", false);
+    setWarningHandler([](const std::string&) {});
+    LoadReport after;
+    SemanticGraph stale = SemanticGraph::load(path, encoder, "auto", true, true, {"name"}, GraphMismatchMode::Warn,
+                                              std::nullopt, ModelMismatchMode::Ignore, std::nullopt, &after);
+    setWarningHandler(nullptr);
+    ASSERT_TRUE(after.source == LoadSource::Json);
+    ASSERT_TRUE(after.snapshotSkipped.has_value());
+}
+
+TEST(snapshot_of_an_empty_store_and_a_failed_write_leave_nothing_behind) {
+    SdTempDir dir("snapempty");
+    auto encoder = std::make_shared<MockEncoder>(8);
+    SemanticGraph graph("g", encoder, /*autoEmbed=*/false);
+    graph.addNode("p", "1", {{"name", "x"}});
+    graph.save(dir.file("g.ison"), "auto", true, true);
+    LoadReport report;
+    SemanticGraph back = SemanticGraph::load(dir.file("g.ison"), encoder, "auto", true, true, {"name"},
+                                             GraphMismatchMode::Error, std::nullopt, ModelMismatchMode::Warn,
+                                             std::nullopt, &report);
+    ASSERT_TRUE(report.source == LoadSource::Snapshot);
+    ASSERT_EQ(back.embeddingStore().count(), 0u);
+
+    // a snapshot that cannot be written: the pair is saved, the error is thrown, no temp file is left
+    SemanticGraph other("g", encoder);
+    other.addNode("p", "1", {{"name", "x"}});
+    std::filesystem::create_directory(dir.file("blocked.ison.embeddings.snap"));   // a directory in the way
+    bool refused = false;
+    try {
+        other.save(dir.file("blocked.ison"), "auto", true, true);
+    } catch (const EmbeddingError&) {
+        refused = true;
+    }
+    ASSERT_TRUE(refused);
+    ASSERT_TRUE(std::filesystem::exists(dir.file("blocked.ison")));
+    ASSERT_TRUE(std::filesystem::exists(dir.file("blocked.ison.embeddings.json")));
+    for (const auto& entry : std::filesystem::directory_iterator(dir.path())) {
+        ASSERT_TRUE(entry.path().extension() != ".tmp");
+    }
+    ASSERT_THROWS(EmbeddingStore().saveSnapshot(dir.file("no/such/dir/x.snap")), EmbeddingError);
+}
+
+TEST(snapshot_loaded_store_scores_like_a_json_loaded_one_with_the_index_on) {
+    ClusteredData gen(25, 20, 41);
+    auto data = gen.drawMany(3500);
+    EmbeddingStore source;
+    fillStore(source, data);
+    SdTempDir dir("snapann");
+    source.saveSnapshot(dir.file("a.snap"));
+    source.saveEmbeddings(dir.file("a.json"));
+    AnnOptions o;
+    o.nlist = 32; o.nprobe = 6; o.minSize = 0;
+    EmbeddingStore fromSnap, fromJson;
+    fromSnap.enableAnn(o);
+    fromJson.enableAnn(o);
+    fromSnap.loadSnapshot(dir.file("a.snap"));
+    fromJson.loadEmbeddings(dir.file("a.json"));
+    for (const auto& q : gen.drawMany(20)) {
+        ASSERT_TRUE(sameHits(fromSnap.similaritySearchVector(q, 10, "", -1.0f), fromJson.similaritySearchVector(q, 10, "", -1.0f)));
+        ASSERT_TRUE(sameHits(fromSnap.similaritySearchVector(q, 10, "", -1.0f, true), source.similaritySearchVector(q, 10, "", -1.0f, true)));
+    }
+    ASSERT_TRUE(fromSnap.annStats().active);
+    ASSERT_EQ(fromSnap.annStats().builds, 1u);
+    // loading a snapshot drops an index built on the old rows
+    fromSnap.loadSnapshot(dir.file("a.snap"));
+    ASSERT_FALSE(fromSnap.annStats().active);
 }
 
 // =============================================================================
