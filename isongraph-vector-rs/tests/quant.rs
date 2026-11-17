@@ -195,12 +195,16 @@ fn batch_equals_single_bit_for_bit_exact_and_ivf_and_across_threads() {
         ..AnnConfig::default()
     };
     for config in [None, Some(ann)] {
-        let mut store = filled(&data, |i| if i % 3 == 0 { "a" } else { "b" });
+        let mut store = filled(&data, |i| match i {
+            _ if i % 500 == 0 => "rare", // a dozen rows: probes come up short
+            _ if i % 3 == 0 => "a",
+            _ => "b",
+        });
         if let Some(c) = config.clone() {
             store.set_ann(Some(c)).unwrap();
         }
         store.set_scan_precision(int8(4)).unwrap();
-        for filter in [None, Some("a")] {
+        for filter in [None, Some("a"), Some("rare")] {
             let singles: Vec<_> = queries
                 .iter()
                 .map(|q| store.similarity_search_vector(q, 10, filter, -1.0).unwrap())

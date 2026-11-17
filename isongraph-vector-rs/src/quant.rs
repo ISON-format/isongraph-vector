@@ -538,6 +538,26 @@ dispatch! {
     fn scan_cells(v: View, cells: Cells, chosen: &[u32], with_pending: bool, qq: &QQuery, q: &QueryVec, code: Option<u32>, top: &mut TopK) = scan_cells_impl
 }
 
+/// First pass over an explicit list of slots (a cell's rows).
+#[inline(always)]
+fn scan_slots_impl<const F: bool>(
+    v: View,
+    slots: &[u32],
+    qq: &QQuery,
+    q: &QueryVec,
+    top: &mut TopK,
+) {
+    let mut quad = Quad8::new();
+    for &slot in slots {
+        quad.push::<F>(&v, qq, q, slot as usize, v.q.row(slot as usize), top);
+    }
+    quad.finish::<F>(&v, qq, q, top);
+}
+
+dispatch! {
+    fn scan_slots(v: View, slots: &[u32], qq: &QQuery, q: &QueryVec, top: &mut TopK) = scan_slots_impl
+}
+
 /// Exact f32 scores of `slots`, offered to `top`.
 #[inline(always)]
 fn rerank_impl<const F: bool>(rows: Rows, q: &QueryVec, slots: &[u32], top: &mut TopK) {
@@ -604,7 +624,7 @@ pub(super) fn scan_probed(
     let tasks = chosen.len().div_ceil(CELLS_PER_TASK);
     let threads = if par.configured == 0 {
         par.workers(tasks, SCAN_AUTO_THREADS)
-            .min((candidates * dim / 4 / PAR_MIN_CELL_FLOATS).max(1))
+            .min((candidates * dim / PAR_MIN_CELL_FLOATS).max(1))
     } else {
         par.workers(tasks, SCAN_AUTO_THREADS)
     };
@@ -847,10 +867,16 @@ impl EmbeddingStore {
         Some(out)
     }
 
-    /// The hook `batch_hits` calls before the f32 cell-major batch: with an
-    /// int8 copy, each query takes the very path a lone query takes (so the
-    /// answers are identical), spread over the pool. Returns whether it
-    /// handled the batch (even by leaving `answers` empty for the exact scan).
+    /// The hook `batch_hits` calls before the f32 cell-major batch. Like it,
+    /// this works **cell-major**: each probed cell's int8 rows are scored once
+    /// against every query that probes the cell (the rows stay in cache), into
+    /// per-query candidate heaps of `k * rerank_factor`; then each query's
+    /// candidates are re-scored exactly. A query's candidate set is the top
+    /// `kc` of exactly the rows the single-query probe scans, under the same
+    /// total order, so the answer is identical to the single-query answer. A
+    /// query that comes up short, or whose probe is too small for int8 to skip
+    /// anything, is re-run on the single-query path. Returns whether it handled
+    /// the batch (even by leaving `answers` empty for the exact scan).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn quant_approximate_batch(
         &self,
@@ -862,34 +888,173 @@ impl EmbeddingStore {
         top_k: usize,
         answers: &mut [Option<Vec<Hit>>],
     ) -> bool {
-        if self.table.quant().is_none() {
+        let table = &self.table;
+        let Some(qr) = table.quant() else {
             return false;
-        }
-        if super::effective_nprobe(cfg, ivf.nlist) >= ivf.nlist {
+        };
+        let nprobe = super::effective_nprobe(cfg, ivf.nlist);
+        if nprobe >= ivf.nlist {
             return true; // probing everything is the exact scan
         }
+        let kc = top_k.saturating_mul(qr.rerank_factor);
+        let live = table.live();
+        let view = View {
+            rows: table.rows(),
+            q: qr.view(table.dim),
+        };
+        let bar = threshold - THRESHOLD_SLACK;
         let par = self.par();
+
+        // 1. the cells each query probes (queries with no direction go to the
+        //    exact scan, as in the f32 batch)
+        let mut chosen: Vec<Option<Vec<u32>>> = (0..qs.len()).map(|_| None).collect();
+        {
+            let next = AtomicUsize::new(0);
+            let done: Mutex<Vec<(usize, Vec<u32>)>> = Mutex::new(Vec::new());
+            par.run(par.workers(qs.len(), usize::MAX), &|_| {
+                let mut local = Vec::new();
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= qs.len() {
+                        break;
+                    }
+                    if qs[i].has_direction() {
+                        local.push((i, ivf.choose_cells(&qs[i], nprobe)));
+                    }
+                }
+                done.lock().unwrap_or_else(|e| e.into_inner()).extend(local);
+            });
+            for (i, cells) in done.into_inner().unwrap_or_else(|e| e.into_inner()) {
+                chosen[i] = Some(cells);
+            }
+        }
+        // a probe with no more rows than `kc` cannot be thinned by int8: the
+        // single-query path answers it in f32
+        let mut single = Vec::new();
+        for (i, cells) in chosen.iter_mut().enumerate() {
+            if let Some(c) = cells {
+                let rows: usize = c
+                    .iter()
+                    .map(|&c| ivf.lists[c as usize].len())
+                    .sum::<usize>()
+                    + ivf.pending.len();
+                if kc >= rows {
+                    single.push(i);
+                    *cells = None;
+                }
+            }
+        }
+
+        // 2. invert: the queries of each cell (the extra last entry is the
+        //    pending rows, which every query scores)
+        let mut by_cell: Vec<Vec<u32>> = vec![Vec::new(); ivf.nlist + 1];
+        for (i, cells) in chosen.iter().enumerate() {
+            if let Some(cells) = cells {
+                for &c in cells {
+                    by_cell[c as usize].push(i as u32);
+                }
+                by_cell[ivf.nlist].push(i as u32);
+            }
+        }
+        let members_of = |c: usize| -> &[u32] {
+            if c == ivf.nlist {
+                &ivf.pending
+            } else {
+                &ivf.lists[c]
+            }
+        };
+        let tasks: Vec<usize> = (0..=ivf.nlist)
+            .filter(|&c| !by_cell[c].is_empty() && !members_of(c).is_empty())
+            .collect();
+
+        // 3. score every probed cell once against all of its queries
+        let qqs: Vec<Option<QQuery>> = chosen
+            .iter()
+            .zip(qs)
+            .map(|(c, q)| c.as_ref().map(|_| QQuery::new(q.v)))
+            .collect();
+        let next = AtomicUsize::new(0);
+        let parts: Mutex<Vec<Vec<TopK>>> = Mutex::new(Vec::new());
+        par.run(par.workers(tasks.len(), usize::MAX), &|_| {
+            let mut tops: Vec<TopK> = Vec::new();
+            let mut slots: Vec<u32> = Vec::new();
+            loop {
+                let t = next.fetch_add(1, Ordering::Relaxed);
+                if t >= tasks.len() {
+                    break;
+                }
+                if tops.is_empty() {
+                    tops = (0..qs.len()).map(|_| TopK::new(kc, bar, live)).collect();
+                }
+                let c = tasks[t];
+                slots.clear();
+                slots.extend(
+                    members_of(c)
+                        .iter()
+                        .copied()
+                        .filter(|&s| code.is_none_or(|code| view.rows.codes[s as usize] == code)),
+                );
+                for &i in &by_cell[c] {
+                    let i = i as usize;
+                    let qq = qqs[i]
+                        .as_ref()
+                        .expect("a probing query has a quantised copy");
+                    scan_slots(view, &slots, qq, &qs[i], &mut tops[i]);
+                }
+            }
+            if !tops.is_empty() {
+                parts.lock().unwrap_or_else(|e| e.into_inner()).push(tops);
+            }
+        });
+        let mut parts = parts.into_inner().unwrap_or_else(|e| e.into_inner());
+        let mut merged: Vec<TopK> = match parts.pop() {
+            Some(first) => first,
+            None => (0..qs.len()).map(|_| TopK::new(kc, bar, live)).collect(),
+        };
+        for part in parts {
+            for (a, b) in merged.iter_mut().zip(part) {
+                a.merge(b);
+            }
+        }
+
+        // 4. exact rerank; the short ones go back through the single path
+        for (i, cand) in merged.into_iter().enumerate() {
+            if chosen[i].is_none() {
+                continue;
+            }
+            let top = rerank_candidates(view.rows, &qs[i], cand, threshold, top_k);
+            if top.len() >= top_k {
+                self.counts.approximate.fetch_add(1, Ordering::Relaxed);
+                answers[i] = Some(top.into_sorted());
+            } else {
+                single.push(i);
+            }
+        }
         let one_thread = Par {
             configured: 1,
             pool: &self.pool,
         };
         let next = AtomicUsize::new(0);
-        let done: Mutex<Vec<(usize, Option<Vec<Hit>>)>> = Mutex::new(Vec::new());
-        par.run(par.workers(qs.len(), usize::MAX), &|_| {
+        let redone: Mutex<Vec<(usize, Option<Vec<Hit>>)>> = Mutex::new(Vec::new());
+        par.run(par.workers(single.len(), usize::MAX), &|_| {
             let mut local = Vec::new();
             loop {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                if i >= qs.len() {
+                let j = next.fetch_add(1, Ordering::Relaxed);
+                if j >= single.len() {
                     break;
                 }
+                let i = single[j];
                 local.push((
                     i,
                     self.approximate_topk(cfg, ivf, &qs[i], code, threshold, top_k, one_thread),
                 ));
             }
-            done.lock().unwrap_or_else(|e| e.into_inner()).extend(local);
+            redone
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(local);
         });
-        for (i, hits) in done.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        for (i, hits) in redone.into_inner().unwrap_or_else(|e| e.into_inner()) {
             answers[i] = hits;
         }
         true
