@@ -1,0 +1,4 @@
+D:\Goldmine\ISON\bench_data\rs_target_stagec\release\examples\stage_c_bench.exe --ds-dir D:\Goldmine\ISON\bench_data\prep/glove --ds glove --n 100000 --mode exact --exp core --queries 1000 --budget 3 --label rust_exact --out D:\Goldmine\ISON\ison_dev\isongraphossworking\isongraph-vector\benchmarks\rust-stage-c\raw\rust_exact_glove_100000_r2.json
+rust_exact: ds=glove n=100000 d=100 mode=exact int8=0 queries=1000 cpus=32 exps=["core"]
+  ingest 0.05s  rss 59 MB
+  exact 1T recall=1.0000 qps=537.1 median=1.719ms | auto 707.7 qps | batch 10552 qps

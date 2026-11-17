@@ -1,0 +1,4 @@
+D:\Goldmine\ISON\bench_data\rs_target_stagec\release\examples\stage_c_bench.exe --ds-dir D:\Goldmine\ISON\bench_data\prep/sift --ds sift --n 100000 --mode exact --exp core --queries 1000 --budget 3 --label rust_exact --out D:\Goldmine\ISON\ison_dev\isongraphossworking\isongraph-vector\benchmarks\rust-stage-c\raw\rust_exact_sift_100000_r3.json
+rust_exact: ds=sift n=100000 d=128 mode=exact int8=0 queries=1000 cpus=32 exps=["core"]
+  ingest 0.05s  rss 70 MB
+  exact 1T recall=1.0000 qps=396.9 median=2.575ms | auto 645.0 qps | batch 11457 qps

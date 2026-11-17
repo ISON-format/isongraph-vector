@@ -1,0 +1,39 @@
+{
+  "config": {
+    "tenants": 4,
+    "nodes": 20000,
+    "dim": 64,
+    "top_k": 10,
+    "clients": 16,
+    "duration": 8.0,
+    "warmup": 2.0,
+    "mode": "spawn",
+    "shards": 0,
+    "text": false,
+    "url": null,
+    "seed": 1
+  },
+  "environment": {
+    "python": "3.12.7",
+    "platform": "Windows-11-10.0.26300-SP0",
+    "cpu_count": 32,
+    "server_processes": 1
+  },
+  "result": {
+    "requests_ok": 11779,
+    "errors": {},
+    "throughput_rps": 1472.4,
+    "latency_ms": {
+      "mean": 10.859,
+      "p50": 9.614,
+      "p95": 23.212,
+      "p99": 28.273,
+      "max": 38.366
+    },
+    "per_tenant_requests": {
+      "min": 2910,
+      "max": 2981,
+      "tenants_hit": 4
+    }
+  }
+}

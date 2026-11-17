@@ -1,0 +1,2 @@
+C:\Program Files\Python312\python.exe D:\Goldmine\ISON\ison_dev\isongraphossworking\isongraph-vector\benchmarks\rust-stage-c\bench_c.py --system numpy_bf --ds sift --n 100000 --exp core --queries 1000 --budget 3 --out D:\Goldmine\ISON\ison_dev\isongraphossworking\isongraph-vector\benchmarks\rust-stage-c\raw\numpy_bf_sift_100000_r2.json
+  numpy_bf sift 100000 knob=None recall=1.0000 qps1t=314 med=3.136ms batch=786

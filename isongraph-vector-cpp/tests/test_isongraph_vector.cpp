@@ -17,6 +17,9 @@
 #include <functional>
 #include <map>
 #include <type_traits>
+#include <thread>
+#include <atomic>
+#include <limits>
 #include "../include/isongraph_vector.hpp"
 #include "../include/isongraph_vector_http.hpp"
 
@@ -2884,6 +2887,617 @@ TEST(a_node_added_while_the_endpoint_is_down_is_rolled_back) {
     ASSERT_EQ(graph.graph().nodeCount(), 0u);
     graph.addNode("person", "1", {{"name", "Alice"}});  // the endpoint is back
     ASSERT_EQ(graph.embeddingStore().count(), 1u);
+}
+
+// =============================================================================
+// Approximate (IVF) search
+// =============================================================================
+
+namespace {
+
+/// Recall@10 the tests demand of the index on the clustered data below (4,000
+/// vectors, 40 clusters, 64 cells, nprobe 8 = 12.5% of the cells). Measured
+/// 1.000 on every seed tried; the floor leaves room for rounding differences
+/// between compilers, not for a worse algorithm.
+const double ANN_RECALL_FLOOR = 0.95;
+
+/// Clustered unit-ish vectors and a way to draw queries from the same clusters
+/// (the shape the Python tests use: an IVF index is meaningless on uniform noise).
+struct ClusteredData {
+    size_t dim;
+    double noise;
+    std::vector<std::vector<float>> centers;
+    std::mt19937_64 rng;
+
+    ClusteredData(size_t clusters, size_t dimension, uint64_t seed, double noiseNorm = 1.0)
+        : dim(dimension), noise(noiseNorm), rng(seed) {
+        for (size_t c = 0; c < clusters; ++c) {
+            std::vector<float> center(dim);
+            double sq = 0;
+            for (auto& x : center) { x = static_cast<float>(gauss()); sq += double(x) * x; }
+            for (auto& x : center) x = static_cast<float>(x / std::sqrt(sq));
+            centers.push_back(std::move(center));
+        }
+    }
+
+    double gauss() {
+        double u1 = (static_cast<double>(rng() >> 11) + 1.0) / 9007199254740993.0;
+        double u2 = static_cast<double>(rng() >> 11) / 9007199254740992.0;
+        return std::sqrt(-2.0 * std::log(u1)) * std::cos(6.283185307179586 * u2);
+    }
+
+    std::vector<float> draw() {
+        const auto& center = centers[rng() % centers.size()];
+        std::vector<float> v(dim);
+        for (size_t d = 0; d < dim; ++d) {
+            v[d] = center[d] + static_cast<float>(noise * gauss() / std::sqrt(double(dim)));
+        }
+        return v;
+    }
+
+    std::vector<std::vector<float>> drawMany(size_t count) {
+        std::vector<std::vector<float>> out;
+        for (size_t i = 0; i < count; ++i) out.push_back(draw());
+        return out;
+    }
+};
+
+std::string annKey(const SimilarityResult& r) { return r.node_ref.type + ":" + r.node_ref.id; }
+
+std::vector<std::string> annKeys(const std::vector<SimilarityResult>& results) {
+    std::vector<std::string> keys;
+    for (const auto& r : results) keys.push_back(annKey(r));
+    return keys;
+}
+
+AnnOptions annOptions(size_t nlist = 64, size_t nprobe = 8, size_t minSize = 0) {
+    AnnOptions o;
+    o.nlist = nlist;
+    o.nprobe = nprobe;
+    o.minSize = minSize;
+    return o;
+}
+
+void fillStore(EmbeddingStore& store, const std::vector<std::vector<float>>& data,
+               const std::function<std::string(size_t)>& typeOf = nullptr) {
+    for (size_t i = 0; i < data.size(); ++i) {
+        store.add(NodeRef(typeOf ? typeOf(i) : "doc", std::to_string(i)), "text " + std::to_string(i), data[i]);
+    }
+}
+
+/// Same vectors, no index: the brute-force reference.
+EmbeddingStore plainStore(const std::vector<std::vector<float>>& data,
+                          const std::function<std::string(size_t)>& typeOf = nullptr) {
+    EmbeddingStore store;
+    fillStore(store, data, typeOf);
+    return store;
+}
+
+}  // namespace
+
+TEST(ann_is_off_by_default_and_exact_search_is_untouched) {
+    ClusteredData gen(40, 32, 1);
+    auto data = gen.drawMany(1500);
+    EmbeddingStore store = plainStore(data);
+    ASSERT_FALSE(store.annStats().enabled);
+    ASSERT_FALSE(store.annStats().active);
+    ASSERT_THROWS(store.buildAnnIndex(), EmbeddingError);
+    ASSERT_THROWS(store.setAnnNprobe(4), EmbeddingError);
+
+    // exact=true on a store without an index is the same scan
+    for (const auto& q : gen.drawMany(5)) {
+        auto a = store.similaritySearchVector(q, 10, "", -1.0f);
+        auto b = store.similaritySearchVector(q, 10, "", -1.0f, /*exact=*/true);
+        ASSERT_EQ(a.size(), b.size());
+        for (size_t i = 0; i < a.size(); ++i) {
+            ASSERT_EQ(annKey(a[i]), annKey(b[i]));
+            ASSERT_EQ(a[i].score, b[i].score);
+        }
+    }
+    ASSERT_EQ(store.annStats().exactSearches, 0u);  // not counted while disabled
+}
+
+TEST(ann_recall_floor_on_clustered_data) {
+    ClusteredData gen(40, 32, 1);
+    auto data = gen.drawMany(4000);
+    EmbeddingStore store;
+    store.enableAnn(annOptions(64, 8, 0));
+    fillStore(store, data);
+
+    RecallReport report = store.recallCheck(gen.drawMany(60), 10);
+    ASSERT_TRUE(report.approximate);
+    ASSERT_EQ(report.nlist, 64u);
+    ASSERT_EQ(report.nprobe, 8u);
+    ASSERT_EQ(report.queries, 60u);
+    ASSERT_GE(report.recall, ANN_RECALL_FLOOR);
+    ASSERT_TRUE(report.minRecall >= 0.0 && report.minRecall <= report.recall && report.recall <= 1.0);
+    ASSERT_TRUE(report.annMs >= 0.0 && report.exactMs >= 0.0);
+
+    AnnStats stats = store.annStats();
+    ASSERT_TRUE(stats.enabled && stats.active);
+    ASSERT_EQ(stats.nlist, 64u);
+    ASSERT_EQ(stats.trainedN, 4000u);
+    ASSERT_GT(stats.indexBytes, 0u);
+    ASSERT_GE(stats.approximateSearches, 60u);
+    ASSERT_EQ(stats.builds, 1u);
+}
+
+TEST(ann_results_carry_the_exact_cosine_score) {
+    ClusteredData gen(40, 32, 2);
+    auto data = gen.drawMany(3000);
+    EmbeddingStore store;
+    store.enableAnn(annOptions());
+    fillStore(store, data);
+    EmbeddingStore reference = plainStore(data);
+
+    for (const auto& q : gen.drawMany(10)) {
+        std::map<std::string, float> truth;
+        for (const auto& r : reference.similaritySearchVector(q, 3000, "", -1.0f)) truth[annKey(r)] = r.score;
+        auto got = store.similaritySearchVector(q, 10, "", -1.0f);
+        ASSERT_EQ(got.size(), 10u);
+        for (size_t i = 0; i < got.size(); ++i) {
+            ASSERT_EQ(got[i].score, truth.at(annKey(got[i])));  // same float, not merely close
+            if (i > 0) ASSERT_TRUE(got[i - 1].score >= got[i].score);
+        }
+    }
+}
+
+TEST(ann_exact_override_equals_brute_force) {
+    ClusteredData gen(40, 32, 3);
+    auto data = gen.drawMany(3000);
+    EmbeddingStore store;
+    store.enableAnn(annOptions(64, 2, 0));  // a narrow probe, so approximate answers would differ
+    fillStore(store, data);
+    EmbeddingStore reference = plainStore(data);
+
+    for (const auto& q : gen.drawMany(15)) {
+        auto want = reference.similaritySearchVector(q, 10, "", 0.0f);
+        auto got = store.similaritySearchVector(q, 10, "", 0.0f, /*exact=*/true);
+        ASSERT_EQ(got.size(), want.size());
+        for (size_t i = 0; i < want.size(); ++i) {
+            ASSERT_EQ(annKey(got[i]), annKey(want[i]));
+            ASSERT_EQ(got[i].score, want[i].score);
+            ASSERT_EQ(got[i].text, want[i].text);
+        }
+    }
+    // the override never consulted the index
+    ASSERT_EQ(store.annStats().approximateSearches, 0u);
+    ASSERT_GE(store.annStats().exactSearches, 15u);
+}
+
+TEST(ann_probing_every_cell_is_the_exact_scan) {
+    ClusteredData gen(40, 32, 4);
+    auto data = gen.drawMany(2000);
+    EmbeddingStore store;
+    store.enableAnn(annOptions(32, 32, 0));  // nprobe == nlist
+    fillStore(store, data);
+    EmbeddingStore reference = plainStore(data);
+    for (const auto& q : gen.drawMany(8)) {
+        auto want = reference.similaritySearchVector(q, 10, "", 0.0f);
+        auto got = store.similaritySearchVector(q, 10, "", 0.0f);
+        ASSERT_EQ(annKeys(got), annKeys(want));
+        for (size_t i = 0; i < want.size(); ++i) ASSERT_EQ(got[i].score, want[i].score);
+    }
+    RecallReport report = store.recallCheck(gen.drawMany(5));
+    ASSERT_FALSE(report.approximate);
+    ASSERT_EQ(report.recall, 1.0);
+    ASSERT_EQ(store.annStats().approximateSearches, 0u);
+}
+
+TEST(ann_small_store_falls_back_to_the_exact_scan) {
+    ClusteredData gen(10, 16, 5);
+    auto data = gen.drawMany(500);
+    EmbeddingStore store;
+    store.enableAnn(annOptions(16, 2, /*minSize=*/1000));
+    fillStore(store, data);
+    EmbeddingStore reference = plainStore(data);
+    auto q = gen.draw();
+    ASSERT_EQ(annKeys(store.similaritySearchVector(q, 10)), annKeys(reference.similaritySearchVector(q, 10)));
+    ASSERT_FALSE(store.annStats().active);
+    ASSERT_EQ(store.annStats().builds, 0u);
+    ASSERT_FALSE(store.recallCheck({q}).approximate);
+
+    // growing past minSize switches the index on, shrinking below drops it again
+    auto more = gen.drawMany(600);
+    for (size_t i = 0; i < more.size(); ++i) store.add(NodeRef("late", std::to_string(i)), "", more[i]);
+    store.similaritySearchVector(q, 10);
+    ASSERT_TRUE(store.annStats().active);
+    for (size_t i = 0; i < 200; ++i) store.remove(NodeRef("late", std::to_string(i)));
+    store.similaritySearchVector(q, 10);
+    ASSERT_FALSE(store.annStats().active);
+}
+
+TEST(ann_default_policy_matches_python) {
+    AnnOptions defaults;
+    ASSERT_EQ(defaults.minSize, 50000u);
+    ASSERT_EQ(defaults.nlist, 0u);   // automatic: ~4*sqrt(N), 16..65536
+    ASSERT_EQ(defaults.nprobe, 0u);  // automatic: ~5% of nlist
+    ASSERT_EQ(defaults.seed, 0u);
+    ASSERT_EQ(AnnOptions::autoNlist(10000), 400u);
+    ASSERT_EQ(AnnOptions::autoNlist(100), 40u);
+    ASSERT_EQ(AnnOptions::autoNlist(4), 16u);
+    ASSERT_EQ(AnnOptions::autoNlist(1000000), 4000u);
+    ASSERT_EQ(AnnOptions::autoNlist(100000000), 40000u);
+    ASSERT_EQ(AnnOptions::autoNlist(1000000000000ull), 65536u);
+
+    // automatic nlist/nprobe on a real index
+    ClusteredData gen(25, 16, 6);
+    auto data = gen.drawMany(2500);
+    EmbeddingStore store;
+    AnnOptions o;
+    o.minSize = 0;
+    store.enableAnn(o);
+    fillStore(store, data);
+    AnnStats stats = store.buildAnnIndex();
+    ASSERT_EQ(stats.nlist, 200u);   // round(4*sqrt(2500))
+    ASSERT_EQ(stats.nprobe, 10u);   // round(5% of 200)
+}
+
+TEST(ann_same_seed_builds_the_same_index) {
+    ClusteredData gen(40, 32, 7);
+    auto data = gen.drawMany(3000);
+    auto queries = gen.drawMany(30);
+
+    EmbeddingStore a, b, c, d;
+    a.enableAnn(annOptions(48, 4, 0));
+    b.enableAnn(annOptions(48, 4, 0));
+    AnnOptions threaded = annOptions(48, 4, 0);
+    threaded.threads = 4;
+    c.enableAnn(threaded);
+    AnnOptions single = annOptions(48, 4, 0);
+    single.threads = 1;
+    d.enableAnn(single);
+    fillStore(a, data);
+    // b gets the same rows in the opposite insertion order
+    for (size_t i = data.size(); i-- > 0;) b.add(NodeRef("doc", std::to_string(i)), "text " + std::to_string(i), data[i]);
+    fillStore(c, data);
+    fillStore(d, data);
+
+    for (const auto& q : queries) {
+        auto ra = a.similaritySearchVector(q, 10, "", -1.0f);
+        auto rb = b.similaritySearchVector(q, 10, "", -1.0f);
+        auto rc = c.similaritySearchVector(q, 10, "", -1.0f);
+        auto rd = d.similaritySearchVector(q, 10, "", -1.0f);
+        ASSERT_EQ(annKeys(ra), annKeys(rb));  // insertion order does not matter
+        ASSERT_EQ(annKeys(ra), annKeys(rc));  // neither does the thread count
+        ASSERT_EQ(annKeys(ra), annKeys(rd));
+        for (size_t i = 0; i < ra.size(); ++i) ASSERT_EQ(ra[i].score, rd[i].score);
+    }
+}
+
+TEST(ann_writes_are_visible_immediately) {
+    ClusteredData gen(40, 32, 8);
+    auto data = gen.drawMany(4000);
+    EmbeddingStore store;
+    store.enableAnn(annOptions());
+    fillStore(store, data);
+    store.buildAnnIndex();
+
+    auto fresh = gen.draw();
+    store.add(NodeRef("new", "1"), "fresh", fresh);
+    auto top = store.similaritySearchVector(fresh, 3);
+    ASSERT_EQ(annKey(top[0]), "new:1");
+    ASSERT_NEAR(top[0].score, 1.0f, 1e-5f);
+    ASSERT_EQ(store.annStats().pending, 1u);
+
+    // an in-place update moves the row: found at its new place, scored from its
+    // new vector everywhere, and listed once
+    auto target = gen.draw();
+    store.add(NodeRef("doc", "7"), "moved", target);
+    auto hit = store.similaritySearchVector(target, 1);
+    ASSERT_EQ(annKey(hit[0]), "doc:7");
+    ASSERT_NEAR(hit[0].score, 1.0f, 1e-5f);
+    ASSERT_EQ(hit[0].text, "moved");
+    ASSERT_EQ(store.count(), 4001u);
+
+    EmbeddingStore truthStore = plainStore(data);
+    truthStore.add(NodeRef("new", "1"), "fresh", fresh);
+    truthStore.add(NodeRef("doc", "7"), "moved", target);
+    for (const auto& q : {data[7], target}) {
+        auto res = store.similaritySearchVector(q, 400, "", -1.0f);
+        std::set<std::string> seen;
+        for (const auto& r : res) ASSERT_TRUE(seen.insert(annKey(r)).second);  // no stale second entry
+        std::map<std::string, float> truth;
+        for (const auto& r : truthStore.similaritySearchVector(q, 5000, "", -1.0f)) truth[annKey(r)] = r.score;
+        for (const auto& r : res) ASSERT_EQ(r.score, truth.at(annKey(r)));
+    }
+    // updating a row twice before it is folded does not list it twice
+    store.add(NodeRef("doc", "7"), "moved again", target);
+    ASSERT_EQ(store.annStats().pending, 2u);
+}
+
+TEST(ann_deleted_rows_never_come_back) {
+    ClusteredData gen(40, 32, 9);
+    auto data = gen.drawMany(4000);
+    EmbeddingStore store;
+    store.enableAnn(annOptions());
+    fillStore(store, data);
+    store.buildAnnIndex();
+    ASSERT_EQ(store.annStats().builds, 1u);
+
+    std::set<std::string> gone;
+    for (size_t i = 0; i < 4000; i += 3) {  // a third of them: forces compaction
+        ASSERT_TRUE(store.remove(NodeRef("doc", std::to_string(i))));
+        gone.insert("doc:" + std::to_string(i));
+    }
+    for (const auto& q : gen.drawMany(15)) {
+        for (const auto& r : store.similaritySearchVector(q, 10)) ASSERT_EQ(gone.count(annKey(r)), 0u);
+        // tombstones would score 0.0, which beats any negative cosine
+        for (const auto& r : store.similaritySearchVector(q, 250, "", -1.0f)) ASSERT_EQ(gone.count(annKey(r)), 0u);
+    }
+    RecallReport report = store.recallCheck(gen.drawMany(40));
+    ASSERT_GE(report.recall, ANN_RECALL_FLOOR);
+    ASSERT_EQ(store.annStats().builds, 1u);  // the index followed the compaction, it was not retrained
+    ASSERT_EQ(store.count(), 4000u - gone.size());
+    ASSERT_FALSE(store.remove(NodeRef("doc", "0")));
+}
+
+TEST(ann_pending_rows_fold_and_heavy_churn_retrains) {
+    ClusteredData gen(40, 32, 10);
+    auto data = gen.drawMany(3000);
+    EmbeddingStore store;
+    store.enableAnn(annOptions());
+    fillStore(store, data);
+    store.buildAnnIndex();
+    ASSERT_EQ(store.annStats().builds, 1u);
+
+    auto extra = gen.drawMany(700);
+    for (size_t i = 0; i < extra.size(); ++i) store.add(NodeRef("late", std::to_string(i)), "", extra[i]);
+    ASSERT_EQ(store.annStats().pending, 700u);
+    store.similaritySearchVector(extra[0], 5);  // >= 512 pending: folded
+    ASSERT_EQ(store.annStats().pending, 0u);
+    ASSERT_EQ(store.annStats().builds, 1u);
+
+    auto more = gen.drawMany(1200);
+    for (size_t i = 0; i < more.size(); ++i) store.add(NodeRef("later", std::to_string(i)), "", more[i]);
+    store.similaritySearchVector(more[0], 5);  // churn 1900 > 50% of 3000
+    ASSERT_EQ(store.annStats().builds, 2u);
+    ASSERT_EQ(store.annStats().trainedN, 4900u);
+    ASSERT_GE(store.recallCheck(gen.drawMany(30)).recall, ANN_RECALL_FLOOR);
+}
+
+TEST(ann_clear_drops_the_index_and_a_new_dimension_rebuilds) {
+    ClusteredData gen(15, 16, 11);
+    auto data = gen.drawMany(1500);
+    EmbeddingStore store;
+    store.enableAnn(annOptions(16, 4, 0));
+    fillStore(store, data);
+    store.buildAnnIndex();
+    ASSERT_TRUE(store.annStats().active);
+    store.clear();
+    ASSERT_TRUE(store.similaritySearchVector(data[0], 5).empty());
+    ASSERT_FALSE(store.annStats().active);
+
+    store.clear(/*resetDimension=*/true);
+    ClusteredData small(12, 8, 12);
+    auto fresh = small.drawMany(1200);
+    fillStore(store, fresh);
+    auto res = store.similaritySearchVector(fresh[5], 5);
+    ASSERT_EQ(annKey(res[0]), "doc:5");
+    ASSERT_TRUE(store.annStats().active);
+    ASSERT_EQ(*store.dimension(), 8u);
+}
+
+TEST(ann_node_type_filter_widens_instead_of_returning_a_short_list) {
+    ClusteredData gen(40, 32, 13);
+    auto data = gen.drawMany(4000);
+    auto typeOf = [](size_t i) { return std::string(i % 200 == 0 ? "rare" : "common"); };
+    EmbeddingStore store;
+    store.enableAnn(annOptions(64, 2, 0));
+    fillStore(store, data, typeOf);
+    EmbeddingStore reference = plainStore(data, typeOf);
+    auto q = gen.draw();
+
+    auto common = store.similaritySearchVector(q, 10, "common");
+    ASSERT_EQ(common.size(), 10u);
+    for (const auto& r : common) ASSERT_EQ(r.node_ref.type, "common");
+
+    // 20 rare rows in the whole store, a k of 15: two probed cells cannot hold 15
+    // of them, so the probe must widen (ending in the full scan)
+    AnnStats before = store.annStats();
+    auto rare = store.similaritySearchVector(q, 15, "rare", -1.0f);
+    ASSERT_EQ(rare.size(), 15u);
+    for (const auto& r : rare) ASSERT_EQ(r.node_ref.type, "rare");
+    ASSERT_EQ(rare.size(), reference.similaritySearchVector(q, 15, "rare", -1.0f).size());
+    AnnStats after = store.annStats();
+    ASSERT_TRUE(after.widenedSearches > before.widenedSearches || after.exactSearches > before.exactSearches);
+    ASSERT_TRUE(store.similaritySearchVector(q, 5, "nope").empty());
+}
+
+TEST(ann_threshold_is_respected) {
+    ClusteredData gen(40, 32, 14);
+    auto data = gen.drawMany(4000);
+    EmbeddingStore store;
+    store.enableAnn(annOptions());
+    fillStore(store, data);
+    auto q = gen.draw();
+    float best = store.similaritySearchVector(q, 1, "", 0.0f, true)[0].score;
+    for (const auto& r : store.similaritySearchVector(q, 10, "", best - 1e-3f)) ASSERT_GE(r.score, best - 1e-3f);
+    ASSERT_TRUE(store.similaritySearchVector(q, 10, "", 2.0f).empty());
+    // fewer than k above a threshold: the same short list as the scan
+    float cut = store.similaritySearchVector(q, 10, "", 0.0f, true)[4].score;
+    auto got = annKeys(store.similaritySearchVector(q, 10, "", cut));
+    auto want = annKeys(store.similaritySearchVector(q, 10, "", cut, true));
+    ASSERT_EQ(std::set<std::string>(got.begin(), got.end()), std::set<std::string>(want.begin(), want.end()));
+}
+
+TEST(ann_zero_query_and_unbounded_k_use_the_exact_scan) {
+    ClusteredData gen(40, 32, 15);
+    auto data = gen.drawMany(2000);
+    EmbeddingStore store;
+    store.enableAnn(annOptions());
+    fillStore(store, data);
+    auto zero = store.similaritySearchVector(std::vector<float>(32, 0.0f), 5, "", 0.0f);
+    ASSERT_EQ(zero.size(), 5u);
+    for (const auto& r : zero) ASSERT_EQ(r.score, 0.0f);
+    // asking for at least every row cannot be narrowed by an index
+    AnnStats before = store.annStats();
+    ASSERT_EQ(store.similaritySearchVector(gen.draw(), 2000, "", -1.0f).size(), 2000u);
+    ASSERT_EQ(store.similaritySearchVector(gen.draw(), std::numeric_limits<size_t>::max(), "", -1.0f).size(), 2000u);
+    ASSERT_EQ(store.annStats().approximateSearches, before.approximateSearches);
+    ASSERT_TRUE(store.similaritySearchVector(gen.draw(), 0).empty());
+}
+
+TEST(ann_nprobe_can_be_changed_and_recall_follows) {
+    ClusteredData gen(40, 32, 16);
+    auto data = gen.drawMany(4000);
+    EmbeddingStore store;
+    store.enableAnn(annOptions(64, 1, 0));
+    fillStore(store, data);
+    auto queries = gen.drawMany(60);
+    double narrow = store.recallCheck(queries).recall;
+    store.setAnnNprobe(16);
+    ASSERT_EQ(store.annStats().nprobe, 16u);
+    double wide = store.recallCheck(queries).recall;
+    ASSERT_GE(wide, narrow);
+    ASSERT_GE(wide, ANN_RECALL_FLOOR);
+}
+
+TEST(ann_recall_check_arguments_and_text_queries) {
+    ClusteredData gen(40, 32, 17);
+    auto data = gen.drawMany(1500);
+    EmbeddingStore store(std::make_shared<MockEncoder>(32));
+    store.enableAnn(annOptions(16, 4, 0));
+    fillStore(store, data);
+    ASSERT_THROWS(store.recallCheck(gen.drawMany(2), 0), EmbeddingError);
+    ASSERT_EQ(store.recallCheck(gen.drawMany(3)).queries, 3u);
+    RecallReport texts = store.recallCheckTexts({"alpha", "beta", "gamma"}, 5);
+    ASSERT_EQ(texts.queries, 3u);
+    ASSERT_EQ(texts.k, 5u);
+    ASSERT_TRUE(texts.recall >= 0.0 && texts.recall <= 1.0);
+
+    EmbeddingStore off = plainStore(data);
+    RecallReport r = off.recallCheck(gen.drawMany(3));
+    ASSERT_EQ(r.recall, 1.0);
+    ASSERT_FALSE(r.approximate);
+}
+
+TEST(ann_does_not_change_what_is_saved_or_the_graph_digest) {
+    ClusteredData gen(20, 16, 18);
+    auto data = gen.drawMany(1200);
+
+    auto build = [&](bool withAnn) {
+        SemanticGraph graph("g", nullptr, false, {"name"}, ModelMismatchMode::Warn, std::nullopt,
+                            withAnn ? std::optional<AnnOptions>(annOptions(16, 4, 0)) : std::nullopt);
+        for (size_t i = 0; i < data.size(); ++i) {
+            graph.addNode("item", std::to_string(i), {{"name", "n" + std::to_string(i)}});
+            graph.embeddingStore().add(NodeRef("item", std::to_string(i)), "n" + std::to_string(i), data[i]);
+        }
+        return graph;
+    };
+    SemanticGraph plain = build(false);
+    SemanticGraph indexed = build(true);
+    indexed.embeddingStore().buildAnnIndex();
+    ASSERT_TRUE(indexed.embeddingStore().annStats().active);
+    indexed.similaritySearchVector(data[3], 5);
+
+    ASSERT_EQ(graphDigest(plain.graph()), graphDigest(indexed.graph()));
+    ASSERT_EQ(plain.embeddingStore().toJson(), indexed.embeddingStore().toJson());
+
+    TempDir dir;
+    std::string a = dir.file("plain.ison"), b = dir.file("indexed.ison");
+    plain.save(a);
+    indexed.save(b);
+    ASSERT_EQ(readWhole(a), readWhole(b));
+    std::string sideA = readWhole(SemanticGraph::embeddingsPathFor(a));
+    std::string sideB = readWhole(SemanticGraph::embeddingsPathFor(b));
+    ASSERT_EQ(sideA, sideB);
+    ASSERT_TRUE(sideA.find("ivf") == std::string::npos && sideA.find("nlist") == std::string::npos);
+
+    // and a graph loaded from either sidecar searches the same with the index on
+    SemanticGraph loaded = SemanticGraph::load(b, nullptr, "auto", true, false, {"name"});
+    ASSERT_EQ(loaded.embeddingStore().count(), 1200u);
+    ASSERT_FALSE(loaded.embeddingStore().annStats().enabled);  // never persisted
+    loaded.embeddingStore().enableAnn(annOptions(16, 16, 0));
+    ASSERT_EQ(annKeys(loaded.similaritySearchVector(data[9], 8, "", -1.0f)),
+              annKeys(plain.similaritySearchVector(data[9], 8, "", -1.0f)));
+}
+
+TEST(ann_through_the_graph_node_filter_and_exact_flag) {
+    ClusteredData gen(40, 32, 19);
+    auto data = gen.drawMany(3000);
+    SemanticGraph graph("g", nullptr, false, {"name"}, ModelMismatchMode::Warn, std::nullopt,
+                        std::optional<AnnOptions>(annOptions(48, 6, 0)));
+    for (size_t i = 0; i < data.size(); ++i) {
+        graph.addNode("item", std::to_string(i), {{"group", static_cast<int>(i % 50)}});
+        graph.embeddingStore().add(NodeRef("item", std::to_string(i)), "", data[i]);
+    }
+    auto q = gen.draw();
+
+    auto plainHits = graph.similaritySearchVector(q, 5);
+    ASSERT_EQ(plainHits.size(), 5u);
+    ASSERT_GE(graph.embeddingStore().annStats().approximateSearches, 1u);
+
+    AnnStats before = graph.embeddingStore().annStats();
+    graph.similaritySearchVector(q, 5, "", 0.0f, NodeFilterOptions(), /*exact=*/true);
+    ASSERT_EQ(graph.embeddingStore().annStats().approximateSearches, before.approximateSearches);
+
+    // 1 node in 50 passes the filter: the 6 probed cells hold few of them, so the
+    // search must widen and still hand back k (the same k the full scan finds)
+    NodeFilterOptions filter;
+    filter.nodeFilter = [](const Node& n) { return n.properties.at("group").as_int() == 7; };
+    auto filtered = graph.similaritySearchVector(q, 10, "", -1.0f, filter);
+    auto truth = graph.similaritySearchVector(q, 10, "", -1.0f, filter, /*exact=*/true);
+    ASSERT_EQ(filtered.size(), 10u);
+    ASSERT_EQ(truth.size(), 10u);
+    for (const auto& r : filtered) {
+        ASSERT_EQ(graph.graph().getNode(r.node_ref.type, r.node_ref.id).properties.at("group").as_int(), 7);
+    }
+
+    auto near = graph.similarToNode(NodeRef("item", "3"), 5);
+    ASSERT_EQ(near.size(), 5u);
+    for (const auto& r : near) ASSERT_NE(r.node_ref.id, "3");
+    ASSERT_TRUE(graph.recallCheck(gen.drawMany(20)).recall >= ANN_RECALL_FLOOR);
+}
+
+TEST(ann_store_survives_copy_and_move) {
+    ClusteredData gen(20, 16, 20);
+    auto data = gen.drawMany(1500);
+    EmbeddingStore store;
+    store.enableAnn(annOptions(16, 16, 0));
+    fillStore(store, data);
+    store.buildAnnIndex();
+    auto q = gen.draw();
+    auto want = annKeys(store.similaritySearchVector(q, 10, "", -1.0f));
+
+    EmbeddingStore copy = store;  // the copy's vectors live elsewhere: it rebuilds lazily
+    ASSERT_FALSE(copy.annStats().active);
+    ASSERT_TRUE(copy.annStats().enabled);
+    ASSERT_EQ(annKeys(copy.similaritySearchVector(q, 10, "", -1.0f)), want);
+    copy.add(NodeRef("extra", "1"), "", q);
+    ASSERT_EQ(annKey(copy.similaritySearchVector(q, 1)[0]), "extra:1");
+    ASSERT_EQ(store.count(), 1500u);  // the original is untouched
+
+    EmbeddingStore moved = std::move(store);
+    ASSERT_EQ(annKeys(moved.similaritySearchVector(q, 10, "", -1.0f)), want);
+    moved.remove(NodeRef("doc", "0"));
+    ASSERT_EQ(moved.count(), 1499u);
+}
+
+TEST(ann_concurrent_searches_are_safe) {
+    ClusteredData gen(30, 24, 21);
+    auto data = gen.drawMany(3000);
+    EmbeddingStore store;
+    store.enableAnn(annOptions(32, 4, 0));
+    fillStore(store, data);
+    auto queries = gen.drawMany(40);
+    std::atomic<int> bad{0};
+    auto reader = [&](int seed) {
+        for (int i = 0; i < 100; ++i) {
+            auto res = store.similaritySearchVector(queries[(i + seed) % 40], 8, "", -1.0f);
+            std::set<std::string> seen;
+            bool ok = res.size() == 8;
+            for (size_t j = 0; j < res.size(); ++j) {
+                ok = ok && seen.insert(annKey(res[j])).second && (j == 0 || res[j - 1].score >= res[j].score);
+            }
+            if (!ok) ++bad;
+        }
+    };
+    std::vector<std::thread> pool;
+    for (int t = 0; t < 4; ++t) pool.emplace_back(reader, t);
+    for (auto& t : pool) t.join();
+    ASSERT_EQ(bad.load(), 0);
+    ASSERT_EQ(store.annStats().builds, 1u);  // four threads, one lazy build
 }
 
 // =============================================================================

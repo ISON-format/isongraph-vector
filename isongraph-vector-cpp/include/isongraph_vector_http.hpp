@@ -123,8 +123,9 @@ using HttpTransport = std::function<HttpResponse(const HttpRequest&)>;
  *
  * One easy handle per request (no connection reuse - an embeddings call is
  * long next to a TLS handshake). Redirects are not followed, so the API key is
- * never forwarded to another host; only http and https are allowed; the
- * response body is capped at 64 MiB. The first use initialises libcurl
+ * never forwarded to another host; only http and https are allowed; no
+ * `Expect: 100-continue` is sent; the response body is capped at 64 MiB (a
+ * larger one is an HttpError). The first use initialises libcurl
  * globally (curl_global_init is not thread-safe before that point, so make a
  * first call from one thread before going concurrent).
  */
@@ -143,18 +144,24 @@ public:
         std::unique_ptr<CURL, void (*)(CURL*)> easy(raw, curl_easy_cleanup);
 
         curl_slist* rawList = nullptr;
-        for (const auto& [name, value] : request.headers) {
-            std::string line = name + ": " + value;
+        auto appendHeader = [&](const std::string& line) {
             curl_slist* next = curl_slist_append(rawList, line.c_str());
             if (next == nullptr) {
                 curl_slist_free_all(rawList);
                 throw HttpError("out of memory building request headers");
             }
             rawList = next;
-        }
+        };
+        for (const auto& [name, value] : request.headers) appendHeader(name + ": " + value);
+        // "Expect:" with no value stops libcurl asking for a 100-continue before
+        // a large body: servers that do not answer it would stall the request
+        // for a second, and an embeddings call gains nothing from the handshake.
+        appendHeader("Expect:");
         std::unique_ptr<curl_slist, void (*)(curl_slist*)> list(rawList, curl_slist_free_all);
 
         HttpResponse response;
+        BodySink sink;
+        sink.body = &response.body;
         char errorBuffer[CURL_ERROR_SIZE] = {0};
 
         auto set = [&](CURLoption option, auto value) {
@@ -183,11 +190,14 @@ public:
         set(CURLOPT_ACCEPT_ENCODING, "");
         set(CURLOPT_ERRORBUFFER, errorBuffer);
         set(CURLOPT_WRITEFUNCTION, &CurlTransport::onBody);
-        set(CURLOPT_WRITEDATA, &response.body);
+        set(CURLOPT_WRITEDATA, &sink);
         set(CURLOPT_HEADERFUNCTION, &CurlTransport::onHeader);
         set(CURLOPT_HEADERDATA, &response.headers);
 
         CURLcode rc = curl_easy_perform(easy.get());
+        if (rc != CURLE_OK && sink.overflowed) {
+            throw HttpError("HTTP response body exceeds the 64 MiB limit");
+        }
         if (rc != CURLE_OK) {
             // libcurl's own text: names the failure and the host, never a header.
             throw HttpError(std::string("HTTP request failed: ") +
@@ -212,11 +222,19 @@ private:
         ~GlobalInit() { curl_global_cleanup(); }
     };
 
+    struct BodySink {
+        std::string* body = nullptr;
+        bool overflowed = false;
+    };
+
     static size_t onBody(char* data, size_t size, size_t count, void* userdata) {
-        auto* body = static_cast<std::string*>(userdata);
+        auto* sink = static_cast<BodySink*>(userdata);
         size_t bytes = size * count;
-        if (body->size() + bytes > MAX_BODY_BYTES) return 0;  // aborts the transfer
-        body->append(data, bytes);
+        if (sink->body->size() + bytes > MAX_BODY_BYTES) {
+            sink->overflowed = true;
+            return 0;  // aborts the transfer
+        }
+        sink->body->append(data, bytes);
         return bytes;
     }
 

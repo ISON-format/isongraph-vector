@@ -1,0 +1,89 @@
+{
+  "all_threads": 32,
+  "budget": 3.0,
+  "build": {
+    "first_exact_query_ms": 2.1896,
+    "ingest_s": 0.0482919
+  },
+  "d": 100,
+  "ds": "glove",
+  "exps": [
+    "core"
+  ],
+  "first_exact_query_ms": 2.1896,
+  "int8_rerank": 0,
+  "k": 10,
+  "knob_name": "",
+  "mem_after_first_exact_query": {
+    "peak_mb": 64.42578125,
+    "rss_mb": 60.61328125
+  },
+  "mem_after_ingest": {
+    "peak_mb": 64.42578125,
+    "rss_mb": 58.96875
+  },
+  "mem_after_sweep": {
+    "peak_mb": 66.9453125,
+    "rss_mb": 63.48046875
+  },
+  "mem_baseline": {
+    "peak_mb": 5.7265625,
+    "rss_mb": 5.7265625
+  },
+  "mem_end": {
+    "peak_mb": 66.9453125,
+    "rss_mb": 63.50390625
+  },
+  "mode": "exact",
+  "n": 100000,
+  "queries": 1000,
+  "raw_vectors_mb": 38.14697265625,
+  "ref_knob": null,
+  "started": "SystemTime { intervals: 134393543669655366 }",
+  "status": "ok",
+  "sweep": [
+    {
+      "auto_threads": {
+        "median_ms": 1.3327,
+        "p99_ms": 3.0884,
+        "qps": 648.0928022230088,
+        "runs": [
+          621.9519688884707,
+          648.0928022230088,
+          747.8636154030607
+        ]
+      },
+      "batch": {
+        "nq": 1000,
+        "qps_batch": 10014.892144619049,
+        "qps_batch_max": 10686.283834110403,
+        "qps_batch_min": 9957.41214824197,
+        "qps_batch_runs": [
+          10686.283834110403,
+          9957.41214824197,
+          10014.892144619049
+        ],
+        "recall": 1.0,
+        "threads": 32
+      },
+      "knob": null,
+      "max_ms": 8.0916,
+      "mean_ms": 2.3622259333333284,
+      "median_ms": 2.2108000000000003,
+      "nq": 1000,
+      "p95_ms": 3.9519,
+      "p99_ms": 5.4615,
+      "qps_1t": 411.6460428568818,
+      "qps_1t_max": 495.9394215947801,
+      "qps_1t_min": 378.64000839066233,
+      "qps_1t_runs": [
+        495.9394215947801,
+        378.64000839066233,
+        411.6460428568818
+      ],
+      "recall": 1.0
+    }
+  ],
+  "system": "rust_exact",
+  "version": "isongraph-vector-rs HEAD (cargo release, default flags)"
+}

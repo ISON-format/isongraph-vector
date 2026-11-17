@@ -1,0 +1,89 @@
+{
+  "all_threads": 32,
+  "budget": 3.0,
+  "build": {
+    "first_exact_query_ms": 2.3133,
+    "ingest_s": 0.052445
+  },
+  "d": 128,
+  "ds": "sift",
+  "exps": [
+    "core"
+  ],
+  "first_exact_query_ms": 2.3133,
+  "int8_rerank": 0,
+  "k": 10,
+  "knob_name": "",
+  "mem_after_first_exact_query": {
+    "peak_mb": 77.484375,
+    "rss_mb": 70.9765625
+  },
+  "mem_after_ingest": {
+    "peak_mb": 77.484375,
+    "rss_mb": 69.984375
+  },
+  "mem_after_sweep": {
+    "peak_mb": 78.0625,
+    "rss_mb": 74.08203125
+  },
+  "mem_baseline": {
+    "peak_mb": 5.85546875,
+    "rss_mb": 5.85546875
+  },
+  "mem_end": {
+    "peak_mb": 78.0625,
+    "rss_mb": 74.10546875
+  },
+  "mode": "exact",
+  "n": 100000,
+  "queries": 1000,
+  "raw_vectors_mb": 48.828125,
+  "ref_knob": null,
+  "started": "SystemTime { intervals: 134393585175266885 }",
+  "status": "ok",
+  "sweep": [
+    {
+      "auto_threads": {
+        "median_ms": 0.5863,
+        "p99_ms": 1.4699,
+        "qps": 1545.8127102595142,
+        "runs": [
+          1681.0469022172006,
+          1528.8595945800696,
+          1545.8127102595142
+        ]
+      },
+      "batch": {
+        "nq": 1000,
+        "qps_batch": 28197.44982263804,
+        "qps_batch_max": 29288.065698988972,
+        "qps_batch_min": 26724.96271867701,
+        "qps_batch_runs": [
+          29288.065698988972,
+          28197.44982263804,
+          26724.96271867701
+        ],
+        "recall": 1.0,
+        "threads": 32
+      },
+      "knob": null,
+      "max_ms": 5.0104,
+      "mean_ms": 2.1788779333333332,
+      "median_ms": 2.1234,
+      "nq": 1000,
+      "p95_ms": 2.6664000000000003,
+      "p99_ms": 3.0552,
+      "qps_1t": 470.53002242687194,
+      "qps_1t_max": 477.2361915883782,
+      "qps_1t_min": 431.7840748015824,
+      "qps_1t_runs": [
+        477.2361915883782,
+        431.7840748015824,
+        470.53002242687194
+      ],
+      "recall": 1.0
+    }
+  ],
+  "system": "rust_exact",
+  "version": "isongraph-vector-rs HEAD (cargo release, default flags)"
+}

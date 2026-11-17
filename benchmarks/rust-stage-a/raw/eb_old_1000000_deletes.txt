@@ -1,0 +1,5 @@
+old: n=1000000 d=384 queries=2000 nprobe=128 has_batch=false
+  delete 10000 (never_searched): 978119/s = 1022 ns each
+  delete 10000 (after_exact_search): 535240/s = 1868 ns each
+  delete 10000 (ivf_built): 567585/s = 1762 ns each
+wrote D:/Goldmine/ISON/ison_dev/isongraphossworking/isongraph-vector/benchmarks/rust-stage-a/raw/eb_old_1000000_deletes.json

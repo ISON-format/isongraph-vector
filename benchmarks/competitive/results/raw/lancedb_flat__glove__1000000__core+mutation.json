@@ -1,0 +1,118 @@
+{
+ "system": "lancedb_flat",
+ "ds": "glove",
+ "n": 1000000,
+ "d": 100,
+ "k": 10,
+ "queries": 2000,
+ "all_threads": 32,
+ "exps": [
+  "core",
+  "mutation"
+ ],
+ "started": "2026-11-16 10:32:54",
+ "mem_baseline": {
+  "rss_mb": 35.12109375,
+  "peak_mb": 35.12109375
+ },
+ "version": "lancedb 0.41.0",
+ "build": {
+  "ingest_s": 0.8012462998158298,
+  "index_s": 1.800013706088066e-06,
+  "total_s": 0.8012480998295359,
+  "first_query_ms": 156.952099991031,
+  "ready_s": 0.9582001998205669
+ },
+ "mem_after_build": {
+  "rss_mb": 128.203125,
+  "peak_mb": 158.734375
+ },
+ "mem_after_first_query": {
+  "rss_mb": 141.90625,
+  "peak_mb": 286.6875
+ },
+ "sweep": [
+  {
+   "nq": 30,
+   "recall_queries": 30,
+   "recall": 1.0,
+   "qps_1t_runs": [
+    2.8897626910166934
+   ],
+   "qps_1t": 2.8897626910166934,
+   "qps_1t_min": 2.8897626910166934,
+   "qps_1t_max": 2.8897626910166934,
+   "median_ms": 345.8859999955166,
+   "p95_ms": 384.75180996756535,
+   "p99_ms": 392.7767049934482,
+   "mean_ms": 346.0491766706885,
+   "knob": null
+  }
+ ],
+ "knob_name": "nprobes",
+ "loop_allthreads": {
+  "nq": 30,
+  "threads": 32,
+  "qps": 9.45213711840502,
+  "median_ms": 105.48774999915622,
+  "p95_ms": 124.36967001412992,
+  "p99_ms": 137.11867800157052,
+  "mean_ms": 106.23351222214599
+ },
+ "mem_after_sweep": {
+  "rss_mb": 170.53515625,
+  "peak_mb": 305.52734375
+ },
+ "ref_knob": null,
+ "ref_recall_pre": 1.0,
+ "mutation": {
+  "ref_knob": null,
+  "recall_before": 1.0,
+  "insert_10k": {
+   "seconds": 0.0704729999997653,
+   "per_s": 141898.3156674656,
+   "batch": 1000
+  },
+  "update_10k": {
+   "seconds": 1.495726499997545,
+   "per_s": 6685.7142666232185,
+   "batch": 1000
+  },
+  "delete_10k": {
+   "seconds": 1.3979403999983333,
+   "per_s": 7153.380787916225,
+   "batch": 1000
+  },
+  "mem_after": {
+   "rss_mb": 176.37890625,
+   "peak_mb": 305.52734375
+  },
+  "first_query_after_ms": 272.6897999527864,
+  "after": {
+   "nq": 30,
+   "recall_queries": 30,
+   "recall": 1.0,
+   "qps_1t_runs": [
+    2.267650244375897
+   ],
+   "qps_1t": 2.267650244375897,
+   "qps_1t_min": 2.267650244375897,
+   "qps_1t_max": 2.267650244375897,
+   "median_ms": 440.3876999858767,
+   "p95_ms": 467.7804049686529,
+   "p99_ms": 483.53027496719733,
+   "mean_ms": 440.98511332607205
+  },
+  "recall_after": 1.0
+ },
+ "mem_end": {
+  "rss_mb": 194.81640625,
+  "peak_mb": 336.40625
+ },
+ "status": "ok",
+ "finished": "2026-11-16 10:33:46",
+ "load_before_pct": 12.109374999999995,
+ "load_contaminated": false,
+ "wall_s": 52.0783486366272,
+ "flag": null
+}

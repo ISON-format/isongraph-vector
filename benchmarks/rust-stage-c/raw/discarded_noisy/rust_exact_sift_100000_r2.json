@@ -1,0 +1,89 @@
+{
+  "all_threads": 32,
+  "budget": 3.0,
+  "build": {
+    "first_exact_query_ms": 2.868,
+    "ingest_s": 0.0495233
+  },
+  "d": 128,
+  "ds": "sift",
+  "exps": [
+    "core"
+  ],
+  "first_exact_query_ms": 2.868,
+  "int8_rerank": 0,
+  "k": 10,
+  "knob_name": "",
+  "mem_after_first_exact_query": {
+    "peak_mb": 77.51171875,
+    "rss_mb": 70.96875
+  },
+  "mem_after_ingest": {
+    "peak_mb": 77.51171875,
+    "rss_mb": 69.9765625
+  },
+  "mem_after_sweep": {
+    "peak_mb": 78.0234375,
+    "rss_mb": 73.9296875
+  },
+  "mem_baseline": {
+    "peak_mb": 5.859375,
+    "rss_mb": 5.859375
+  },
+  "mem_end": {
+    "peak_mb": 78.0234375,
+    "rss_mb": 73.953125
+  },
+  "mode": "exact",
+  "n": 100000,
+  "queries": 1000,
+  "raw_vectors_mb": 48.828125,
+  "ref_knob": null,
+  "started": "SystemTime { intervals: 134393547247713928 }",
+  "status": "ok",
+  "sweep": [
+    {
+      "auto_threads": {
+        "median_ms": 1.4118,
+        "p99_ms": 1.981,
+        "qps": 699.8085253893678,
+        "runs": [
+          702.800794699026,
+          673.6521248301644,
+          699.8085253893678
+        ]
+      },
+      "batch": {
+        "nq": 1000,
+        "qps_batch": 11358.679848793254,
+        "qps_batch_max": 13009.99167360533,
+        "qps_batch_min": 11163.916435852694,
+        "qps_batch_runs": [
+          11358.679848793254,
+          11163.916435852694,
+          13009.99167360533
+        ],
+        "recall": 1.0,
+        "threads": 32
+      },
+      "knob": null,
+      "max_ms": 29.884,
+      "mean_ms": 2.5058305000000023,
+      "median_ms": 2.5758,
+      "nq": 1000,
+      "p95_ms": 2.9754,
+      "p99_ms": 3.2007,
+      "qps_1t": 395.1776315550284,
+      "qps_1t_max": 459.4925603100073,
+      "qps_1t_min": 355.78704167379914,
+      "qps_1t_runs": [
+        459.4925603100073,
+        395.1776315550284,
+        355.78704167379914
+      ],
+      "recall": 1.0
+    }
+  ],
+  "system": "rust_exact",
+  "version": "isongraph-vector-rs HEAD (cargo release, default flags)"
+}

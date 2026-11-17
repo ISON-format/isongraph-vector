@@ -1,0 +1,91 @@
+{
+ "system": "numpy_bf",
+ "ds": "text384",
+ "n": 10000,
+ "d": 384,
+ "k": 10,
+ "queries": 2000,
+ "all_threads": 32,
+ "exps": [
+  "core"
+ ],
+ "started": "2026-11-16 08:57:09",
+ "mem_baseline": {
+  "rss_mb": 37.44140625,
+  "peak_mb": 37.44140625
+ },
+ "version": "numpy 2.5.5",
+ "build": {
+  "ingest_s": 0.0029279000009410083,
+  "index_s": 1.200009137392044e-06,
+  "total_s": 0.0029291000100784004,
+  "first_query_ms": 0.8420000085607171,
+  "ready_s": 0.0037711000186391175
+ },
+ "mem_after_build": {
+  "rss_mb": 54.22265625,
+  "peak_mb": 68.875
+ },
+ "mem_after_first_query": {
+  "rss_mb": 54.44140625,
+  "peak_mb": 68.875
+ },
+ "sweep": [
+  {
+   "nq": 2000,
+   "recall_queries": 2000,
+   "recall": 1.0,
+   "qps_1t_runs": [
+    3364.167051224355,
+    3126.0887583616272,
+    3518.481704649937
+   ],
+   "qps_1t": 3364.167051224355,
+   "qps_1t_min": 3126.0887583616272,
+   "qps_1t_max": 3518.481704649937,
+   "median_ms": 0.3035000408999622,
+   "p95_ms": 0.3500199876725674,
+   "p99_ms": 0.4527010128367692,
+   "mean_ms": 0.30045081649829325,
+   "knob": null,
+   "batch": {
+    "recall": 1.0,
+    "qps_batch_runs": [
+     14581.978423595207,
+     14956.87186371766,
+     14689.982611883277
+    ],
+    "qps_batch": 14689.982611883277,
+    "qps_batch_min": 14581.978423595207,
+    "qps_batch_max": 14956.87186371766,
+    "threads": 32
+   }
+  }
+ ],
+ "knob_name": null,
+ "loop_allthreads": {
+  "nq": 2000,
+  "threads": 32,
+  "qps": 6581.068879255676,
+  "median_ms": 0.15139998868107796,
+  "p95_ms": 0.1896050438517705,
+  "p99_ms": 0.23000400455202916,
+  "mean_ms": 0.15553231681891097
+ },
+ "mem_after_sweep": {
+  "rss_mb": 63.44140625,
+  "peak_mb": 369.37890625
+ },
+ "ref_knob": null,
+ "ref_recall_pre": 1.0,
+ "mem_end": {
+  "rss_mb": 59.63671875,
+  "peak_mb": 369.37890625
+ },
+ "status": "ok",
+ "finished": "2026-11-16 08:57:12",
+ "load_before_pct": 3.9468749999999986,
+ "load_contaminated": false,
+ "wall_s": 3.463876724243164,
+ "flag": null
+}

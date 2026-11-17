@@ -1,0 +1,12 @@
+D:\Goldmine\ISON\bench_data\rs_target_stagec\release\examples\stage_c_bench.exe --ds-dir D:\Goldmine\ISON\bench_data\prep/text384 --ds text384 --n 100000 --mode hnsw --exp core --queries 1000 --budget 3 --label rust_hnsw --out D:\Goldmine\ISON\ison_dev\isongraphossworking\isongraph-vector\benchmarks\rust-stage-c\raw\rust_hnsw_text384_100000_r2.json
+rust_hnsw: ds=text384 n=100000 d=384 mode=hnsw int8=0 queries=1000 cpus=32 exps=["core"]
+  ingest 0.11s  rss 169 MB
+  hnsw build 6.82s (stats Some(6.824207)) rss 208 MB (peak 209)
+  hnsw knob=24 recall=0.7816 qps1t=10824 median=0.090ms batch=45957
+  hnsw knob=48 recall=0.8850 qps1t=6040 median=0.163ms batch=27571
+  hnsw knob=64 recall=0.9145 qps1t=4799 median=0.207ms batch=23646
+  hnsw knob=96 recall=0.9476 qps1t=3436 median=0.287ms batch=18790
+  hnsw knob=128 recall=0.9626 qps1t=2742 median=0.366ms batch=14608
+  hnsw knob=192 recall=0.9796 qps1t=1890 median=0.528ms batch=10111
+  hnsw knob=256 recall=0.9863 qps1t=1474 median=0.672ms batch=8043
+  hnsw knob=400 recall=0.9936 qps1t=1051 median=0.962ms batch=5654

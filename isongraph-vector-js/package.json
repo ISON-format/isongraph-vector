@@ -18,7 +18,8 @@
   ],
   "scripts": {
     "test": "vitest run",
-    "test:core": "vitest run src/index.test.js src/http-encoder.test.js"
+    "test:core": "vitest run src/index.test.js src/http-encoder.test.js src/async-encoder.test.js src/ann.test.js",
+    "bench:ann": "node --max-old-space-size=16384 bench/ann.mjs"
   },
   "keywords": [
     "ison",

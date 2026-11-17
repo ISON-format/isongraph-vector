@@ -1,0 +1,142 @@
+{
+ "system": "faiss_flat",
+ "ds": "glove",
+ "n": 1000000,
+ "d": 100,
+ "k": 10,
+ "queries": 2000,
+ "all_threads": 32,
+ "exps": [
+  "core",
+  "mutation",
+  "saveload"
+ ],
+ "started": "2026-11-16 10:31:28",
+ "mem_baseline": {
+  "rss_mb": 34.97265625,
+  "peak_mb": 34.97265625
+ },
+ "version": "faiss-cpu 1.16.0",
+ "build": {
+  "ingest_s": 0.3754827000084333,
+  "index_s": 2.3999600671231747e-06,
+  "total_s": 0.37548509996850044,
+  "first_query_ms": 28.816199977882206,
+  "ready_s": 0.40430129994638264
+ },
+ "mem_after_build": {
+  "rss_mb": 504.5234375,
+  "peak_mb": 639.9921875
+ },
+ "mem_after_first_query": {
+  "rss_mb": 504.6015625,
+  "peak_mb": 639.9921875
+ },
+ "sweep": [
+  {
+   "nq": 149,
+   "recall_queries": 1000,
+   "recall": 1.0,
+   "qps_1t_runs": [
+    42.621622221620804,
+    40.715336211406004,
+    39.77757448303346
+   ],
+   "qps_1t": 40.715336211406004,
+   "qps_1t_min": 39.77757448303346,
+   "qps_1t_max": 42.621622221620804,
+   "median_ms": 24.24780000001192,
+   "p95_ms": 27.131040033418685,
+   "p99_ms": 33.16403796430677,
+   "mean_ms": 24.387610963466567,
+   "knob": null,
+   "batch": {
+    "recall": 1.0,
+    "qps_batch_runs": [
+     638.9404629218408,
+     642.4085076945206,
+     596.8994654130149
+    ],
+    "qps_batch": 638.9404629218408,
+    "qps_batch_min": 596.8994654130149,
+    "qps_batch_max": 642.4085076945206,
+    "threads": 32
+   }
+  }
+ ],
+ "knob_name": null,
+ "loop_allthreads": {
+  "nq": 85,
+  "threads": 32,
+  "qps": 49.72282741778036,
+  "median_ms": 20.405200019013137,
+  "p95_ms": 25.612299994099867,
+  "p99_ms": 29.875211997423346,
+  "mean_ms": 20.80622627240076
+ },
+ "mem_after_sweep": {
+  "rss_mb": 517.64453125,
+  "peak_mb": 639.9921875
+ },
+ "ref_knob": null,
+ "ref_recall_pre": 1.0,
+ "mutation": {
+  "ref_knob": null,
+  "recall_before": 1.0,
+  "insert_10k": {
+   "seconds": 0.004300100030377507,
+   "per_s": 2325527.2968899044,
+   "batch": 1000
+  },
+  "update_10k": {
+   "seconds": 3.943905799998902,
+   "per_s": 2535.5575176270145,
+   "batch": 1000
+  },
+  "delete_10k": {
+   "seconds": 4.188923900015652,
+   "per_s": 2387.247951666688,
+   "batch": 1000
+  },
+  "mem_after": {
+   "rss_mb": 529.20703125,
+   "peak_mb": 639.9921875
+  },
+  "first_query_after_ms": 65.74649998219684,
+  "after": {
+   "nq": 119,
+   "recall_queries": 119,
+   "recall": 1.0,
+   "qps_1t_runs": [
+    37.5394677020512,
+    37.76714183374294,
+    37.35729474198767
+   ],
+   "qps_1t": 37.5394677020512,
+   "qps_1t_min": 37.35729474198767,
+   "qps_1t_max": 37.76714183374294,
+   "median_ms": 26.818200014531612,
+   "p95_ms": 27.768639964051545,
+   "p99_ms": 29.021992003545165,
+   "mean_ms": 26.628402240459575
+  },
+  "recall_after": 1.0
+ },
+ "saveload": {
+  "save_s": 0.6554340000147931,
+  "disk_mb": 389.0992069244385,
+  "load_s": 0.9732154000084847,
+  "first_query_after_load_ms": 66.75289996201172,
+  "time_to_ready_s": 1.0399682999704964
+ },
+ "mem_end": {
+  "rss_mb": 531.0625,
+  "peak_mb": 970.30078125
+ },
+ "status": "ok",
+ "finished": "2026-11-16 10:32:40",
+ "load_before_pct": 9.45937499999999,
+ "load_contaminated": false,
+ "wall_s": 72.60048651695251,
+ "flag": null
+}

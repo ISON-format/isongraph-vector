@@ -342,11 +342,25 @@ every suite asserts that set.
 
 ## Honest limits
 
-- **Search is brute force in every backend**, sqlite-vec included — all of them
-  linear in the number of nodes. This is built for an application's own
-  knowledge graph, not as a vector-database replacement. For vectors on both
-  nodes *and* edges, ANN indexing and link prediction, RudraDB is the right
-  tool; these are not really competitors despite the surface similarity.
+- **Search is exact (brute force) by default**, sqlite-vec included — linear in
+  the number of nodes. Every in-memory store has an opt-in IVF index for large
+  stores. This is built for an application's own knowledge graph, not as a
+  vector-database replacement: measured against faiss, hnswlib and usearch
+  (`benchmarks/competitive/`) the ports are 2-4x slower per query at 100k and
+  about 14x slower at 1M vectors at equal recall, have no batched or concurrent
+  search, and persist vectors as JSON only. They do build indexes 8-25x faster
+  and take inserts and updates far faster than HNSW. For vectors on both
+  nodes *and* edges and link prediction, RudraDB is the right tool; these are
+  not really competitors despite the surface similarity.
+- **Where it does help: multi-hop questions.** On HotpotQA, 2WikiMultihopQA and
+  MuSiQue, graph-aware retrieval found every supporting passage more often than
+  plain vector search (+9 to +51 points at k=10, paired p<0.001), but only when
+  the graph carries real structure: on a randomly relabelled graph the gain
+  disappears, and an independently written personalised-PageRank re-ranker
+  matches it. See `benchmarks/multihop/README.md`.
+- **A separate server package exists** (`isongraph-vector-server`, alpha):
+  multi-tenant HTTP API, tenant-sharding router and read replicas. It has no
+  TLS, failover or write-ahead log.
 - **One embedding per node**, from one text field or a concatenation. No
   multi-vector nodes, no edge embeddings.
 - **`MockEncoder` has no semantic structure.** It exists so tests and demos

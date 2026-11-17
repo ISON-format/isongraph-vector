@@ -1,0 +1,79 @@
+{
+ "system": "lancedb_flat",
+ "ds": "text384",
+ "n": 10000,
+ "d": 384,
+ "k": 10,
+ "queries": 2000,
+ "all_threads": 32,
+ "exps": [
+  "core"
+ ],
+ "started": "2026-11-16 08:57:49",
+ "mem_baseline": {
+  "rss_mb": 37.515625,
+  "peak_mb": 37.515625
+ },
+ "version": "lancedb 0.41.0",
+ "build": {
+  "ingest_s": 0.03669500001706183,
+  "index_s": 1.300009898841381e-06,
+  "total_s": 0.03669630002696067,
+  "first_query_ms": 16.3079000194557,
+  "ready_s": 0.05300420004641637
+ },
+ "mem_after_build": {
+  "rss_mb": 141.32421875,
+  "peak_mb": 183.375
+ },
+ "mem_after_first_query": {
+  "rss_mb": 149.83203125,
+  "peak_mb": 183.375
+ },
+ "sweep": [
+  {
+   "nq": 181,
+   "recall_queries": 1000,
+   "recall": 1.0,
+   "qps_1t_runs": [
+    60.40533849721971,
+    60.93997452638205,
+    61.141338538648114
+   ],
+   "qps_1t": 60.93997452638205,
+   "qps_1t_min": 60.40533849721971,
+   "qps_1t_max": 61.141338538648114,
+   "median_ms": 16.04149997001514,
+   "p95_ms": 18.860060034785416,
+   "p99_ms": 23.160338011803127,
+   "mean_ms": 16.43998821524982,
+   "knob": null
+  }
+ ],
+ "knob_name": "nprobes",
+ "loop_allthreads": {
+  "nq": 219,
+  "threads": 32,
+  "qps": 74.59007392256773,
+  "median_ms": 13.29600001918152,
+  "p95_ms": 14.838460006285459,
+  "p99_ms": 16.455072010867294,
+  "mean_ms": 13.422500151028798
+ },
+ "mem_after_sweep": {
+  "rss_mb": 152.68359375,
+  "peak_mb": 183.375
+ },
+ "ref_knob": null,
+ "ref_recall_pre": 1.0,
+ "mem_end": {
+  "rss_mb": 152.68359375,
+  "peak_mb": 183.375
+ },
+ "status": "ok",
+ "finished": "2026-11-16 08:58:22",
+ "load_before_pct": 4.124999999999997,
+ "load_contaminated": false,
+ "wall_s": 33.28580975532532,
+ "flag": null
+}

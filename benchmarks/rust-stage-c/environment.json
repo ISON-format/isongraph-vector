@@ -1,0 +1,94 @@
+{
+ "when": "2026-11-16 19:00:49",
+ "python": "3.12.7",
+ "platform": "Windows-11-10.0.26300-SP0",
+ "cpu": "Intel Core i9-14900HX (8 P-cores with SMT + 16 E-cores = 24 cores / 32 logical)",
+ "logical_cpus": 32,
+ "ram_gb": 47.7,
+ "ram_available_gb": 14.3,
+ "packages": {
+  "numpy": "2.4.2",
+  "faiss-cpu": "1.9.0",
+  "hnswlib": null,
+  "usearch": "2.26.0",
+  "chromadb": "1.3.5",
+  "lancedb": "0.24.3",
+  "sqlite-vec": "0.1.9",
+  "psutil": "7.0.0",
+  "threadpoolctl": "3.5.0"
+ },
+ "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+ "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)",
+ "rust_build": "cargo build --release --example stage_c_bench (default flags, CARGO_TARGET_DIR=bench_data/rs_target_stagec); AVX2/FMA kernels chosen at run time",
+ "load_sample_per_cpu_pct_15s": [
+  21.8,
+  0.0,
+  31.1,
+  0.0,
+  11.9,
+  0.0,
+  7.8,
+  0.0,
+  0.0,
+  71.8,
+  78.8,
+  0.0,
+  0.0,
+  25.2,
+  23.7,
+  0.0,
+  0.0,
+  30.0,
+  7.2,
+  1.3,
+  26.9,
+  4.9,
+  0.5,
+  1.3,
+  13.6,
+  2.4,
+  0.5,
+  0.5,
+  7.3,
+  0.0,
+  0.2,
+  0.9
+ ],
+ "load_mean_pct": 11.5,
+ "pin_cpu8_pct": 0.0,
+ "top_processes_cpu_pct_5s": [
+  [
+   2586.1,
+   "System Idle Process"
+  ],
+  [
+   103.6,
+   "claude.exe"
+  ],
+  [
+   57.7,
+   "System"
+  ],
+  [
+   38.9,
+   "mc-fw-host.exe"
+  ],
+  [
+   31.0,
+   "python.exe"
+  ],
+  [
+   28.2,
+   "Taskmgr.exe"
+  ],
+  [
+   14.4,
+   "skeleton.test.exe"
+  ],
+  [
+   10.8,
+   "audiodg.exe"
+  ]
+ ],
+ "power": "Power Scheme GUID: 381b4222-f694-41f0-9685-ff5bb260df2e  (Balanced)"
+}

@@ -1,0 +1,45 @@
+{
+  "d": 384,
+  "label": "new",
+  "n": 1000000,
+  "nprobe": 128,
+  "writes": {
+    "after_30k_inserts": {
+      "first_ms": 5.1708,
+      "median_ms": 4.3844,
+      "p99_ms": 8.286999999999999
+    },
+    "after_all": {
+      "first_ms": 5.0542,
+      "median_ms": 4.129,
+      "p99_ms": 5.5055
+    },
+    "before": {
+      "first_ms": 2.0494,
+      "median_ms": 1.6974,
+      "p99_ms": 2.1645000000000003
+    },
+    "before_1t": {
+      "first_ms": 4.2712,
+      "median_ms": 4.3532,
+      "p99_ms": 10.0106
+    },
+    "delete_10k": {
+      "per_s": 994243.3311128566
+    },
+    "insert_30k": {
+      "max_ms": 2.9027,
+      "median_ms": 0.0009,
+      "p99_ms": 0.0065,
+      "per_s": 133099.84662461007,
+      "seconds": 0.2253947
+    },
+    "peak_mb": 1884.51171875,
+    "rss_after_mb": 1691.078125,
+    "rss_built_mb": 1641.1328125,
+    "update_10k": {
+      "max_ms": 2.0961,
+      "per_s": 109151.00167874241
+    }
+  }
+}

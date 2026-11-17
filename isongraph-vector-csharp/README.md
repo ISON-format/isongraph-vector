@@ -323,6 +323,54 @@ search rather than filtering its results.
 `Dispose` closes the connection and clears the ADO.NET pool, so the database
 file is genuinely released and can be moved or deleted.
 
+## Approximate search (opt-in)
+
+Search is exact by default. For a store past a few hundred thousand vectors you
+can opt in to an in-memory IVF-flat index: the vectors are clustered by direction
+and a query scores only the cells nearest to it.
+
+```csharp
+var store = new EmbeddingStore(encoder, ann: AnnMode.Ivf);          // or SemanticGraph(..., ann: AnnMode.Ivf)
+var hits = store.SimilaritySearch("…", topK: 10);                   // from the index (once ≥ 50,000 vectors)
+var truth = store.SimilaritySearch("…", topK: 10, exact: true);     // per-call full scan
+
+RecallReport report = store.RecallCheck(myRealQueries, k: 10);      // recall@10 against the exact scan
+// report.Recall, report.MinRecall, report.AnnMs, report.ExactMs
+store.AnnNprobe = 64;                                               // raise until the recall you need holds
+```
+
+`annNlist` (default about 4 x sqrt(N)), `annNprobe` (default 5% of the cells),
+`annMinSize` (default 50,000; below it every search is exact) and `annSeed`
+(seeds the k-means, so the same data gives the same index) tune it.
+`GetAnnStats()` shows what it is doing; `BuildAnnIndex()` builds it ahead of the
+first search.
+
+It is approximate: a true neighbour in a cell that is not probed is missed, and
+how many depends on how your data clusters, so measure with `RecallCheck` on real
+queries. Scores are the same cosine values the exact scan returns. It applies to
+bounded top-k searches; `topK: null`, `exact: true`, a zero query and
+`ScoreMap` (and so `SemanticMultiHop` with `Blend > 0`) use the exact scan.
+`nodeType`, `threshold` and `nodeFilter` apply to the probed rows; when fewer than
+`topK` survive the probe is widened 4x and retried, ending in the exact scan,
+so a selective filter costs time, not results.
+
+The index is built lazily by the first search, never saved (nothing about it is
+in a graph file or sidecar, and the digest is unchanged), and kept current:
+added and updated vectors are visible at once and folded into cells in batches,
+removed ones never come back, and heavy churn retrains it. It holds its own
+contiguous copy of the vectors, so budget about one extra copy of them. Writes and
+searches share the store's lock, as everywhere else in the store. It is not
+available on `SqliteEmbeddingStore`.
+
+Measured on synthetic clustered 384-d vectors (32 cores, .NET 8, top-10, warm medians):
+1,000,000 vectors, 4,000 cells, built in 11 s - recall@10 0.963 at `nprobe` 1
+(0.7 ms), 0.983 at 64 (4.6 ms), 0.991 at the automatic 200 (10.6 ms), against
+293 ms for this port's exact scan; 100,000 vectors: recall 1.000 from `nprobe` 4
+(0.14 ms) against 26 ms. Real embeddings will differ; use `RecallCheck`.
+
+`bench/IsonGraph.Vector.Bench` measures exact against indexed latency and recall:
+`dotnet run -c Release --project bench/IsonGraph.Vector.Bench`.
+
 ## One format, six languages
 
 The SQLite schema and the portable JSON payload are shared by every port —
@@ -340,8 +388,8 @@ store.FromJson(json);
 
 ## Things that will bite you
 
-- **Search is brute force**, sqlite-vec included: linear in the number of
-  nodes. This is built for an application's own knowledge graph, not as a
+- **Search is brute force** by default, sqlite-vec included: linear in the number of
+  nodes (an opt-in approximate index for the in-memory store is described above). This is built for an application's own knowledge graph, not as a
   vector-database replacement.
 - **One embedding per node**, from one text field or a concatenation. No
   multi-vector nodes, no edge embeddings.
@@ -376,7 +424,7 @@ store.FromJson(json);
 ## Tests
 
 ```bash
-dotnet test        # 222 tests
+dotnet test        # 250 tests
 ```
 
 ## Links

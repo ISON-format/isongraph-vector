@@ -261,9 +261,63 @@ an integral float (`1.0`) or an integer beyond 2^53 may digest differently here.
 When a mismatch is found and the file holds such literals, `loadGraph` warns
 and uses the vectors instead of throwing.
 
+## Approximate search (opt-in)
+
+Search is exact by default. For larger stores, `ann: 'ivf'` answers bounded top-k searches from an in-memory IVF-flat index:
+the vectors are clustered into cells with seeded spherical k-means, and a query
+scores only the `annNprobe` cells nearest to it, with the same cosine formula
+as the exact scan.
+
+```javascript
+import { SemanticGraph, EmbeddingStore } from 'isongraph-vector-js';
+
+const graph = new SemanticGraph({ encoder, ann: 'ivf' });   // also on EmbeddingStore
+graph.similaritySearch(query, 10);                          // approximate once the store is large enough
+graph.similaritySearch(query, 10, undefined, 0, undefined, undefined, true);   // exact: true forces the full scan
+graph.recallCheck(sampleQueries, 10);                       // recall@10 against the exact scan, with timings
+graph.embeddingStore.annStats();                            // cells, pending rows, memory, counters
+```
+
+Options (also `EmbeddingStore`'s second argument): `ann`, `annNlist` (default
+about `4 * sqrt(N)`, between 16 and 65536), `annNprobe` (default 5% of the
+cells; settable later as `store.annNprobe`), `annMinSize` (default 50000: below
+it search stays exact) and `annSeed` (the same data and seed give the same
+index). `annNprobe >= annNlist` is the exact scan.
+
+- **It is approximate.** A true neighbour in an unprobed cell is missed. Run
+  `recallCheck()` on queries from your own workload and raise `annNprobe` until
+  the recall holds; the figure depends on how your data clusters, and a number
+  measured on other data does not transfer.
+- **Scores are exact.** The index chooses the candidates with float32 copies of
+  the vectors; the `topK` it returns are re-scored with the same float64 cosine
+  the exact scan uses, so a score never differs between the two paths.
+- **Lazy, and never persisted.** The first search builds it (or call
+  `buildAnnIndex()` to choose the moment); a saved graph, its sidecar and the
+  graph digest are byte-for-byte what they would be without it. Reload a graph
+  with `loadGraph(path, { ann: 'ivf' })` and it is rebuilt on demand.
+- **Kept current.** New and updated nodes are scored exactly until enough have
+  accumulated to be folded into cells; deletes never come back; the index
+  retrains by itself once churn passes half the trained size. Filters
+  (`nodeType`, `threshold`, `nodeFilter`) are applied to the probed cells, and
+  the probe widens (4x per step, ending in the exact scan) when too few
+  candidates survive, so a selective filter costs time, not results.
+- **Costs memory.** A Float32Array copy of the vectors (4 bytes per component),
+  next to the stored ones, plus about 8 bytes per vector for the cell lists.
+- **Faster to query, slow to build.** Without BLAS the exact scan of 384-d
+  vectors takes about 5 ms at 10k, 50 ms at 100k and 0.5 s at 1M; the index
+  answers in 0.2-3 ms at 10k-100k (recall@10 1.00 at the default probe) and
+  in 1.4-27 ms at 1M (recall 0.75 at `annNprobe` 1, 0.94 at the default 200),
+  on synthetic clustered data. Building it runs k-means in plain JavaScript
+  and takes about 8 s at 10k, 55 s at 100k and 8 min at 1M, so call
+  `buildAnnIndex()` at startup instead of letting the first search pay for it.
+  It is not worth it much below 10k vectors. `isongraph-vector-js/bench/ann.mjs`
+  in the repository reproduces the numbers (`npm run bench:ann`).
+- The index is for the in-memory `EmbeddingStore` (and so for `SemanticGraph`);
+  `SqliteEmbeddingStore` has no `ann` option.
+
 ## Embeddings from an HTTP endpoint
 
-`HttpEncoder` is an `EmbeddingEncoder` that calls an OpenAI-compatible
+`HttpEncoder` is an `AsyncEncoder` (and an `EmbeddingEncoder`) that calls an OpenAI-compatible
 `/v1/embeddings` endpoint or Ollama's `/api/embed`. It uses the platform
 `fetch` - no dependency, no `node:` import, so it lives in the main entry and
 runs on Node 18+ and in a browser.
@@ -273,7 +327,7 @@ search queries alike. Point it at a service you are willing to send that data
 to (a local Ollama keeps it on your machine).
 
 ```javascript
-import { HttpEncoder, EmbeddingStore } from 'isongraph-vector-js';
+import { HttpEncoder, SemanticGraph, EmbeddingStore } from 'isongraph-vector-js';
 
 const encoder = new HttpEncoder({
   url: 'https://api.openai.com/v1/embeddings',   // or http://localhost:11434/api/embed
@@ -282,34 +336,58 @@ const encoder = new HttpEncoder({
   apiKey: process.env.OPENAI_API_KEY,             // sent as a Bearer token
 });
 
-const texts = ['Alice is an engineer', 'Bob plans roadmaps'];
-await encoder.prefetch([...texts, 'engineering']);   // the network calls happen here
+// A graph embeds its nodes over the network with the Async methods - no prefetch.
+const graph = new SemanticGraph({ encoder });
+await graph.addNodeAsync('person', 1, { name: 'Alice is an engineer' });
+await graph.addNodeAsync('person', 2, { name: 'Bob plans roadmaps' });
+const hits = await graph.similaritySearchAsync('engineering', 1);
 
+// The bare store has them too.
 const store = new EmbeddingStore(encoder);
-store.addBatch([[['person', 1], texts[0]], [['person', 2], texts[1]]]);
-store.similaritySearch('engineering', 1);            // served from the prefetched vectors
+await store.addBatchAsync([[['person', 1], 'Alice is an engineer'], [['person', 2], 'Bob plans roadmaps']]);
+await store.similaritySearchAsync('engineering', 1);
 ```
 
 Options: `url`, `model` (also the `modelName` recorded on every vector),
 `api` (`'openai'` default, or `'ollama'`), `apiKey`, `dimension` (otherwise
 learned from the first response; `NaN` until then), `batchSize` (64),
 `timeoutMs` (30000), `headers`, `version`, `maxRetries` (2), `retryDelayMs`
-(500), `maxCacheEntries` (100000) and `fetch` (a replacement for the global).
+(500), `maxCacheEntries` (100000), `concurrency` (1) and `fetch` (a replacement for
+the global).
 429 and 5xx answers, timeouts and network errors are retried a bounded number
 of times with backoff (a `Retry-After` header is honoured, up to 30 s); other
 errors throw an `HttpEncoderError` carrying the HTTP `status`. Errors name the
 endpoint's origin and path, never the API key or the query string.
 
-**It is not synchronous, and `EmbeddingEncoder` is.** The stores call
-`encode` / `encodeBatch` and expect a vector back, so `HttpEncoder` serves those
-from a cache and throws an `HttpEncoderError` for a text it has not fetched.
-Fetch first with `await encoder.prefetch(texts)` (or `encodeAsync` /
-`encodeBatchAsync`, which also return the vectors). In practice that means
-`SemanticGraph` auto-embedding does not work with it - the graph builds the
-text itself and asks for the vector at once - so use it with the stores and
-`autoEmbed: false`, prefetching the texts you pass, or embed with
-`encodeBatchAsync` and hand the vectors in. A bounded cache (`maxCacheEntries`)
-evicts the oldest vectors, so prefetch no more than you are about to use.
+**It is asynchronous, and the Async methods are how you use it.**
+`HttpEncoder` implements `AsyncEncoder` (`encodeAsync` / `encodeBatchAsync`),
+and the store and graph have an `...Async` method wherever the encoder is
+called: `addAsync`, `addBatchAsync`, `similaritySearchAsync` on the store, and
+on the graph `addNodeAsync`, `addNodeWithEmbedAsync`, `updateNodeAsync`,
+`embedNodeAsync`, `embedNodesAsync`, `embedAllNodesAsync`, `reembedStaleAsync`,
+`similaritySearchAsync`, `semanticMultiHopAsync`, `semanticPathAsync`,
+`semanticSubgraphAsync` and `recallCheckAsync`. Each awaits the network and
+then does exactly what its synchronous namesake does, with the same model
+metadata (`modelName` on every vector, `staleEmbeddings()`, `onModelMismatch`)
+and the same key redaction. They also work with any synchronous encoder, and
+`isAsyncEncoder(x)` tells the two kinds apart. Your own encoder can be
+async-only: implement `AsyncEncoder` and pass it where an encoder goes.
+
+Failures are atomic. `addNodeAsync` embeds the text *before* it adds the node,
+`updateNodeAsync` before it changes the properties, and `reembedStaleAsync`
+encodes every stale text before it writes one, so a timeout or a 5xx leaves
+the graph exactly as it was and the call can be retried.
+
+For bulk work, `batchSize` texts go in each request, `concurrency` (default 1:
+one after another) requests run at once, and texts asked for at the same
+moment share a single request.
+
+The synchronous interface is unchanged: `encode` / `encodeBatch` serve from a
+cache and throw an `HttpEncoderError` for a text that has not been fetched, so
+the prefetch workflow (`await encoder.prefetch(texts)`, then `addNode`,
+`addBatch`, `similaritySearch`) still works. Every `...Async` call fills that
+cache too. A bounded cache (`maxCacheEntries`) evicts the oldest vectors, so
+prefetch no more than you are about to use.
 
 ## One format, six languages
 
@@ -327,18 +405,19 @@ store.importEmbeddings(payload);
 
 ## Things that will bite you
 
-- **Search is brute force**, sqlite-vec included: linear in the number of
-  nodes. This is built for an application's own knowledge graph, not as a
-  vector-database replacement.
+- **Search is brute force** unless you opt into `ann: 'ivf'` (sqlite-vec is
+  exact too): linear in the number of nodes. This is built for an application's
+  own knowledge graph, not as a vector-database replacement.
 - **One embedding per node**, from one text field or a concatenation. No
   multi-vector nodes, no edge embeddings.
 - **`MockEncoder` has no semantic structure.** Use it to test plumbing, never
-  to judge relevance quality. For real vectors use `HttpEncoder` (below,
-  prefetch-then-search) or implement `EmbeddingEncoder` over the model of your
-  choice.
+  to judge relevance quality. For real vectors use `HttpEncoder` (below, with
+  the `...Async` methods) or implement `EmbeddingEncoder` / `AsyncEncoder` over
+  the model of your choice.
 - **`HttpEncoder` sends your texts to the endpoint you configure**, and its
-  `encode` only serves texts fetched beforehand - see *Embeddings from an HTTP
-  endpoint*.
+  synchronous `encode` only serves texts fetched beforehand - auto-embedding a
+  graph over the network is `addNodeAsync`, not `addNode`. See *Embeddings from
+  an HTTP endpoint*.
 - **Auto-embed renders typed properties.** Since ISONGraph 1.4.0 a property can
   be a number, a bool or null. Nulls are skipped and booleans render as `true`
   and `false`, so the same graph produces the same text in every port.
@@ -349,8 +428,8 @@ store.importEmbeddings(payload);
 ## Tests
 
 ```bash
-npm test             # 193 tests, needs Node 24 for the SQLite half
-npm run test:core    # 68 tests, main entry only, Node 18 and up
+npm test             # 254 tests, needs Node 24 for the SQLite half
+npm run test:core    # 129 tests, main entry only, Node 18 and up
 ```
 
 ## Links

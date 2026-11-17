@@ -1,0 +1,11 @@
+*
+!pyproject.toml
+!LICENSE
+!README.md
+!isongraph_vector-py
+!isongraph-vector-server
+**/__pycache__
+**/.pytest_cache
+**/*.pyc
+isongraph-vector-server/tests
+isongraph-vector-server/scripts/results

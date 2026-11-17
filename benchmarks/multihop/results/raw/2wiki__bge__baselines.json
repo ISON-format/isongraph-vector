@@ -1,0 +1,8 @@
+{
+ "dataset": "2wiki",
+ "model": "bge",
+ "corpus_size": 9239,
+ "n_questions": 1500,
+ "lib_similarity_search_same_top20_set": "198/200",
+ "seconds": 63.759765625
+}

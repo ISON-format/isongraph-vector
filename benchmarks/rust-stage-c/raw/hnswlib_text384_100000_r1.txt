@@ -1,0 +1,10 @@
+C:\Program Files\Python312\python.exe D:\Goldmine\ISON\ison_dev\isongraphossworking\isongraph-vector\benchmarks\rust-stage-c\bench_c.py --system hnswlib --ds text384 --n 100000 --exp core,mutation,saveload --queries 1000 --budget 3 --out D:\Goldmine\ISON\ison_dev\isongraphossworking\isongraph-vector\benchmarks\rust-stage-c\raw\hnswlib_text384_100000_r1.json
+  hnswlib text384 100000 knob=24 recall=0.7846 qps1t=7766 med=0.123ms batch=38888
+  hnswlib text384 100000 knob=32 recall=0.8282 qps1t=6152 med=0.161ms batch=31684
+  hnswlib text384 100000 knob=48 recall=0.8841 qps1t=4773 med=0.205ms batch=24315
+  hnswlib text384 100000 knob=64 recall=0.9153 qps1t=3843 med=0.265ms batch=20936
+  hnswlib text384 100000 knob=96 recall=0.9486 qps1t=2789 med=0.363ms batch=17613
+  hnswlib text384 100000 knob=128 recall=0.9631 qps1t=2175 med=0.455ms batch=12607
+  hnswlib text384 100000 knob=192 recall=0.9798 qps1t=1572 med=0.635ms batch=8910
+  hnswlib text384 100000 knob=256 recall=0.9863 qps1t=1252 med=0.798ms batch=7220
+  hnswlib text384 100000 knob=400 recall=0.9928 qps1t=863 med=1.174ms batch=4747

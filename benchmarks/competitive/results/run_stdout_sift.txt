@@ -1,0 +1,12 @@
+[11:28:51] START faiss_ivfflat__sift__1000000__core+saveload load_before=12.3%
+[11:31:30] END   faiss_ivfflat__sift__1000000__core+saveload ok 159s
+[11:31:45] START faiss_hnsw__sift__1000000__core+saveload load_before=8.2%
+[11:34:07] END   faiss_hnsw__sift__1000000__core+saveload ok 142s
+[11:34:21] START hnswlib__sift__1000000__core+saveload load_before=9.0%
+[11:35:54] END   hnswlib__sift__1000000__core+saveload ok 94s
+[11:36:09] START numpy_bf__sift__1000000__core load_before=11.1%
+[11:38:16] END   numpy_bf__sift__1000000__core ok 127s
+[11:38:32] START rust_default__sift__1000000__core+saveload load_before=7.6%
+[11:41:53] END   rust_default__sift__1000000__core+saveload ok 202s
+[11:42:06] START cpp_default__sift__1000000__core load_before=12.0%
+[11:43:21] END   cpp_default__sift__1000000__core ok 75s

@@ -1,0 +1,10 @@
+C:\Program Files\Python312\python.exe D:\Goldmine\ISON\ison_dev\isongraphossworking\isongraph-vector\benchmarks\rust-stage-c\bench_c.py --system usearch --ds text384 --n 100000 --exp core,mutation,saveload --queries 1000 --budget 3 --out D:\Goldmine\ISON\ison_dev\isongraphossworking\isongraph-vector\benchmarks\rust-stage-c\raw\usearch_text384_100000_r1.json
+  usearch text384 100000 knob=24 recall=0.7812 qps1t=6608 med=0.146ms batch=42870
+  usearch text384 100000 knob=32 recall=0.8274 qps1t=4881 med=0.194ms batch=37246
+  usearch text384 100000 knob=48 recall=0.8781 qps1t=3984 med=0.238ms batch=28619
+  usearch text384 100000 knob=64 recall=0.9147 qps1t=3062 med=0.313ms batch=25865
+  usearch text384 100000 knob=96 recall=0.9475 qps1t=2145 med=0.445ms batch=20683
+  usearch text384 100000 knob=128 recall=0.9626 qps1t=1730 med=0.554ms batch=15408
+  usearch text384 100000 knob=192 recall=0.9781 qps1t=966 med=0.991ms batch=7087
+  usearch text384 100000 knob=256 recall=0.9854 qps1t=745 med=1.262ms batch=6988
+  usearch text384 100000 knob=400 recall=0.9920 qps1t=663 med=1.494ms batch=5531

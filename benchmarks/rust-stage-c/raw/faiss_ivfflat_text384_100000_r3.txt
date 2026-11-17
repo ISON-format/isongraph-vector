@@ -1,0 +1,7 @@
+C:\Program Files\Python312\python.exe D:\Goldmine\ISON\ison_dev\isongraphossworking\isongraph-vector\benchmarks\rust-stage-c\bench_c.py --system faiss_ivfflat --ds text384 --n 100000 --exp core,mutation,saveload --queries 1000 --budget 3 --out D:\Goldmine\ISON\ison_dev\isongraphossworking\isongraph-vector\benchmarks\rust-stage-c\raw\faiss_ivfflat_text384_100000_r3.json
+  faiss_ivfflat text384 100000 knob=16 recall=0.7507 qps1t=6404 med=0.149ms batch=24186
+  faiss_ivfflat text384 100000 knob=32 recall=0.8399 qps1t=3360 med=0.274ms batch=9888
+  faiss_ivfflat text384 100000 knob=64 recall=0.9073 qps1t=1861 med=0.531ms batch=6004
+  faiss_ivfflat text384 100000 knob=128 recall=0.9553 qps1t=955 med=1.016ms batch=3014
+  faiss_ivfflat text384 100000 knob=256 recall=0.9855 qps1t=647 med=1.593ms batch=2206
+  faiss_ivfflat text384 100000 knob=512 recall=0.9958 qps1t=320 med=3.012ms batch=1118

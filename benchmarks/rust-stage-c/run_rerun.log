@@ -1,0 +1,70 @@
+skip rust_exact_text384_100000_r1 (done)
+skip numpy_bf_text384_100000_r1 (done)
+skip faiss_flat_text384_100000_r1 (done)
+skip rust_ivf_text384_100000_r1 (done)
+skip faiss_ivfflat_text384_100000_r1 (done)
+skip rust_hnsw_text384_100000_r1 (done)
+skip faiss_hnsw_text384_100000_r1 (done)
+skip hnswlib_text384_100000_r1 (done)
+== usearch_text384_100000_r1  load total 10% pin-cpu 0% noisy=False
+   done in 31s ok=True
+skip rust_ivf_i8x4_text384_100000_r1 (done)
+== rust_hnsw_i8x4_text384_100000_r1  load total 12% pin-cpu 75% noisy=True
+   done in 10s ok=True
+== rust_exact_text384_100000_r2  load total 16% pin-cpu 0% noisy=False
+   done in 18s ok=True
+skip numpy_bf_text384_100000_r2 (done)
+skip faiss_flat_text384_100000_r2 (done)
+== rust_ivf_text384_100000_r2  load total 16% pin-cpu 0% noisy=False
+   done in 29s ok=True
+== faiss_ivfflat_text384_100000_r2  load total 19% pin-cpu 69% noisy=True
+   done in 34s ok=True
+skip rust_hnsw_text384_100000_r2 (done)
+== faiss_hnsw_text384_100000_r2  load total 13% pin-cpu 69% noisy=True
+   done in 23s ok=True
+skip hnswlib_text384_100000_r2 (done)
+== usearch_text384_100000_r2  load total 23% pin-cpu 1% noisy=False
+   done in 34s ok=True
+== rust_exact_text384_100000_r3  load total 18% pin-cpu 83% noisy=True
+   done in 21s ok=True
+skip numpy_bf_text384_100000_r3 (done)
+== faiss_flat_text384_100000_r3  load total 13% pin-cpu 3% noisy=False
+   done in 25s ok=True
+skip rust_ivf_text384_100000_r3 (done)
+== faiss_ivfflat_text384_100000_r3  load total 21% pin-cpu 72% noisy=True
+   done in 32s ok=True
+skip rust_hnsw_text384_100000_r3 (done)
+== faiss_hnsw_text384_100000_r3  load total 13% pin-cpu 0% noisy=False
+   done in 26s ok=True
+skip hnswlib_text384_100000_r3 (done)
+== usearch_text384_100000_r3  load total 11% pin-cpu 62% noisy=True
+   done in 31s ok=True
+== rust_exact_glove_100000_r1  load total 17% pin-cpu 0% noisy=False
+   done in 28s ok=True
+skip numpy_bf_glove_100000_r1 (done)
+== faiss_flat_glove_100000_r1  load total 19% pin-cpu 77% noisy=True
+   done in 12s ok=True
+skip rust_exact_glove_100000_r2 (done)
+== numpy_bf_glove_100000_r2  load total 22% pin-cpu 0% noisy=False
+   done in 13s ok=True
+skip faiss_flat_glove_100000_r2 (done)
+== rust_exact_glove_100000_r3  load total 15% pin-cpu 0% noisy=False
+   done in 8s ok=True
+skip numpy_bf_glove_100000_r3 (done)
+== faiss_flat_glove_100000_r3  load total 18% pin-cpu 95% noisy=True
+   done in 11s ok=True
+skip rust_exact_sift_100000_r1 (done)
+== numpy_bf_sift_100000_r1  load total 16% pin-cpu 0% noisy=False
+   done in 15s ok=True
+skip faiss_flat_sift_100000_r1 (done)
+== rust_exact_sift_100000_r2  load total 14% pin-cpu 0% noisy=False
+   done in 9s ok=True
+skip numpy_bf_sift_100000_r2 (done)
+== faiss_flat_sift_100000_r2  load total 17% pin-cpu 96% noisy=True
+   done in 13s ok=True
+skip rust_exact_sift_100000_r3 (done)
+== numpy_bf_sift_100000_r3  load total 15% pin-cpu 0% noisy=False
+   done in 15s ok=True
+skip faiss_flat_sift_100000_r3 (done)
+== rust_exact_text384_100000_persist_r1  load total 13% pin-cpu 0% noisy=False
+   done in 14s ok=True

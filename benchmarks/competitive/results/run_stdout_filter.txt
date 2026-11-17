@@ -1,0 +1,18 @@
+[11:43:32] START faiss_ivfflat__text384__100000__filter load_before=7.6%
+[11:43:53] END   faiss_ivfflat__text384__100000__filter ok 20s
+[11:44:08] START faiss_hnsw__text384__100000__filter load_before=9.0%
+[11:44:58] END   faiss_hnsw__text384__100000__filter ok 50s
+[11:45:12] START faiss_flat__text384__100000__filter load_before=8.8%
+[11:45:27] END   faiss_flat__text384__100000__filter ok 15s
+[11:45:41] START faiss_ivfflat__glove__100000__filter load_before=9.9%
+[11:45:53] END   faiss_ivfflat__glove__100000__filter ok 12s
+[11:46:07] START faiss_hnsw__glove__100000__filter load_before=7.7%
+[11:46:42] END   faiss_hnsw__glove__100000__filter ok 35s
+[11:46:59] START faiss_flat__glove__100000__filter load_before=8.9%
+[11:47:05] END   faiss_flat__glove__100000__filter ok 7s
+[11:47:20] START faiss_ivfflat__text384__1000000__filter load_before=8.8%
+[11:48:45] END   faiss_ivfflat__text384__1000000__filter ok 85s
+[11:49:02] START faiss_hnsw__text384__1000000__filter load_before=8.9%
+[11:54:17] END   faiss_hnsw__text384__1000000__filter ok 315s
+[11:54:31] START faiss_flat__text384__1000000__filter load_before=13.4%
+[11:54:54] END   faiss_flat__text384__1000000__filter ok 23s

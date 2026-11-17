@@ -1,0 +1,89 @@
+{
+  "all_threads": 32,
+  "budget": 3.0,
+  "build": {
+    "first_exact_query_ms": 1.8423999999999998,
+    "ingest_s": 0.0489373
+  },
+  "d": 100,
+  "ds": "glove",
+  "exps": [
+    "core"
+  ],
+  "first_exact_query_ms": 1.8423999999999998,
+  "int8_rerank": 0,
+  "k": 10,
+  "knob_name": "",
+  "mem_after_first_exact_query": {
+    "peak_mb": 64.5078125,
+    "rss_mb": 60.5625
+  },
+  "mem_after_ingest": {
+    "peak_mb": 64.5078125,
+    "rss_mb": 58.921875
+  },
+  "mem_after_sweep": {
+    "peak_mb": 66.8671875,
+    "rss_mb": 63.55078125
+  },
+  "mem_baseline": {
+    "peak_mb": 5.7109375,
+    "rss_mb": 5.7109375
+  },
+  "mem_end": {
+    "peak_mb": 66.8671875,
+    "rss_mb": 63.57421875
+  },
+  "mode": "exact",
+  "n": 100000,
+  "queries": 1000,
+  "raw_vectors_mb": 38.14697265625,
+  "ref_knob": null,
+  "started": "SystemTime { intervals: 134393541816261769 }",
+  "status": "ok",
+  "sweep": [
+    {
+      "auto_threads": {
+        "median_ms": 1.4115,
+        "p99_ms": 2.0872,
+        "qps": 707.6954019543574,
+        "runs": [
+          707.6954019543574,
+          676.8370915389675,
+          710.269142286087
+        ]
+      },
+      "batch": {
+        "nq": 1000,
+        "qps_batch": 10552.029419058019,
+        "qps_batch_max": 10653.961462490599,
+        "qps_batch_min": 10508.396208570648,
+        "qps_batch_runs": [
+          10508.396208570648,
+          10552.029419058019,
+          10653.961462490599
+        ],
+        "recall": 1.0,
+        "threads": 32
+      },
+      "knob": null,
+      "max_ms": 3.7457,
+      "mean_ms": 1.9214546666666632,
+      "median_ms": 1.7194,
+      "nq": 1000,
+      "p95_ms": 2.5465,
+      "p99_ms": 2.7186,
+      "qps_1t": 537.1059367876796,
+      "qps_1t_max": 622.8444133409778,
+      "qps_1t_min": 435.35112047406295,
+      "qps_1t_runs": [
+        622.8444133409778,
+        537.1059367876796,
+        435.35112047406295
+      ],
+      "recall": 1.0
+    }
+  ],
+  "system": "rust_exact",
+  "version": "isongraph-vector-rs HEAD (cargo release, default flags)"
+}

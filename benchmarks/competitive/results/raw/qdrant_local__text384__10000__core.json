@@ -1,0 +1,79 @@
+{
+ "system": "qdrant_local",
+ "ds": "text384",
+ "n": 10000,
+ "d": 384,
+ "k": 10,
+ "queries": 2000,
+ "all_threads": 32,
+ "exps": [
+  "core"
+ ],
+ "started": "2026-11-16 08:59:01",
+ "mem_baseline": {
+  "rss_mb": 37.36328125,
+  "peak_mb": 37.36328125
+ },
+ "version": "qdrant-client 1.20.0 (local mode)",
+ "build": {
+  "ingest_s": 33.30397010000888,
+  "index_s": 1.300009898841381e-06,
+  "total_s": 33.30397140001878,
+  "first_query_ms": 39.89770001498982,
+  "ready_s": 33.34386910003377
+ },
+ "mem_after_build": {
+  "rss_mb": 147.74609375,
+  "peak_mb": 198.59375
+ },
+ "mem_after_first_query": {
+  "rss_mb": 148.328125,
+  "peak_mb": 198.59375
+ },
+ "sweep": [
+  {
+   "nq": 231,
+   "recall_queries": 1000,
+   "recall": 1.0,
+   "qps_1t_runs": [
+    72.99020291564169,
+    73.43907393726488,
+    72.42674590726222
+   ],
+   "qps_1t": 72.99020291564169,
+   "qps_1t_min": 72.42674590726222,
+   "qps_1t_max": 73.43907393726488,
+   "median_ms": 13.216899998951703,
+   "p95_ms": 15.94205998117104,
+   "p99_ms": 22.059979962650694,
+   "mean_ms": 13.7080841274928,
+   "knob": null
+  }
+ ],
+ "knob_name": null,
+ "loop_allthreads": {
+  "nq": 210,
+  "threads": 32,
+  "qps": 79.2029707126397,
+  "median_ms": 12.475349998567253,
+  "p95_ms": 14.004170024418272,
+  "p99_ms": 15.141900998423829,
+  "mean_ms": 12.645105237606913
+ },
+ "mem_after_sweep": {
+  "rss_mb": 149.15625,
+  "peak_mb": 198.59375
+ },
+ "ref_knob": null,
+ "ref_recall_pre": 1.0,
+ "mem_end": {
+  "rss_mb": 146.22265625,
+  "peak_mb": 198.59375
+ },
+ "status": "ok",
+ "finished": "2026-11-16 09:00:05",
+ "load_before_pct": 3.565624999999999,
+ "load_contaminated": false,
+ "wall_s": 63.546509981155396,
+ "flag": null
+}

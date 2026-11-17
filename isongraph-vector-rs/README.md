@@ -246,7 +246,8 @@ get back: `vec0` runs an exact brute-force KNN in C, not an approximate index
 — measured identical ordering and scores within 2e-07 of the scan. Measured
 over 20,000 vectors of 384 dimensions, top-10, median of five runs:
 **19.0 ms** for the SQLite scan, **6.9 ms** through the index, and **9.9 ms**
-for the in-memory store. Recall of the index against the exact scan is
+for the in-memory store as it was then (its scan has since been rewritten; see
+*Searching large stores*). Recall of the index against the exact scan is
 **1.000** — the same answers, faster. Below a few thousand vectors the scan
 wins outright, which is why the index is opt-in.
 
@@ -254,6 +255,110 @@ Top-k results come out of `select_nth_unstable_by` rather than sorting all of
 them, which is where a third of the query time used to go. Filtering by node
 type stays exact too: the type is a `vec0` metadata column, so it narrows the
 search rather than filtering its results.
+
+## Searching large stores
+
+Search is exact unless you switch the approximate index on, and the exact path
+is fast. The vectors live **once**, in one contiguous chunked `f32` matrix that
+is the store itself (a record is a row of it; there is no second copy, about
+1.1x the raw vector bytes at a million 384-d vectors). A search is a single pass
+over it: a SIMD dot product per row (AVX2 + FMA when the CPU has them, checked
+at run time), a bounded heap for the top k, and, for a big store, up to eight
+threads of a persistent pool (`set_scan_threads(1)` keeps it on one). Equal
+scores come back in the order the vectors were stored, so a search gives the
+same answer on every run and for any thread count. See `DESIGN.md` for the
+layout, the concurrency model and the write path.
+
+### Many queries, many threads
+
+```rust
+// one call, many queries: ~10x the throughput of a loop on a big store, and
+// every answer is identical (ids, scores, order) to the one-query call
+let answers = store.similarity_search_vector_batch(&queries, 10, None, 0.0)?;
+let by_text = store.similarity_search_batch(&["first", "second"], 10, None, 0.0)?;
+
+// searches take &self, never lock the data, and scale across threads
+std::thread::scope(|s| {
+    for q in &queries { let store = &store; s.spawn(move || store.similarity_search_vector(q, 10, None, 0.0)); }
+});
+
+// readers and a writer on different threads: a reader/writer lock with short write sections
+let shared = SharedEmbeddingStore::new(store);
+let writer = shared.clone();
+std::thread::spawn(move || writer.add(NodeId::new("doc", "9"), "new text", None));
+let hits = shared.similarity_search_vector(&q, 10, None, 0.0)?;   // never sees a half-applied write
+```
+
+Batch calls run on a persistent thread pool shared by all stores (one worker per
+logical CPU; `ISONGRAPH_VECTOR_THREADS=n` or `store.set_search_pool(Some(Arc::new(SearchPool::new(n))))`
+changes it, `set_scan_threads(n)` caps one call). The exact batch scores 16
+queries against each block of rows while it is in cache; with the index on, the
+batch scores each probed cell once for all the queries that probe it.
+
+For stores past a few hundred thousand vectors there is an opt-in approximate
+index, IVF-flat, matching the Python port:
+
+```rust
+use isongraph_vector_rs::{AnnConfig, EmbeddingStore};
+
+graph.set_ann(Some(AnnConfig::default()))?;      // or store.set_ann(..) / EmbeddingStore::with_ann(..)
+let hits = graph.similarity_search("query", 10, None, 0.0)?;      // from the index
+let exact = graph.similarity_search_with(
+    "query",
+    &SimilarityOptions { exact: true, ..Default::default() },     // the full scan
+)?;
+let report = graph.recall_check(&my_queries, 10, None, 0.0)?;      // measure it on YOUR queries
+println!("recall@10 = {:.3}, nprobe {} of {} cells", report.recall, report.nprobe, report.nlist);
+```
+
+Vectors are clustered into `nlist` cells (default about `4 * sqrt(N)`) by a
+seeded spherical k-means, and a query scores only the `nprobe` nearest cells
+(default 5% of them), with the same cosine as the exact scan. It is built by the
+first search that wants it, is never saved (a saved graph, its sidecar and its
+digest are identical with it on or off), and is used only for a bounded `top_k`
+on a store of at least `AnnConfig::min_size` (default 50,000) vectors. Writes
+are visible at once: new and updated vectors are scored exactly until 256 of
+them have piled up, and the write that makes it 256 folds them into their cells
+(a pause of a millisecond or two at a million vectors), so a search never pays
+for a backlog; deletes stop being returned, and heavy churn retrains on the next
+search (call `build_ann_index(true)` yourself, off the hot path, to choose when). A `node_type`, `threshold` or `NodeFilter` applies to the probed rows;
+if fewer than `top_k` survive, the probe widens 4x and tries again, ending in
+the full scan. `build_ann_index`, `ann_stats` and `recall_check` are on both
+`EmbeddingStore` and `SemanticGraph`. The SQLite store has no approximate index
+(load its `export_embeddings` into an in-memory store to use one).
+
+Measured with `examples/ann_bench.rs` on a 32-thread i9-14900HX laptop with
+other work running, 384-d unit vectors, top 10, median of 200 queries
+(synthetic clustered data; the index's recall depends entirely on how your data
+clusters, so measure your own):
+
+| vectors | exact, 1 thread | exact, auto threads | index build | IVF at default nprobe | recall@10 |
+|---|---|---|---|---|---|
+| 10,000 | 0.44 ms | 0.30 ms | 0.07 s | 0.043 ms | 1.000 |
+| 100,000 | 6.8 ms | 3.8 ms | 0.6 s | 0.64 ms | 1.000 |
+| 1,000,000 | 68 ms | 28 ms | 8.3 s | 2.4 ms | 0.993 |
+
+On the harder, overlapping "diffuse" data the same default gives 0.986 recall
+at 100,000 vectors (0.62 ms) and 0.991 at 1,000,000 (2.6 ms); lower `nprobe`
+values are faster and much less accurate there (`nprobe = 16` of 4,000 cells is
+0.30 recall), and below 100,000 vectors the exact scan is usually the better
+choice. Run `cargo run --release --example ann_bench -- --help` to reproduce.
+
+**HNSW (opt-in alternative to IVF).** `AnnConfig::hnsw()` (or `mode: AnnMode::Hnsw`)
+builds a hierarchical navigable small-world graph instead: `m` 16, `ef_construction`
+200, `ef_search` chosen by store size (about 0.95 recall@10 on 384-d text
+embeddings; override with `set_ann_ef_search` or per call with
+`similarity_search_vector_ef`). It stores slot numbers and links only (about 146
+bytes per vector, the whole store 1.18x the raw vectors at 1M x 384), returns the
+exact scan's scores for the hits it finds, links each row as it is written
+(0.5-1.5 ms), tombstones deletes and bridges over them at compaction, and is
+never saved. `AnnConfig::default()` stays IVF, and exact search stays the
+default. The trade: on real text-384 vectors at recall about 0.95 a single query
+is about 4x (100k) to 10x (1M) faster than IVF, but the build is far slower
+(142-170 s at 1M against IVF's 8 s; same graph for any thread count) and IVF's
+big batches stay faster at 100k. `examples/hnsw_bench.rs` sweeps `ef_search`
+(recall against queries per second, build time, memory); `DESIGN.md` section 10
+is the specification.
 
 ## Embedding over HTTP
 
@@ -341,9 +446,14 @@ store.from_json(&json, false)?;
 
 ## Things that will bite you
 
-- **Search is brute force**, sqlite-vec included: linear in the number of
+- **Search is brute force** unless you switch on the opt-in IVF index (see
+  *Searching large stores*), sqlite-vec included: linear in the number of
   nodes. This is built for an application's own knowledge graph, not as a
   vector-database replacement.
+- **The approximate index is approximate.** A true neighbour in an unprobed cell
+  is missed; recall was measured on synthetic data only. Its k-means uses this
+  port's own seeded generator, so the same `seed` builds a different (equally
+  valid) index than the Python port does.
 - **One embedding per node**, from one text field or a concatenation. No
   multi-vector nodes, no edge embeddings.
 - **`MockEncoder` has no semantic structure.** Use it to test plumbing, never
@@ -353,9 +463,15 @@ store.from_json(&json, false)?;
 - **`NodeId` is string-typed here.** The shared payload format carries an
   `id_type` of `str` or `int`; this port reads and preserves `int` written by
   another, but every id it originates is a string.
-- **Seed order among equal scores is not deterministic.** The store is a
-  `HashMap`, so ties can be broken differently between runs. It only shows up
-  with hand-crafted identical vectors; distinct texts give distinct scores.
+- **Equal scores are ordered by arrival.** Searches do not depend on `HashMap`
+  order: rows are kept in the order they were stored (an update keeps its row,
+  a delete and re-add goes to the end), and ties come back in that order.
+- **`EmbeddingStore::get` returns an owned `EmbeddingRecord`** (the vector is a
+  row of the shared matrix, so the record is built on request). Use `get_vector`
+  to borrow the floats without a copy.
+- **Compaction is a pause.** A store whose rows are a quarter deleted squeezes
+  the matrix (order preserving), a pause proportional to its size; call
+  `compact()` at a quiet moment to choose when.
 - **The graph digest sees integer ids only through the file text.** `NodeId`
   is a string here, so `graph_digest(&graph)` hashes every id as a string (right
   for anything built in Rust); `save` and `load` read the id column's types from
@@ -370,8 +486,8 @@ store.from_json(&json, false)?;
 ## Tests
 
 ```bash
-cargo test                      # 122 unit tests + 2 doctests
-cargo test --features sqlite    # + 22 SQLite tests
+cargo test                      # 127 unit tests + 32 approximate-index tests + 2 doctests
+cargo test --features sqlite    # + 22 SQLite tests + 3 index/SQLite tests
 cargo test --features http-encoder   # + 18 HTTP encoder tests (local mock server)
 cargo clippy --all-targets --features sqlite -- -D warnings
 cargo fmt --check

@@ -1,0 +1,57 @@
+{
+  "role": "primary",
+  "data_dir": "/data",
+  "host": "0.0.0.0",
+  "port": 8080,
+  "log_level": "INFO",
+
+  "max_workers": 32,
+  "accept_queue": 64,
+  "socket_timeout_seconds": 10,
+  "max_body_bytes": 1048576,
+  "max_concurrent_requests": 32,
+  "queue_wait_seconds": 0.5,
+  "request_deadline_seconds": 30,
+  "lock_timeout_seconds": 10,
+  "failed_auth_per_minute": 30,
+  "trusted_proxies": [],
+
+  "durability": "snapshot",
+  "autosave_interval_seconds": 30,
+  "keep_generations": 3,
+  "strict_startup": false,
+
+  "quotas": {
+    "max_graphs": 20,
+    "max_nodes": 100000,
+    "max_edges": 500000,
+    "max_dimension": 1536,
+    "max_batch_items": 500,
+    "max_top_k": 100,
+    "max_hops": 5,
+    "rate_per_second": 50,
+    "rate_burst": 100,
+    "max_inflight": 8
+  },
+
+  "encoder": {
+    "kind": "http",
+    "url": "http://embeddings.internal:8000/v1/embeddings",
+    "model": "my-embedding-model",
+    "api": "openai",
+    "api_key_env": "EMBEDDING_API_KEY",
+    "timeout": 30,
+    "max_concurrency": 4
+  },
+
+  "replica": {
+    "source": "",
+    "sync_interval_seconds": 15,
+    "max_staleness_seconds": 120
+  },
+
+  "router": {
+    "shards": [],
+    "read_preference": "primary"
+  }
+}

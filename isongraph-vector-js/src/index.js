@@ -89,6 +89,55 @@ export class GraphEmbeddingMismatchError extends EmbeddingError {
         this.name = 'GraphEmbeddingMismatchError';
     }
 }
+/** True for an object with `encodeAsync` and `encodeBatchAsync` methods. */
+export function isAsyncEncoder(value) {
+    const v = value;
+    return (v !== null && v !== undefined && typeof v === 'object' &&
+        typeof v.encodeAsync === 'function' && typeof v.encodeBatchAsync === 'function');
+}
+/**
+ * The synchronous face of an encoder that only has an asynchronous one, so the
+ * stores (whose `encoder` is an EmbeddingEncoder) can hold it. Its metadata is
+ * read live from the wrapped encoder; its synchronous methods refuse, naming
+ * the asynchronous ones.
+ */
+class AsyncOnlyEncoder {
+    constructor(inner) {
+        this.inner = inner;
+    }
+    get dimension() {
+        return this.inner.dimension;
+    }
+    get modelName() {
+        return this.inner.modelName;
+    }
+    get version() {
+        return this.inner.version;
+    }
+    encode(_text) {
+        throw new EmbeddingError('this encoder is asynchronous: use the Async methods (addAsync, addNodeAsync, ' +
+            'similaritySearchAsync, ...) or pass the vector yourself');
+    }
+    encodeBatch(texts) {
+        return texts.map(text => this.encode(text));
+    }
+    encodeAsync(text) {
+        return this.inner.encodeAsync(text);
+    }
+    encodeBatchAsync(texts) {
+        return this.inner.encodeBatchAsync(texts);
+    }
+}
+/** What a store or graph holds: sync encoders as they are, async-only ones wrapped. */
+function adoptEncoder(encoder) {
+    if (encoder === null || encoder === undefined)
+        return null;
+    const sync = encoder;
+    if (typeof sync.encode === 'function' && typeof sync.encodeBatch === 'function') {
+        return encoder;
+    }
+    return isAsyncEncoder(encoder) ? new AsyncOnlyEncoder(encoder) : encoder;
+}
 /**
  * Deterministic encoder with no dependencies, for tests and offline work.
  *
@@ -202,20 +251,29 @@ const ERROR_SNIPPET_CHARS = 200;
  * **Every text you embed is sent to the configured endpoint**, including the
  * text of every node a graph embeds and every search query.
  *
- * `EmbeddingEncoder` is synchronous and a network call is not, so the encoder
- * works in two steps: fetch the vectors with `await encoder.prefetch(texts)`
- * (or `encodeAsync` / `encodeBatchAsync`, which fetch and return them), then
- * use the synchronous `encode` / `encodeBatch` the stores call. Those serve
- * from a cache and throw an HttpEncoderError for a text that was not fetched
- * first. That makes `SemanticGraph` auto-embedding unusable with this encoder
- * unless the node texts are prefetched; the plain stores (`addBatch`,
- * `similaritySearch` with a prefetched query) are the intended fit.
+ * It is an {@link AsyncEncoder} (`encodeAsync` / `encodeBatchAsync`), and that
+ * is the way to use it: give it to a store or graph and call the `...Async`
+ * methods (`addNodeAsync`, `updateNodeAsync`, `embedAllNodesAsync`,
+ * `similaritySearchAsync`, ...), which await the network themselves. Identical
+ * texts requested at the same moment share one request.
+ *
+ * `EmbeddingEncoder` is synchronous and a network call is not, so the
+ * synchronous `encode` / `encodeBatch` serve from a cache: fetch first with
+ * `await encoder.prefetch(texts)` (every `...Async` call fills it too), and a
+ * text that was not fetched makes them throw an HttpEncoderError. That keeps
+ * the plain synchronous methods (`addNode`, `addBatch`, `similaritySearch`)
+ * usable for prefetched texts.
  *
  * @example
  * ```typescript
  * const encoder = new HttpEncoder({
  *   url: 'http://localhost:11434/api/embed', model: 'nomic-embed-text', api: 'ollama',
  * });
+ * const graph = new SemanticGraph({ encoder });
+ * await graph.addNodeAsync('person', 1, { name: 'Alice' });      // embeds over the network
+ * const hits = await graph.similaritySearchAsync('who is Alice');
+ *
+ * // or, synchronously, after fetching the texts:
  * const texts = ['Alice is an engineer', 'Bob plans roadmaps'];
  * await encoder.prefetch([...texts, 'engineering']);
  * const store = new EmbeddingStore(encoder);
@@ -226,6 +284,7 @@ const ERROR_SNIPPET_CHARS = 200;
 export class HttpEncoder {
     constructor(options) {
         this._cache = new Map();
+        this._inflight = new Map();
         if (!options || typeof options.url !== 'string' || typeof options.model !== 'string' || !options.model) {
             throw new EmbeddingError('HttpEncoder needs a url and a model');
         }
@@ -275,6 +334,7 @@ export class HttpEncoder {
         this._maxRetries = Math.floor(nonNegative(options.maxRetries, 2, 'maxRetries'));
         this._retryDelayMs = nonNegative(options.retryDelayMs, 500, 'retryDelayMs');
         this._maxCache = Math.floor(positive(options.maxCacheEntries, 100000, 'maxCacheEntries', false));
+        this._concurrency = positive(options.concurrency, 1, 'concurrency', true);
         const fetchFn = options.fetch ?? globalThis.fetch;
         if (typeof fetchFn !== 'function') {
             throw new EmbeddingError('HttpEncoder needs a global fetch (Node 18+) or a fetch option');
@@ -317,28 +377,69 @@ export class HttpEncoder {
     async encodeAsync(text) {
         return (await this.encodeBatchAsync([text]))[0];
     }
-    /** Fetch vectors for many texts, in order; only uncached texts hit the network. */
+    /**
+     * Fetch vectors for many texts, in order. Only texts that are neither cached
+     * nor already being fetched hit the network, `batchSize` per request and
+     * `concurrency` requests at a time; the first failure rejects the call.
+     */
     async encodeBatchAsync(texts) {
         const found = new Map();
-        const missing = new Set();
+        const fresh = [];
+        const waits = [];
+        const considered = new Set();
         for (const text of texts) {
-            if (found.has(text) || missing.has(text))
+            if (considered.has(text))
                 continue;
+            considered.add(text);
             const hit = this._cache.get(text);
-            if (hit)
+            if (hit) {
                 found.set(text, hit);
-            else
-                missing.add(text);
+                continue;
+            }
+            const shared = this._inflight.get(text);
+            if (shared) {
+                waits.push(shared.then(fetched => { found.set(text, fetched.get(text)); }));
+                continue;
+            }
+            fresh.push(text);
         }
-        const pending = [...missing];
-        for (let start = 0; start < pending.length; start += this._batchSize) {
-            const chunk = pending.slice(start, start + this._batchSize);
-            const vectors = await this._request(chunk);
-            chunk.forEach((text, i) => {
-                found.set(text, vectors[i]);
-                this._remember(text, vectors[i]);
-            });
+        const chunks = [];
+        for (let start = 0; start < fresh.length; start += this._batchSize) {
+            chunks.push(fresh.slice(start, start + this._batchSize));
         }
+        let next = 0;
+        let failed = false;
+        const worker = async () => {
+            while (!failed && next < chunks.length) {
+                const chunk = chunks[next++];
+                const job = this._request(chunk).then(vectors => {
+                    const fetched = new Map();
+                    chunk.forEach((text, i) => {
+                        fetched.set(text, vectors[i]);
+                        this._remember(text, vectors[i]);
+                    });
+                    return fetched;
+                });
+                for (const text of chunk)
+                    this._inflight.set(text, job);
+                const release = () => {
+                    for (const text of chunk)
+                        if (this._inflight.get(text) === job)
+                            this._inflight.delete(text);
+                };
+                job.then(release, release);
+                try {
+                    for (const [text, vector] of await job)
+                        found.set(text, vector);
+                }
+                catch (error) {
+                    failed = true;
+                    throw error;
+                }
+            }
+        };
+        const workers = Array.from({ length: Math.min(this._concurrency, chunks.length) }, worker);
+        await Promise.all([...waits, ...workers]);
         return texts.map(text => found.get(text).slice());
     }
     /** Synchronous: serves a prefetched text, otherwise throws HttpEncoderError. */
@@ -487,8 +588,736 @@ export function selectTopK(results, k) {
     }
     return top;
 }
+// =============================================================================
+// Approximate (IVF) search
+// =============================================================================
+/** Stores below this many vectors answer exactly even with `ann` on. */
+const ANN_MIN_SIZE = 50000;
+/** New or updated rows are scored exactly until this many (or this fraction of the trained size) are pending. */
+const ANN_FOLD_MIN = 512;
+const ANN_FOLD_FRACTION = 0.02;
+/** Retrain once writes + deletes since training exceed this fraction of the trained size. */
+const ANN_RETRAIN_FRACTION = 0.5;
+/**
+ * k-means trains on up to this many sampled vectors per cell, for this many
+ * rounds. Python samples 40 per cell; with no BLAS here the build cost matters,
+ * and on 600k clustered vectors 24 per cell took 296 s against 390 s for 40
+ * with the same recall at the default probe (0.978) and a little less at
+ * `annNprobe` 1 (0.93 against 0.96).
+ */
+const ANN_SAMPLE_PER_CELL = 24;
+const ANN_KMEANS_ITERS = 8;
+/** From this many cells on, nearest-cell lookups go through a coarse layer of about 3 x sqrt(nlist) super-cells. */
+const ANN_COARSE_MIN_CELLS = 256;
+/**
+ * ... and look inside this many of the super-cells nearest the vector. Measured
+ * on 100k-300k clustered vectors: this finds the true nearest cell for 95-99%
+ * of them at about a third of the brute-force cost; looking inside only 4
+ * left 2-20% in a different cell, which capped recall whatever `annNprobe`.
+ */
+const ANN_COARSE_PROBE = 24;
+/** k-means rounds that place the super-cells over the centroids. */
+const ANN_COARSE_ROUNDS = 3;
+/** Super-cells per sqrt(nlist): finer ones find the nearest cell more often for the same work. */
+const ANN_COARSE_FACTOR = 3;
+/** float32 rows vs the float64 exact score differ by about 1e-7; candidates this close under the threshold are re-scored. */
+const ANN_THRESHOLD_SLACK = 1e-6;
+/** Banker's rounding, as Python's `round`, so the default cell counts agree across ports. */
+function roundHalfEven(x) {
+    const floor = Math.floor(x);
+    const diff = x - floor;
+    if (diff < 0.5)
+        return floor;
+    if (diff > 0.5)
+        return floor + 1;
+    return floor % 2 === 0 ? floor : floor + 1;
+}
+const nowMs = () => typeof performance !== 'undefined' ? performance.now() : Date.now();
+/** Small seeded generator (mulberry32): the same seed gives the same index. */
+class Rng {
+    constructor(seed) {
+        this._a = (Math.trunc(seed) ^ 0x9e3779b9) >>> 0;
+    }
+    next() {
+        this._a = (this._a + 0x6d2b79f5) >>> 0;
+        let t = this._a;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    }
+    /** Integer in [0, n). */
+    below(n) {
+        return Math.floor(this.next() * n);
+    }
+}
+/** Dot product of a[ao..ao+dim) and b[bo..bo+dim), four accumulators wide. */
+function dot2(a, ao, b, bo, dim) {
+    let s0 = 0;
+    let s1 = 0;
+    let s2 = 0;
+    let s3 = 0;
+    let j = 0;
+    const lim = dim - 3;
+    for (; j < lim; j += 4) {
+        s0 += a[ao + j] * b[bo + j];
+        s1 += a[ao + j + 1] * b[bo + j + 1];
+        s2 += a[ao + j + 2] * b[bo + j + 2];
+        s3 += a[ao + j + 3] * b[bo + j + 3];
+    }
+    for (; j < dim; j++)
+        s0 += a[ao + j] * b[bo + j];
+    return s0 + s1 + s2 + s3;
+}
+/**
+ * Nearest unit centroid to a vector, by dot product.
+ *
+ * With many cells a brute-force pass over all of them costs nlist x dim per
+ * vector, which is what makes k-means and assignment slow in a language with no
+ * BLAS. Past `ANN_COARSE_MIN_CELLS` the centroids are themselves grouped into
+ * about sqrt(nlist) super-cells and only the members of the few super-cells
+ * nearest the vector are compared: roughly 10x less work, and the cell it picks
+ * is the true nearest one all but rarely. A vector put in a near-miss cell is
+ * still found by any query that probes that cell.
+ */
+class CentroidSearch {
+    constructor(centroids, nlist, dim, coarseFactor = ANN_COARSE_FACTOR, probe = ANN_COARSE_PROBE) {
+        this._coarse = null;
+        this._ncoarse = 0;
+        this._members = new Int32Array(0);
+        this._memberOffsets = new Int32Array(0);
+        this._coarseScore = new Float64Array(0);
+        this._pickIdx = new Int32Array(0);
+        this._pickScore = new Float64Array(0);
+        this._nlist = nlist;
+        this._dim = dim;
+        this._centroids = centroids;
+        this._probe = probe;
+        if (nlist >= ANN_COARSE_MIN_CELLS)
+            this._buildCoarse(coarseFactor);
+    }
+    _buildCoarse(coarseFactor) {
+        const nlist = this._nlist;
+        const dim = this._dim;
+        const centroids = this._centroids;
+        const ncoarse = Math.max(2, Math.round(coarseFactor * Math.sqrt(nlist)));
+        const coarse = new Float32Array(ncoarse * dim);
+        for (let i = 0; i < ncoarse; i++) {
+            const src = Math.floor((i * nlist) / ncoarse) * dim;
+            coarse.set(centroids.subarray(src, src + dim), i * dim);
+        }
+        const owner = new Int32Array(nlist);
+        const sums = new Float64Array(ncoarse * dim);
+        const counts = new Int32Array(ncoarse);
+        for (let round = 0; round < ANN_COARSE_ROUNDS; round++) {
+            for (let c = 0; c < nlist; c++) {
+                let best = 0;
+                let bestScore = -Infinity;
+                for (let k = 0; k < ncoarse; k++) {
+                    const s = dot2(centroids, c * dim, coarse, k * dim, dim);
+                    if (s > bestScore) {
+                        bestScore = s;
+                        best = k;
+                    }
+                }
+                owner[c] = best;
+            }
+            if (round === ANN_COARSE_ROUNDS - 1)
+                break;
+            sums.fill(0);
+            counts.fill(0);
+            for (let c = 0; c < nlist; c++) {
+                const k = owner[c];
+                counts[k]++;
+                const base = k * dim;
+                const src = c * dim;
+                for (let j = 0; j < dim; j++)
+                    sums[base + j] += centroids[src + j];
+            }
+            for (let k = 0; k < ncoarse; k++) {
+                if (counts[k] === 0)
+                    continue;
+                let len = 0;
+                for (let j = 0; j < dim; j++)
+                    len += sums[k * dim + j] * sums[k * dim + j];
+                len = Math.sqrt(len);
+                if (len === 0)
+                    continue;
+                for (let j = 0; j < dim; j++)
+                    coarse[k * dim + j] = sums[k * dim + j] / len;
+            }
+        }
+        const memberOffsets = new Int32Array(ncoarse + 1);
+        for (let c = 0; c < nlist; c++)
+            memberOffsets[owner[c] + 1]++;
+        for (let k = 0; k < ncoarse; k++)
+            memberOffsets[k + 1] += memberOffsets[k];
+        const fill = memberOffsets.slice(0, ncoarse);
+        const members = new Int32Array(nlist);
+        for (let c = 0; c < nlist; c++)
+            members[fill[owner[c]]++] = c;
+        this._coarse = coarse;
+        this._ncoarse = ncoarse;
+        this._members = members;
+        this._memberOffsets = memberOffsets;
+        this._coarseScore = new Float64Array(ncoarse);
+        const probe = Math.min(this._probe, ncoarse);
+        this._pickIdx = new Int32Array(probe);
+        this._pickScore = new Float64Array(probe);
+    }
+    /** Index of the centroid most similar to v[off..off+dim). */
+    nearest(v, off) {
+        const dim = this._dim;
+        const centroids = this._centroids;
+        let best = 0;
+        let bestScore = -Infinity;
+        const coarse = this._coarse;
+        if (coarse === null) {
+            for (let c = 0; c < this._nlist; c++) {
+                const s = dot2(centroids, c * dim, v, off, dim);
+                if (s > bestScore) {
+                    bestScore = s;
+                    best = c;
+                }
+            }
+            return best;
+        }
+        const pickIdx = this._pickIdx;
+        const pickScore = this._pickScore;
+        const probe = pickIdx.length;
+        let picked = 0;
+        for (let k = 0; k < this._ncoarse; k++) {
+            const s = dot2(coarse, k * dim, v, off, dim);
+            if (picked === probe && s <= pickScore[probe - 1])
+                continue;
+            let i = picked < probe ? picked++ : probe - 1;
+            while (i > 0 && pickScore[i - 1] < s) {
+                pickScore[i] = pickScore[i - 1];
+                pickIdx[i] = pickIdx[i - 1];
+                i--;
+            }
+            pickScore[i] = s;
+            pickIdx[i] = k;
+        }
+        const members = this._members;
+        const offsets = this._memberOffsets;
+        for (let p = 0; p < picked; p++) {
+            const k = pickIdx[p];
+            for (let m = offsets[k]; m < offsets[k + 1]; m++) {
+                const c = members[m];
+                const s = dot2(centroids, c * dim, v, off, dim);
+                if (s > bestScore) {
+                    bestScore = s;
+                    best = c;
+                }
+            }
+        }
+        return best;
+    }
+}
+/**
+ * Float32Array snapshot of the store's vectors, kept in step with its writes.
+ *
+ * One contiguous matrix with spare row capacity, the vector norms, a type code
+ * per row and a liveness flag. A write patches it in place: an insert appends
+ * a row, an update overwrites one, a delete tombstones one (squeezed out once
+ * a quarter of the rows are dead). Rows stay in insertion order, which is the
+ * order the store's Map iterates, so ties break exactly as the exact scan's do.
+ * Built lazily by the first approximate search, never persisted.
+ */
+class ScanCache {
+    constructor(dim, capacity) {
+        /** Rows in use, tombstones included, and how many of those are tombstones. */
+        this.n = 0;
+        this.dead = 0;
+        this.keys = [];
+        this.pos = new Map();
+        this.codeOf = new Map();
+        this.ivf = null;
+        this.dim = dim;
+        this.matrix = new Float32Array(capacity * dim);
+        this.norms = new Float64Array(capacity);
+        this.codes = new Int32Array(capacity);
+        this.alive = new Uint8Array(capacity);
+        this.query = new Float32Array(dim);
+    }
+    static build(records, count, dim) {
+        const cache = new ScanCache(dim, count + Math.max(1024, count >> 4));
+        for (const record of records)
+            cache.put(record.id, record);
+        return cache;
+    }
+    get capacity() {
+        return this.norms.length;
+    }
+    _grow() {
+        const capacity = this.capacity + Math.max(1024, this.capacity >> 2);
+        const matrix = new Float32Array(capacity * this.dim);
+        matrix.set(this.matrix.subarray(0, this.n * this.dim));
+        const norms = new Float64Array(capacity);
+        norms.set(this.norms.subarray(0, this.n));
+        const codes = new Int32Array(capacity);
+        codes.set(this.codes.subarray(0, this.n));
+        const alive = new Uint8Array(capacity);
+        alive.set(this.alive.subarray(0, this.n));
+        this.matrix = matrix;
+        this.norms = norms;
+        this.codes = codes;
+        this.alive = alive;
+    }
+    /** Mirror one upserted record. */
+    put(key, record) {
+        const dim = this.dim;
+        let i = this.pos.get(key);
+        if (i === undefined) {
+            if (this.n >= this.capacity)
+                this._grow();
+            i = this.n++;
+            this.keys[i] = key;
+            this.pos.set(key, i);
+            const type = record.nodeRef[0];
+            let code = this.codeOf.get(type);
+            if (code === undefined) {
+                code = this.codeOf.size;
+                this.codeOf.set(type, code);
+            }
+            this.codes[i] = code;
+            this.alive[i] = 1;
+        }
+        const vector = record.vector;
+        const base = i * dim;
+        let sum = 0;
+        for (let j = 0; j < dim; j++) {
+            const f = Math.fround(vector[j]);
+            this.matrix[base + j] = f;
+            sum += f * f;
+        }
+        this.norms[i] = Math.sqrt(sum);
+        if (this.ivf !== null)
+            this.ivf.notePut(i, this.capacity);
+    }
+    /** Mirror one deleted record. */
+    drop(key) {
+        const i = this.pos.get(key);
+        if (i === undefined)
+            return;
+        this.pos.delete(key);
+        this.matrix.fill(0, i * this.dim, (i + 1) * this.dim);
+        this.norms[i] = 0;
+        this.alive[i] = 0;
+        this.keys[i] = null;
+        this.dead++;
+        if (this.ivf !== null)
+            this.ivf.noteDrop(i);
+        while (this.n > 0 && this.alive[this.n - 1] === 0) { // trailing tombstones
+            this.n--;
+            this.keys.pop();
+            this.dead--;
+        }
+        if (this.dead > 32 && this.dead * 4 > this.n)
+            this._compact();
+    }
+    /** Squeeze the tombstones out, keeping the live rows in their order. */
+    _compact() {
+        const dim = this.dim;
+        const live = new Int32Array(this.n - this.dead);
+        let kept = 0;
+        for (let r = 0; r < this.n; r++)
+            if (this.alive[r] === 1)
+                live[kept++] = r;
+        if (this.ivf !== null)
+            this.ivf.compact(live);
+        for (let w = 0; w < kept; w++) {
+            const r = live[w];
+            if (r !== w) {
+                this.matrix.copyWithin(w * dim, r * dim, (r + 1) * dim);
+                this.norms[w] = this.norms[r];
+                this.codes[w] = this.codes[r];
+                const key = this.keys[r];
+                this.keys[w] = key;
+                this.pos.set(key, w);
+            }
+        }
+        this.alive.fill(1, 0, kept);
+        this.alive.fill(0, kept, this.n);
+        this.keys.length = kept;
+        this.n = kept;
+        this.dead = 0;
+    }
+    bytes() {
+        return this.matrix.byteLength + this.norms.byteLength + this.codes.byteLength + this.alive.byteLength;
+    }
+}
+/**
+ * Inverted-file ("IVF-flat") index over a {@link ScanCache}.
+ *
+ * Spherical k-means partitions the rows into `nlist` cells by direction, which
+ * is what cosine similarity compares. A query scores the `nprobe` cells whose
+ * centroids are nearest and only the rows inside them, with the same cosine
+ * formula as the exact scan. The vectors are not copied again: the index is a
+ * cell number per row (`assign`) plus the rows grouped by cell
+ * (`order`/`offsets`), about 8 bytes per vector plus the centroids.
+ *
+ * It follows its cache instead of being rebuilt on every write:
+ *  - a **new** or **updated** row is *pending* (cell -1): every query scores
+ *    the pending rows exactly, so a write is visible at once and costs the
+ *    index nothing;
+ *  - pending rows are folded into their nearest cell in one pass once there
+ *    are enough of them (see `EmbeddingStore._annIndex`);
+ *  - a **delete** clears the row's cell; stale entries in `order` are skipped
+ *    at query time;
+ *  - the cache's compaction renumbers rows, and `compact` carries the cells
+ *    across without retraining;
+ *  - `churn` counts writes and deletes since training; the store retrains when
+ *    it passes a fraction of the trained size.
+ */
+class IvfIndex {
+    constructor(centroids, nlist, dim, assign) {
+        this.order = new Int32Array(0);
+        this.offsets = new Int32Array(0);
+        this.pending = new Set();
+        this.churn = 0;
+        this.trainedN = 0;
+        this.buildSeconds = 0;
+        // Scratch kept between queries: a search allocates nothing proportional to the store.
+        this._chosen = new Int32Array(0);
+        this._chosenScore = new Float64Array(0);
+        this.candRows = new Int32Array(0);
+        this.candScores = new Float64Array(0);
+        this.nlist = nlist;
+        this.dim = dim;
+        this.centroids = centroids;
+        this.assign = assign;
+        this._search = new CentroidSearch(centroids, nlist, dim);
+    }
+    /** Train centroids on a sample, then give every live row its cell. */
+    static build(cache, nlistWanted, seed) {
+        const started = nowMs();
+        const { n, dim, matrix, norms, alive } = cache;
+        const live = new Int32Array(n - cache.dead);
+        let total = 0;
+        for (let r = 0; r < n; r++)
+            if (alive[r] === 1)
+                live[total++] = r;
+        const nlist = Math.max(1, Math.min(Math.floor(nlistWanted), total));
+        const rng = new Rng(seed);
+        // Sample up to 40 vectors per cell (a partial Fisher-Yates), as unit rows.
+        const sampleN = Math.min(total, ANN_SAMPLE_PER_CELL * nlist);
+        let sample;
+        if (sampleN === total) {
+            sample = live;
+        }
+        else {
+            const pool = live.slice();
+            for (let i = 0; i < sampleN; i++) {
+                const j = i + rng.below(total - i);
+                const t = pool[i];
+                pool[i] = pool[j];
+                pool[j] = t;
+            }
+            sample = pool.subarray(0, sampleN);
+            sample.sort();
+        }
+        const x = new Float32Array(sampleN * dim);
+        for (let i = 0; i < sampleN; i++) {
+            const r = sample[i];
+            const inv = norms[r] > 0 ? 1 / norms[r] : 0;
+            const src = r * dim;
+            const dst = i * dim;
+            for (let j = 0; j < dim; j++)
+                x[dst + j] = matrix[src + j] * inv;
+        }
+        // Initial centroids: distinct sample points.
+        const centroids = new Float32Array(nlist * dim);
+        const picks = new Int32Array(sampleN);
+        for (let i = 0; i < sampleN; i++)
+            picks[i] = i;
+        for (let c = 0; c < nlist; c++) {
+            const j = c + rng.below(sampleN - c);
+            const t = picks[c];
+            picks[c] = picks[j];
+            picks[j] = t;
+            centroids.set(x.subarray(picks[c] * dim, (picks[c] + 1) * dim), c * dim);
+        }
+        // Spherical k-means: assign to the most similar centroid, re-centre on the sum, re-normalise.
+        const cell = new Int32Array(sampleN);
+        const counts = new Int32Array(nlist);
+        const sums = new Float64Array(nlist * dim);
+        for (let iter = 0; iter < ANN_KMEANS_ITERS; iter++) {
+            const search = new CentroidSearch(centroids, nlist, dim);
+            counts.fill(0);
+            sums.fill(0);
+            for (let i = 0; i < sampleN; i++) {
+                const c = search.nearest(x, i * dim);
+                cell[i] = c;
+                counts[c]++;
+                const base = c * dim;
+                const src = i * dim;
+                for (let j = 0; j < dim; j++)
+                    sums[base + j] += x[src + j];
+            }
+            for (let c = 0; c < nlist; c++) {
+                let len = 0;
+                if (counts[c] > 0) {
+                    for (let j = 0; j < dim; j++)
+                        len += sums[c * dim + j] * sums[c * dim + j];
+                    len = Math.sqrt(len);
+                }
+                if (counts[c] === 0 || len === 0) { // a dead centroid: re-seed on a random point
+                    const i = rng.below(sampleN);
+                    centroids.set(x.subarray(i * dim, (i + 1) * dim), c * dim);
+                }
+                else {
+                    for (let j = 0; j < dim; j++)
+                        centroids[c * dim + j] = sums[c * dim + j] / len;
+                }
+            }
+        }
+        const index = new IvfIndex(centroids, nlist, dim, new Int32Array(cache.capacity).fill(-1));
+        index.trainedN = total;
+        for (let t = 0; t < total; t++) {
+            const r = live[t];
+            index.assign[r] = index._search.nearest(matrix, r * dim);
+        }
+        index.relist(n);
+        index.buildSeconds = (nowMs() - started) / 1000;
+        return index;
+    }
+    /** Regroup the rows by cell (a stable counting sort of `assign`). */
+    relist(n) {
+        const assign = this.assign;
+        const offsets = new Int32Array(this.nlist + 1);
+        let total = 0;
+        for (let r = 0; r < n; r++) {
+            const c = assign[r];
+            if (c >= 0) {
+                offsets[c + 1]++;
+                total++;
+            }
+        }
+        for (let c = 0; c < this.nlist; c++)
+            offsets[c + 1] += offsets[c];
+        const fill = offsets.slice(0, this.nlist);
+        const order = new Int32Array(total);
+        for (let r = 0; r < n; r++) {
+            const c = assign[r];
+            if (c >= 0)
+                order[fill[c]++] = r;
+        }
+        this.order = order;
+        this.offsets = offsets;
+    }
+    /** Give every pending row its nearest cell and regroup. */
+    fold(cache) {
+        if (this.pending.size > 0) {
+            for (const r of this.pending) {
+                this.assign[r] = this._search.nearest(cache.matrix, r * this.dim);
+            }
+            this.pending.clear();
+        }
+        this.relist(cache.n);
+    }
+    notePut(i, capacity) {
+        if (i >= this.assign.length) {
+            const grown = new Int32Array(Math.max(capacity, i + 1)).fill(-1);
+            grown.set(this.assign);
+            this.assign = grown;
+        }
+        this.assign[i] = -1;
+        this.pending.add(i);
+        this.churn++;
+    }
+    noteDrop(i) {
+        if (i < this.assign.length)
+            this.assign[i] = -1;
+        this.pending.delete(i);
+        this.churn++;
+    }
+    /** Follow the cache's compaction (`live` = the old rows kept, in order). */
+    compact(live) {
+        const kept = live.length;
+        const moved = new Int32Array(kept);
+        for (let w = 0; w < kept; w++)
+            moved[w] = this.assign[live[w]];
+        this.assign.fill(-1);
+        this.assign.set(moved);
+        if (this.pending.size > 0) {
+            const old = Array.from(this.pending).sort((a, b) => a - b);
+            this.pending = new Set(old.map(r => lowerBound(live, r)));
+        }
+        this.relist(kept);
+    }
+    bytes() {
+        return this.centroids.byteLength + this.assign.byteLength + this.order.byteLength + this.offsets.byteLength;
+    }
+    /**
+     * Score the rows of the `lists` cells nearest `q`, plus every pending row,
+     * into `candRows`/`candScores`; returns how many were kept. `code` < 0 means
+     * any node type; rows scoring under `floor` are left out.
+     */
+    gather(cache, q, qnorm, code, floor, lists) {
+        const { nlist, dim, centroids } = this;
+        if (this._chosen.length < lists) {
+            this._chosen = new Int32Array(lists);
+            this._chosenScore = new Float64Array(lists);
+        }
+        const chosen = this._chosen;
+        let nChosen = 0;
+        if (lists >= nlist) {
+            for (let c = 0; c < nlist; c++)
+                chosen[c] = c;
+            nChosen = nlist;
+        }
+        else {
+            const chosenScore = this._chosenScore;
+            for (let c = 0; c < nlist; c++) {
+                const s = dot2(centroids, c * dim, q, 0, dim);
+                if (nChosen === lists && s <= chosenScore[lists - 1])
+                    continue;
+                let i = nChosen < lists ? nChosen++ : lists - 1;
+                while (i > 0 && chosenScore[i - 1] < s) {
+                    chosenScore[i] = chosenScore[i - 1];
+                    chosen[i] = chosen[i - 1];
+                    i--;
+                }
+                chosenScore[i] = s;
+                chosen[i] = c;
+            }
+        }
+        const order = this.order;
+        const offsets = this.offsets;
+        let bound = this.pending.size;
+        for (let k = 0; k < nChosen; k++)
+            bound += offsets[chosen[k] + 1] - offsets[chosen[k]];
+        if (this.candRows.length < bound) {
+            const size = Math.max(bound, this.candRows.length * 2, 256);
+            this.candRows = new Int32Array(size);
+            this.candScores = new Float64Array(size);
+        }
+        const candRows = this.candRows;
+        const candScores = this.candScores;
+        const { matrix, norms, codes } = cache;
+        const assign = this.assign;
+        let m = 0;
+        for (let k = 0; k < nChosen; k++) {
+            const c = chosen[k];
+            for (let p = offsets[c], end = offsets[c + 1]; p < end; p++) {
+                const r = order[p];
+                if (assign[r] < 0)
+                    continue; // deleted or updated since the last regroup
+                if (code >= 0 && codes[r] !== code)
+                    continue;
+                const denom = norms[r] * qnorm;
+                const s = denom > 0 ? dot2(matrix, r * dim, q, 0, dim) / denom : 0;
+                if (s < floor)
+                    continue;
+                candRows[m] = r;
+                candScores[m] = s;
+                m++;
+            }
+        }
+        for (const r of this.pending) {
+            if (code >= 0 && codes[r] !== code)
+                continue;
+            const denom = norms[r] * qnorm;
+            const s = denom > 0 ? dot2(matrix, r * dim, q, 0, dim) / denom : 0;
+            if (s < floor)
+                continue;
+            candRows[m] = r;
+            candScores[m] = s;
+            m++;
+        }
+        return m;
+    }
+    /** The `k` best of the first `m` candidates: score descending, row ascending on ties. */
+    best(m, k) {
+        const rows = this.candRows;
+        const scores = this.candScores;
+        const size = Math.min(k, m);
+        // Min-heap of candidate slots whose root is the worst kept one.
+        const heap = new Int32Array(size);
+        const worse = (a, b) => scores[a] < scores[b] || (scores[a] === scores[b] && rows[a] > rows[b]);
+        let count = 0;
+        for (let i = 0; i < m; i++) {
+            if (count === size) {
+                const root = heap[0];
+                if (!(scores[i] > scores[root] || (scores[i] === scores[root] && rows[i] < rows[root])))
+                    continue;
+                heap[0] = i;
+                let at = 0;
+                for (;;) {
+                    const l = 2 * at + 1;
+                    if (l >= size)
+                        break;
+                    const r = l + 1;
+                    const child = r < size && worse(heap[r], heap[l]) ? r : l;
+                    if (!worse(heap[child], heap[at]))
+                        break;
+                    const t = heap[at];
+                    heap[at] = heap[child];
+                    heap[child] = t;
+                    at = child;
+                }
+            }
+            else {
+                let at = count++;
+                heap[at] = i;
+                while (at > 0) {
+                    const parent = (at - 1) >> 1;
+                    if (!worse(heap[at], heap[parent]))
+                        break;
+                    const t = heap[at];
+                    heap[at] = heap[parent];
+                    heap[parent] = t;
+                    at = parent;
+                }
+            }
+        }
+        // Drain worst-first into the back of the output.
+        const out = new Int32Array(count);
+        for (let o = count - 1; o >= 0; o--) {
+            out[o] = heap[0];
+            const last = heap[o];
+            if (o === 0)
+                break;
+            heap[0] = last;
+            let at = 0;
+            for (;;) {
+                const l = 2 * at + 1;
+                if (l >= o)
+                    break;
+                const r = l + 1;
+                const child = r < o && worse(heap[r], heap[l]) ? r : l;
+                if (!worse(heap[child], heap[at]))
+                    break;
+                const t = heap[at];
+                heap[at] = heap[child];
+                heap[child] = t;
+                at = child;
+            }
+        }
+        return out;
+    }
+}
+/** Index of the first element of sorted `values` that is >= `target`. */
+function lowerBound(values, target) {
+    let lo = 0;
+    let hi = values.length;
+    while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (values[mid] < target)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
 /**
  * In-memory embedding storage with brute-force cosine similarity search.
+ *
+ * Search is exact by default. For large stores an opt-in approximate index
+ * (`ann: 'ivf'`, see {@link AnnOptions}) trades a little recall for much lower
+ * latency; this is built for an application's own knowledge graph, not as a
+ * vector-database replacement.
  */
 export class EmbeddingStore {
     constructor(encoder, options = {}) {
@@ -496,17 +1325,55 @@ export class EmbeddingStore {
         this._dimension = null;
         this._onModelMismatch = 'warn';
         this._warnedMismatch = new Set();
+        this._ann = null;
+        this._annNlist = null;
+        this._annNprobe = null;
+        this._annMinSize = ANN_MIN_SIZE;
+        this._annSeed = 0;
+        this._annCounts = { approximate: 0, exact: 0, widened: 0, builds: 0 };
+        this._scan = null;
         /** Metadata of the most recent imported sidecar (empty before any). */
         this.lastImportMeta = {};
-        this._encoder = encoder || null;
+        this._encoder = adoptEncoder(encoder);
         this._version = options.version ?? null;
         this.onModelMismatch = options.onModelMismatch ?? 'warn';
+        const ann = options.ann ?? null;
+        if (ann !== null && ann !== 'ivf') {
+            throw new EmbeddingError(`ann must be null or 'ivf', got ${JSON.stringify(ann)}`);
+        }
+        const whole = (label, value, floor) => {
+            if (value === undefined || value === null)
+                return null;
+            if (typeof value !== 'number' || !Number.isInteger(value) || value < floor) {
+                throw new EmbeddingError(`${label} must be an integer >= ${floor}, got ${value}`);
+            }
+            return value;
+        };
+        this._ann = ann;
+        this._annNlist = whole('annNlist', options.annNlist, 1);
+        this._annNprobe = whole('annNprobe', options.annNprobe, 1);
+        this._annMinSize = whole('annMinSize', options.annMinSize, 0) ?? ANN_MIN_SIZE;
+        this._annSeed = Math.trunc(Number(options.annSeed ?? 0)) || 0;
+    }
+    /** The approximate index in use (`'ivf'`), or null when search is exact. */
+    get ann() {
+        return this._ann;
+    }
+    /** Cells scanned per query; null means "automatic" (about 5% of the cells). */
+    get annNprobe() {
+        return this._annNprobe;
+    }
+    set annNprobe(value) {
+        if (value !== null && (typeof value !== 'number' || !Number.isInteger(value) || value < 1)) {
+            throw new EmbeddingError(`annNprobe must be an integer >= 1, got ${value}`);
+        }
+        this._annNprobe = value;
     }
     get encoder() {
         return this._encoder;
     }
     set encoder(encoder) {
-        this._encoder = encoder;
+        this._encoder = adoptEncoder(encoder);
     }
     /** Vector length this store holds, or null while it is still empty. */
     get dimension() {
@@ -573,6 +1440,9 @@ export class EmbeddingStore {
         else {
             vector = query;
         }
+        return this._checkQuery(vector);
+    }
+    _checkQuery(vector) {
         if (vector.length === 0) {
             throw new DimensionMismatchError("query vector is empty");
         }
@@ -673,8 +1543,14 @@ export class EmbeddingStore {
         }
         this._checkDimension(vector, "vector");
         const key = this._nodeRefToKey(nodeRef);
-        this._embeddings.set(key, { id: key, nodeRef, vector, text, model: this._modelName() });
+        this._set(key, { id: key, nodeRef, vector, text, model: this._modelName() });
         return key;
+    }
+    /** Every write goes through here, so the approximate index's cache stays in step. */
+    _set(key, record) {
+        this._embeddings.set(key, record);
+        if (this._scan !== null)
+            this._scan.put(key, record);
     }
     /** Add many embeddings, encoding their texts in one batched call. */
     addBatch(entries) {
@@ -701,16 +1577,106 @@ export class EmbeddingStore {
         });
         return entries.length;
     }
+    /**
+     * Encode texts with the store's encoder, awaiting it: an {@link AsyncEncoder}
+     * (such as HttpEncoder) over the network, any other encoder as `encodeBatch`.
+     * Nothing is stored. Rejects with NoEncoderError when there is no encoder.
+     */
+    async encodeTextsAsync(texts) {
+        const encoder = this._encoder;
+        if (!encoder) {
+            throw new NoEncoderError("No encoder provided and no vectors given");
+        }
+        const vectors = isAsyncEncoder(encoder)
+            ? await encoder.encodeBatchAsync(texts)
+            : encoder.encodeBatch(texts);
+        if (vectors.length !== texts.length) {
+            throw new EmbeddingError(`encoder returned ${vectors.length} vectors for ${texts.length} texts`);
+        }
+        return vectors;
+    }
+    /**
+     * Like {@link add}, but awaits the encoder, so it works with one that makes
+     * a network call. On a failure nothing is stored.
+     */
+    async addAsync(nodeRef, text, vector) {
+        if (vector === undefined) {
+            vector = (await this.encodeTextsAsync([text]))[0];
+        }
+        return this.add(nodeRef, text, vector);
+    }
+    /**
+     * Like {@link addBatch}, but awaits the encoder: the texts that need
+     * encoding go out in one `encodeBatchAsync` call (HttpEncoder splits it into
+     * `batchSize` requests). All entries are stored only once every vector is in.
+     */
+    async addBatchAsync(entries) {
+        if (entries.length === 0)
+            return 0;
+        const needsEncoding = entries
+            .map((e, i) => (e.length < 3 || e[2] === undefined ? i : -1))
+            .filter(i => i >= 0);
+        const vectorFor = new Map();
+        if (needsEncoding.length > 0) {
+            const encoded = await this.encodeTextsAsync(needsEncoding.map(i => entries[i][1]));
+            needsEncoding.forEach((slot, i) => vectorFor.set(slot, encoded[i]));
+        }
+        entries.forEach((entry, i) => {
+            this.add(entry[0], entry[1], vectorFor.get(i) ?? entry[2]);
+        });
+        return entries.length;
+    }
+    /**
+     * The vector a query stands for: a vector as it is, a text through the
+     * encoder (awaited), with the same model-mismatch check as a synchronous
+     * text query. Used by the `...Async` searches.
+     */
+    async resolveQueryAsync(query) {
+        if (typeof query !== 'string')
+            return this._checkQuery(query);
+        if (!this._encoder) {
+            throw new NoEncoderError("No encoder provided for text query");
+        }
+        this._checkModelCompat();
+        return this._checkQuery((await this.encodeTextsAsync([query]))[0]);
+    }
     get(nodeRef) {
         const key = this._nodeRefToKey(nodeRef);
         return this._embeddings.get(key) || null;
     }
     remove(nodeRef) {
         const key = this._nodeRefToKey(nodeRef);
-        return this._embeddings.delete(key);
+        const removed = this._embeddings.delete(key);
+        if (removed && this._scan !== null)
+            this._scan.drop(key);
+        return removed;
     }
-    similaritySearch(query, topK = 10, nodeType, threshold = 0.0) {
+    /**
+     * Find the most similar nodes by embedding.
+     *
+     * Exact by default. With `ann: 'ivf'`, a bounded `topK` on a store of at
+     * least `annMinSize` vectors is answered from the approximate index (the
+     * scores are the same cosine values, but a true neighbour in an unprobed
+     * cell can be missing); `exact: true` forces the full scan, and has no effect
+     * on a store without `ann`. `topK: null` always scans everything.
+     */
+    similaritySearch(query, topK = 10, nodeType, threshold = 0.0, exact = false) {
         const queryVector = this._resolveQuery(query);
+        if (this._ann !== null) {
+            if (exact || topK === null || topK <= 0) {
+                this._annCounts.exact++;
+            }
+            else {
+                const answer = this._annSearch(queryVector, topK, nodeType, threshold);
+                if (answer !== null)
+                    return answer;
+                this._annCounts.exact++;
+            }
+        }
+        return this._scanExact(queryVector, topK, nodeType, threshold);
+    }
+    /** The brute-force scan every search used before the approximate index existed. */
+    _scanExact(queryVector, topK, nodeType, threshold) {
         const results = [];
         for (const record of this._embeddings.values()) {
             if (nodeType && record.nodeRef[0] !== nodeType)
@@ -723,6 +1689,305 @@ export class EmbeddingStore {
         if (topK === null)
             return results.sort((a, b) => b.score - a.score);
         return selectTopK(results, topK);
+    }
+    /** {@link similaritySearch} with a text query encoded by awaiting the encoder. */
+    async similaritySearchAsync(query, topK = 10, nodeType, threshold = 0.0, exact = false) {
+        return this.similaritySearch(await this.resolveQueryAsync(query), topK, nodeType, threshold, exact);
+    }
+    /** The vector a query stands for (a text goes through the synchronous encoder). */
+    resolveQuery(query) {
+        return this._resolveQuery(query);
+    }
+    // -- approximate (IVF) search -------------------------------------------------
+    /** Cells for a store of `n` vectors: about 4 * sqrt(n), within [16, 65536]. */
+    static _annAutoNlist(n) {
+        return Math.min(Math.max(roundHalfEven(4 * Math.sqrt(n)), 16), 65536);
+    }
+    /**
+     * The cache holding the index, with the index built or maintained as the
+     * policy says; null means "answer exactly": `ann` is off, or the store holds
+     * fewer than `annMinSize` vectors.
+     *
+     * Policy:
+     *  - built lazily by the first search (never persisted): k-means on a sample
+     *    of up to 40 x nlist vectors, then every row assigned a cell;
+     *  - new and updated rows are scored exactly until at least
+     *    `max(512, 2%)` of the indexed rows are pending, then folded into cells;
+     *  - deletes tombstone (nothing to do but skip them);
+     *  - once writes + deletes since training exceed 50% of the trained size,
+     *    the index is retrained from the current data, with an automatic `nlist`
+     *    re-chosen for the new size;
+     *  - a cleared store, a dimension change, or a store that shrinks below
+     *    `annMinSize` drops the index with its cache.
+     */
+    _annIndex() {
+        if (this._ann === null || this._dimension === null)
+            return null;
+        const live = this._embeddings.size;
+        if (live < Math.max(2, this._annMinSize)) {
+            this._scan = null;
+            return null;
+        }
+        let scan = this._scan;
+        if (scan === null) {
+            scan = this._scan = ScanCache.build(this._embeddings.values(), live, this._dimension);
+        }
+        let ivf = scan.ivf;
+        if (ivf !== null && ivf.churn > ANN_RETRAIN_FRACTION * ivf.trainedN)
+            ivf = scan.ivf = null;
+        if (ivf === null) {
+            const nlist = this._annNlist ?? EmbeddingStore._annAutoNlist(live);
+            scan.ivf = IvfIndex.build(scan, nlist, this._annSeed);
+            this._annCounts.builds++;
+        }
+        else if (ivf.pending.size >= Math.max(ANN_FOLD_MIN, ANN_FOLD_FRACTION * ivf.trainedN)) {
+            ivf.fold(scan);
+        }
+        return scan;
+    }
+    _annProbe(ivf) {
+        const wanted = this._annNprobe ?? Math.max(1, roundHalfEven(0.05 * ivf.nlist));
+        return Math.min(wanted, ivf.nlist);
+    }
+    /**
+     * Cells to probe at widening `scale`; null = widened enough to just scan.
+     * Scale 1 honours `annNprobe` as configured (`annNprobe >= nlist` is the
+     * exact scan); later steps multiply it by 4 and give up on the index once
+     * they would touch half the cells, where scanning everything costs about the
+     * same.
+     */
+    _annLists(ivf, scale) {
+        const lists = this._annProbe(ivf) * scale;
+        if (scale === 1)
+            return lists >= ivf.nlist ? null : lists;
+        return lists * 2 >= ivf.nlist ? null : lists;
+    }
+    /** Load the query into the cache's float32 buffer; null when it has no direction (all zeros). */
+    _annQuery(scan, queryVector, nodeType) {
+        const q = scan.query;
+        let sum = 0;
+        for (let j = 0; j < scan.dim; j++) {
+            const f = Math.fround(queryVector[j]);
+            q[j] = f;
+            sum += f * f;
+        }
+        const qnorm = Math.sqrt(sum);
+        if (qnorm === 0)
+            return null;
+        let code = -1;
+        if (nodeType)
+            code = scan.codeOf.get(nodeType) ?? -2; // -2: no node of that type exists
+        return { qnorm, code };
+    }
+    /**
+     * Top-k from the index, or null to fall back to the exact scan.
+     *
+     * Filters (`nodeType`, `threshold`) apply to the probed rows. If fewer than
+     * `topK` survive, the probe is widened 4x and tried again, and past half the
+     * cells the exact scan answers instead - so a rare type or a high threshold
+     * costs time rather than silently returning a short list.
+     */
+    _annSearch(queryVector, topK, nodeType, threshold) {
+        const scan = this._annIndex();
+        if (scan === null)
+            return null;
+        const ivf = scan.ivf;
+        const prepared = this._annQuery(scan, queryVector, nodeType);
+        if (prepared === null)
+            return null;
+        if (prepared.code === -2)
+            return [];
+        const floor = threshold - ANN_THRESHOLD_SLACK;
+        for (let scale = 1;; scale *= 4) {
+            const lists = this._annLists(ivf, scale);
+            if (lists === null)
+                return null;
+            const m = ivf.gather(scan, scan.query, prepared.qnorm, prepared.code, floor, lists);
+            if (m < topK)
+                continue;
+            const best = ivf.best(m, topK);
+            const results = [];
+            for (let i = 0; i < best.length; i++) {
+                const record = this._embeddings.get(scan.keys[ivf.candRows[best[i]]]);
+                results.push({ nodeRef: record.nodeRef, score: ivf.candScores[best[i]], text: record.text });
+            }
+            this._annCounts.approximate++;
+            if (scale > 1)
+                this._annCounts.widened++;
+            return this.annPolish(results, queryVector, threshold);
+        }
+    }
+    /**
+     * Re-score approximate results with the exact float64 cosine the full scan
+     * uses (the index scores float32 copies), drop any that fall under
+     * `threshold` once exact, and order them best first.
+     */
+    annPolish(results, queryVector, threshold) {
+        const out = [];
+        for (const result of results) {
+            const record = this._embeddings.get(this._nodeRefToKey(result.nodeRef));
+            if (!record)
+                continue;
+            const score = this._cosineSimilarity(queryVector, record.vector);
+            if (score >= threshold)
+                out.push({ nodeRef: result.nodeRef, score, text: result.text });
+        }
+        return out.sort((a, b) => b.score - a.score);
+    }
+    /**
+     * Candidates for a search that has to filter them itself (a graph's
+     * `nodeFilter`): every row of the probed cells that clears `threshold`, best
+     * first, lazily, with *approximate* (float32) scores - pass what you keep to
+     * {@link annPolish}. `scale` is the widening step (1, 4, 16, ...); null asks
+     * for the exact scan. `approximate` is false when the answer is exact - the
+     * caller has nothing left to widen to.
+     */
+    annRanked(queryVector, nodeType, threshold, scale) {
+        if (scale !== null && this._ann !== null) {
+            const scan = this._annIndex();
+            const ivf = scan === null ? null : scan.ivf;
+            const lists = ivf === null ? null : this._annLists(ivf, scale);
+            const prepared = scan === null || lists === null ? null : this._annQuery(scan, queryVector, nodeType);
+            if (scan !== null && ivf !== null && lists !== null && prepared !== null) {
+                if (prepared.code === -2)
+                    return { ranked: [], approximate: false };
+                const m = ivf.gather(scan, scan.query, prepared.qnorm, prepared.code, threshold - ANN_THRESHOLD_SLACK, lists);
+                this._annCounts.approximate++;
+                if (scale > 1)
+                    this._annCounts.widened++;
+                const rows = ivf.candRows.slice(0, m);
+                const scores = ivf.candScores.slice(0, m);
+                const slots = new Int32Array(m);
+                for (let i = 0; i < m; i++)
+                    slots[i] = i;
+                slots.sort((a, b) => scores[b] - scores[a] || rows[a] - rows[b]);
+                const keys = scan.keys;
+                const embeddings = this._embeddings;
+                const ranked = (function* () {
+                    for (let i = 0; i < m; i++) {
+                        const record = embeddings.get(keys[rows[slots[i]]]);
+                        yield { nodeRef: record.nodeRef, score: scores[slots[i]], text: record.text };
+                    }
+                })();
+                return { ranked, approximate: true };
+            }
+        }
+        return { ranked: this._scanExact(queryVector, null, nodeType, threshold), approximate: false };
+    }
+    /**
+     * Build the approximate index now instead of on the first search; returns
+     * {@link annStats}. `force` retrains even if an index exists. Does nothing
+     * (and says so in the stats) while the store is smaller than `annMinSize`.
+     *
+     * @throws EmbeddingError when the store was created without `ann`
+     */
+    buildAnnIndex(force = false) {
+        if (this._ann === null) {
+            throw new EmbeddingError("this store has no approximate index; create it with ann: 'ivf'");
+        }
+        if (force && this._scan !== null)
+            this._scan.ivf = null;
+        const scan = this._annIndex();
+        if (scan !== null && scan.ivf !== null && scan.ivf.pending.size > 0)
+            scan.ivf.fold(scan);
+        return this.annStats();
+    }
+    /** What the approximate index looks like right now. Never builds anything. */
+    annStats() {
+        const scan = this._scan;
+        const ivf = scan === null ? null : scan.ivf;
+        return {
+            enabled: this._ann !== null,
+            mode: this._ann,
+            active: ivf !== null,
+            nlist: ivf === null ? null : ivf.nlist,
+            nprobe: ivf === null ? this._annNprobe : this._annProbe(ivf),
+            trainedN: ivf === null ? null : ivf.trainedN,
+            pending: ivf === null ? 0 : ivf.pending.size,
+            churn: ivf === null ? 0 : ivf.churn,
+            buildSeconds: ivf === null ? null : ivf.buildSeconds,
+            indexBytes: ivf === null ? 0 : ivf.bytes(),
+            cacheBytes: scan === null ? 0 : scan.bytes(),
+            minSize: this._annMinSize,
+            searches: { ...this._annCounts },
+        };
+    }
+    /**
+     * Recall@k of the approximate index against the exact scan.
+     *
+     * Runs every query both ways and compares the *sets* of top-k nodes.
+     * `queries` is a text, a vector, or a list of either. Use real queries from
+     * your own workload: recall depends on how the data clusters, and a score
+     * measured on unrelated queries or data does not transfer. Raise `annNprobe`
+     * until the recall you need holds.
+     *
+     * Without an index in use (`ann` off, a store under `annMinSize`, or
+     * `annNprobe >= nlist`) both answers are the exact scan, recall is 1 and
+     * `approximate` is false.
+     */
+    recallCheck(queries, k = 10, nodeType, threshold = 0.0) {
+        if (!Number.isInteger(k) || k <= 0)
+            throw new EmbeddingError(`k must be positive, got ${k}`);
+        const vectors = EmbeddingStore._queryList(queries).map(q => this._resolveQuery(q));
+        return this._recall(vectors, k, nodeType, threshold);
+    }
+    /** {@link recallCheck} with text queries encoded by awaiting the encoder. */
+    async recallCheckAsync(queries, k = 10, nodeType, threshold = 0.0) {
+        if (!Number.isInteger(k) || k <= 0)
+            throw new EmbeddingError(`k must be positive, got ${k}`);
+        const vectors = [];
+        for (const query of EmbeddingStore._queryList(queries))
+            vectors.push(await this.resolveQueryAsync(query));
+        return this._recall(vectors, k, nodeType, threshold);
+    }
+    /** One query or many, as a list of texts and plain number arrays. */
+    static _queryList(queries) {
+        if (typeof queries === 'string')
+            return [queries];
+        const list = Array.from(queries);
+        if (list.length > 0 && typeof list[0] === 'number')
+            return [list];
+        return list.map(q => (typeof q === 'string' ? q : Array.from(q)));
+    }
+    _recall(vectors, k, nodeType, threshold) {
+        const recalls = [];
+        const annTimes = [];
+        const exactTimes = [];
+        let used = false;
+        for (const vector of vectors) {
+            const before = this._annCounts.approximate;
+            let started = nowMs();
+            const found = this.similaritySearch(vector, k, nodeType, threshold);
+            annTimes.push(nowMs() - started);
+            used = used || this._annCounts.approximate > before;
+            started = nowMs();
+            const truth = this.similaritySearch(vector, k, nodeType, threshold, true);
+            exactTimes.push(nowMs() - started);
+            if (truth.length > 0) {
+                const wanted = new Set(truth.map(r => this._nodeRefToKey(r.nodeRef)));
+                const hits = found.filter(r => wanted.has(this._nodeRefToKey(r.nodeRef))).length;
+                recalls.push(hits / wanted.size);
+            }
+        }
+        const median = (values) => {
+            if (values.length === 0)
+                return 0;
+            const ordered = [...values].sort((a, b) => a - b);
+            const mid = ordered.length >> 1;
+            return ordered.length % 2 ? ordered[mid] : 0.5 * (ordered[mid - 1] + ordered[mid]);
+        };
+        const ivf = this._scan === null ? null : this._scan.ivf;
+        return {
+            recall: recalls.length ? recalls.reduce((a, b) => a + b, 0) / recalls.length : 1,
+            minRecall: recalls.length ? Math.min(...recalls) : 1,
+            queries: vectors.length,
+            k,
+            nlist: ivf === null ? 0 : ivf.nlist,
+            nprobe: ivf === null ? this._annNprobe ?? 0 : this._annProbe(ivf),
+            approximate: used,
+            annMs: median(annTimes),
+            exactMs: median(exactTimes),
+        };
     }
     /**
      * Cosine score for every embedded node, keyed by `type:id`.
@@ -753,6 +2018,7 @@ export class EmbeddingStore {
      */
     clear(resetDimension = false) {
         this._embeddings.clear();
+        this._scan = null;
         if (resetDimension)
             this._dimension = null;
     }
@@ -820,7 +2086,7 @@ export class EmbeddingStore {
             const ref = [item.type, id];
             this._checkDimension(item.vector, `embedding for :${item.type}:${id}`);
             const key = this._nodeRefToKey(ref);
-            this._embeddings.set(key, {
+            this._set(key, {
                 id: key,
                 nodeRef: ref,
                 vector: item.vector,
@@ -1049,10 +2315,15 @@ function edgeWeight(edge, weightField) {
 export class SemanticGraph extends ISONGraph {
     constructor(options = {}) {
         super(options.name || "semantic_graph", options.directed ?? true);
-        this._encoder = options.encoder || null;
+        this._encoder = adoptEncoder(options.encoder);
         this._embeddingStore = new EmbeddingStore(this._encoder || undefined, {
             version: options.version,
             onModelMismatch: options.onModelMismatch,
+            ann: options.ann,
+            annNlist: options.annNlist,
+            annNprobe: options.annNprobe,
+            annMinSize: options.annMinSize,
+            annSeed: options.annSeed,
         });
         this._autoEmbed = options.autoEmbed ?? true;
         this._embedFields = options.embedFields || ['name', 'description', 'content', 'text'];
@@ -1064,8 +2335,8 @@ export class SemanticGraph extends ISONGraph {
         return this._encoder;
     }
     setEncoder(encoder) {
-        this._encoder = encoder;
-        this._embeddingStore.encoder = encoder;
+        this._encoder = adoptEncoder(encoder);
+        this._embeddingStore.encoder = this._encoder;
     }
     /**
      * Render one property value as embedding text.
@@ -1120,10 +2391,51 @@ export class SemanticGraph extends ISONGraph {
         return node;
     }
     /**
+     * Like {@link addNode}, but awaits the encoder, so auto-embedding works with
+     * one that makes a network call (an HttpEncoder needs no prefetch).
+     *
+     * The text is embedded *before* the node is added: if the encoder fails the
+     * graph is untouched and the call can simply be retried.
+     */
+    async addNodeAsync(nodeType, nodeId, properties = {}) {
+        let text = '';
+        let vector = null;
+        if (this._autoEmbed && this._encoder) {
+            text = this.embedTextFor(properties);
+            if (text)
+                vector = (await this._embeddingStore.encodeTextsAsync([text]))[0];
+        }
+        const node = super.addNode(nodeType, nodeId, properties);
+        if (vector !== null)
+            this._embeddingStore.add(node.ref, text, vector);
+        return node;
+    }
+    /** Like {@link addNodeWithEmbed}, awaiting the encoder (see {@link addNodeAsync}). */
+    async addNodeWithEmbedAsync(nodeType, nodeId, properties = {}, embedText) {
+        if (embedText === undefined) {
+            return this.addNodeAsync(nodeType, nodeId, properties);
+        }
+        const vector = (await this._embeddingStore.encodeTextsAsync([embedText]))[0];
+        const node = super.addNode(nodeType, nodeId, properties);
+        this._embeddingStore.add(node.ref, embedText, vector);
+        return node;
+    }
+    /**
      * Embed a node with given text.
      */
     embedNode(nodeRef, text) {
         return this._embeddingStore.add(nodeRef, text);
+    }
+    /** Like {@link embedNode}, awaiting the encoder. */
+    embedNodeAsync(nodeRef, text) {
+        return this._embeddingStore.addAsync(nodeRef, text);
+    }
+    /** Like {@link embedNodes}, awaiting the encoder; stores nothing if it fails. */
+    async embedNodesAsync(items) {
+        const pairs = items.filter(([, text]) => Boolean(text));
+        if (pairs.length === 0)
+            return 0;
+        return this._embeddingStore.addBatchAsync(pairs);
     }
     /** Embed many nodes in a single batched encoder call. */
     embedNodes(items) {
@@ -1157,6 +2469,38 @@ export class SemanticGraph extends ISONGraph {
             }
             else if (this._encoder) {
                 this.embedNode(node.ref, text);
+            }
+        }
+        return node;
+    }
+    /**
+     * Like {@link updateNode}, but awaits the encoder when a re-embed is needed.
+     *
+     * The new text is embedded before anything changes, so an encoder failure
+     * leaves the node's properties and vector exactly as they were.
+     */
+    async updateNodeAsync(nodeType, nodeId, properties) {
+        const current = this.getNode(nodeType, nodeId);
+        const reembed = this._autoEmbed && this._embedFields.some(f => f in (properties ?? {}));
+        let text = '';
+        let vector = null;
+        if (reembed) {
+            text = this.embedTextFor({ ...current.properties, ...properties });
+            if (text && this._encoder)
+                vector = (await this._embeddingStore.encodeTextsAsync([text]))[0];
+        }
+        const node = super.updateNode(nodeType, nodeId, properties);
+        if (reembed) {
+            // Another update may have landed while the encoder was working.
+            const latest = this.embedTextFor(node.properties);
+            if (!latest) {
+                this._embeddingStore.remove(node.ref);
+            }
+            else if (this._encoder) {
+                if (vector === null || latest !== text) {
+                    vector = (await this._embeddingStore.encodeTextsAsync([latest]))[0];
+                }
+                this._embeddingStore.add(node.ref, latest, vector);
             }
         }
         return node;
@@ -1208,15 +2552,39 @@ export class SemanticGraph extends ISONGraph {
      * With a gate the store cannot truncate first: the best k *unfiltered*
      * matches may all be filtered out, so every match is scored, filtered, and
      * only then cut to k.
+     *
+     * With the store's approximate index the candidates are the probed cells
+     * only. If fewer than k of them pass the gate, the probe is widened (4x each
+     * step) and the search retried, ending in the exact scan, so a selective
+     * filter costs time rather than results.
      */
-    _seedSearch(query, topK, nodeType, threshold, gate) {
+    _seedSearch(query, topK, nodeType, threshold, gate, exact = false) {
+        const store = this._embeddingStore;
         if (gate === null) {
-            return this._embeddingStore.similaritySearch(query, topK, nodeType, threshold);
+            return store.similaritySearch(query, topK, nodeType, threshold, exact);
         }
-        const results = this._embeddingStore
-            .similaritySearch(query, null, nodeType, threshold)
-            .filter(r => gate(r.nodeRef));
-        return topK === null ? results : results.slice(0, Math.max(topK, 0));
+        if (store.ann === null || exact || topK === null || topK <= 0) {
+            const results = store
+                .similaritySearch(query, null, nodeType, threshold)
+                .filter(r => gate(r.nodeRef));
+            return topK === null ? results : results.slice(0, Math.max(topK, 0));
+        }
+        const queryVector = store.resolveQuery(query);
+        for (let scale = 1;; scale *= 4) {
+            const { ranked, approximate } = store.annRanked(queryVector, nodeType, threshold, scale);
+            const results = [];
+            for (const result of ranked) {
+                if (gate(result.nodeRef)) {
+                    results.push(result);
+                    if (results.length >= topK)
+                        break;
+                }
+            }
+            if (!approximate)
+                return results;
+            if (results.length >= topK)
+                return store.annPolish(results, queryVector, threshold);
+        }
     }
     /**
      * Find similar nodes by embedding.
@@ -1227,10 +2595,25 @@ export class SemanticGraph extends ISONGraph {
      *   the filter.
      * @param nodeTypes Keep only nodes whose type is in this list (a bare string
      *   means one type). Combines with `nodeType` and `nodeFilter` by AND.
+     * @param exact Force the full scan even when the graph was created with an
+     *   approximate index (`ann`); no effect otherwise.
      */
-    similaritySearch(query, topK = 10, nodeType, threshold = 0.0, nodeFilter, nodeTypes) {
+    similaritySearch(query, topK = 10, nodeType, threshold = 0.0, nodeFilter, nodeTypes, exact = false) {
         const gate = this._nodeGate(nodeFilter, nodeTypes);
-        return this._seedSearch(query, topK, nodeType, threshold, gate);
+        return this._seedSearch(query, topK, nodeType, threshold, gate, exact);
+    }
+    /** Recall@k of the approximate index against the exact scan (see {@link EmbeddingStore.recallCheck}). */
+    recallCheck(queries, k = 10, nodeType, threshold = 0.0) {
+        return this._embeddingStore.recallCheck(queries, k, nodeType, threshold);
+    }
+    /** {@link recallCheck} with text queries encoded by awaiting the encoder. */
+    recallCheckAsync(queries, k = 10, nodeType, threshold = 0.0) {
+        return this._embeddingStore.recallCheckAsync(queries, k, nodeType, threshold);
+    }
+    /** {@link similaritySearch} with a text query encoded by awaiting the encoder. */
+    async similaritySearchAsync(query, topK = 10, nodeType, threshold = 0.0, nodeFilter, nodeTypes, exact = false) {
+        const vector = await this._embeddingStore.resolveQueryAsync(query);
+        return this.similaritySearch(vector, topK, nodeType, threshold, nodeFilter, nodeTypes, exact);
     }
     /**
      * Find nodes semantically closest to one already in the graph.
@@ -1599,6 +2982,18 @@ export class SemanticGraph extends ISONGraph {
         }
         return null;
     }
+    /** {@link semanticMultiHop} with a text query encoded by awaiting the encoder (options form). */
+    async semanticMultiHopAsync(query, options = {}) {
+        return this.semanticMultiHop(await this._embeddingStore.resolveQueryAsync(query), options);
+    }
+    /** {@link semanticPath} with a text query encoded by awaiting the encoder (options form). */
+    async semanticPathAsync(query, targetRef, options = {}) {
+        return this.semanticPath(await this._embeddingStore.resolveQueryAsync(query), targetRef, options);
+    }
+    /** {@link semanticSubgraph} with a text query encoded by awaiting the encoder. */
+    async semanticSubgraphAsync(query, options = {}) {
+        return this.semanticSubgraph(await this._embeddingStore.resolveQueryAsync(query), options);
+    }
     /**
      * Extract the slice of the graph a query is actually about.
      *
@@ -1681,6 +3076,19 @@ export class SemanticGraph extends ISONGraph {
         }
         return this.embedNodes(batch);
     }
+    /** {@link embedAllNodes} awaiting the encoder: all the texts, then the stores. */
+    async embedAllNodesAsync(textFn, skipExisting = false) {
+        const fn = textFn || ((node) => this.embedTextFor(node.properties) || `${node.type}:${node.id}`);
+        const batch = [];
+        for (const node of this.nodes()) {
+            if (skipExisting && this._embeddingStore.get(node.ref))
+                continue;
+            const text = fn(node);
+            if (text)
+                batch.push([node.ref, text]);
+        }
+        return this.embedNodesAsync(batch);
+    }
     /**
      * Nodes whose stored vector was not made by the current encoder.
      *
@@ -1736,6 +3144,45 @@ export class SemanticGraph extends ISONGraph {
             count += this.embedNodes(pairs.slice(start, start + step));
         }
         return count;
+    }
+    /**
+     * {@link reembedStale} awaiting the encoder.
+     *
+     * Every stale text is encoded (`batchSize` per encoder call) before anything
+     * is written, so a failure partway leaves the store as it was. The new
+     * vectors' length decides whether the pinned dimension changes, which also
+     * works for an encoder that has not learned its dimension yet.
+     */
+    async reembedStaleAsync(includeUnknown = false, batchSize = 256) {
+        const stale = this.staleEmbeddings(includeUnknown);
+        if (stale.length === 0)
+            return 0;
+        const store = this._embeddingStore;
+        const pairs = [];
+        for (const ref of stale) {
+            const record = store.get(ref);
+            if (!record)
+                continue;
+            let text = record.text;
+            if (!text) {
+                const node = this._resolveNode(ref);
+                text = (node ? this.embedTextFor(node.properties) : '') || `${ref[0]}:${ref[1]}`;
+            }
+            pairs.push([ref, text]);
+        }
+        if (!this._encoder)
+            throw new NoEncoderError("No encoder provided to re-embed with");
+        const step = Math.max(1, Math.floor(batchSize));
+        const vectors = [];
+        for (let start = 0; start < pairs.length; start += step) {
+            const chunk = pairs.slice(start, start + step);
+            vectors.push(...await store.encodeTextsAsync(chunk.map(([, text]) => text)));
+        }
+        if (vectors.length > 0 && store.dimension !== null && store.dimension !== vectors[0].length) {
+            store.clear(true);
+        }
+        pairs.forEach(([ref, text], i) => store.add(ref, text, vectors[i]));
+        return pairs.length;
     }
     /**
      * Build a SemanticGraph from a plain ISONGraph (for example one parsed with

@@ -1,0 +1,135 @@
+{
+ "system": "sqlite_vec",
+ "ds": "sift",
+ "n": 100000,
+ "d": 128,
+ "k": 10,
+ "queries": 2000,
+ "all_threads": 32,
+ "exps": [
+  "core",
+  "mutation",
+  "saveload"
+ ],
+ "started": "2026-11-16 11:17:45",
+ "mem_baseline": {
+  "rss_mb": 35.421875,
+  "peak_mb": 35.421875
+ },
+ "version": "sqlite-vec 0.1.9 / sqlite 3.45.3",
+ "build": {
+  "ingest_s": 0.5556321000331081,
+  "index_s": 2.400018274784088e-06,
+  "total_s": 0.5556345000513829,
+  "first_query_ms": 32.17329998733476,
+  "ready_s": 0.5878078000387177,
+  "total_s_runs": [
+   0.5556345000513829,
+   1.9912856000592,
+   2.163471699866932
+  ]
+ },
+ "mem_after_build": {
+  "rss_mb": 39.12890625,
+  "peak_mb": 58.66796875
+ },
+ "mem_after_first_query": {
+  "rss_mb": 39.51953125,
+  "peak_mb": 58.66796875
+ },
+ "sweep": [
+  {
+   "nq": 93,
+   "recall_queries": 93,
+   "recall": 1.0,
+   "qps_1t_runs": [
+    22.39173649564215,
+    21.024955742055827,
+    21.553401877047236
+   ],
+   "qps_1t": 21.553401877047236,
+   "qps_1t_min": 21.024955742055827,
+   "qps_1t_max": 22.39173649564215,
+   "median_ms": 46.99310002615675,
+   "p95_ms": 52.64740001875907,
+   "p99_ms": 57.69439799711084,
+   "mean_ms": 46.2060820792825,
+   "knob": null
+  }
+ ],
+ "knob_name": null,
+ "loop_allthreads": {
+  "nq": 35,
+  "threads": 32,
+  "qps": 11.035035922920613,
+  "median_ms": 89.86820001155138,
+  "p95_ms": 108.1220000050962,
+  "p99_ms": 113.00987200811505,
+  "mean_ms": 90.91911619263036
+ },
+ "mem_after_sweep": {
+  "rss_mb": 41.1015625,
+  "peak_mb": 58.66796875
+ },
+ "ref_knob": null,
+ "ref_recall_pre": 1.0,
+ "mutation": {
+  "ref_knob": null,
+  "recall_before": 1.0,
+  "insert_10k": {
+   "seconds": 0.307022099965252,
+   "per_s": 32570.945222287828,
+   "batch": 1000
+  },
+  "update_10k": {
+   "seconds": 10.963700100022834,
+   "per_s": 912.1008335478981,
+   "batch": 1000
+  },
+  "delete_10k": {
+   "seconds": 8.295781599998008,
+   "per_s": 1205.43192699316,
+   "batch": 1000
+  },
+  "mem_after": {
+   "rss_mb": 50.640625,
+   "peak_mb": 62.6171875
+  },
+  "first_query_after_ms": 109.39749999670312,
+  "after": {
+   "nq": 56,
+   "recall_queries": 56,
+   "recall": 1.0,
+   "qps_1t_runs": [
+    18.043468713921857,
+    18.005915586202843,
+    17.695198498405215
+   ],
+   "qps_1t": 18.005915586202843,
+   "qps_1t_min": 17.695198498405215,
+   "qps_1t_max": 18.043468713921857,
+   "median_ms": 55.82765000872314,
+   "p95_ms": 66.20149501541165,
+   "p99_ms": 83.73340703430587,
+   "mean_ms": 55.82384166787268
+  },
+  "recall_after": 1.0
+ },
+ "saveload": {
+  "save_s": 0.0011999999987892807,
+  "disk_mb": 61.7890625,
+  "load_s": 0.0007896000170148909,
+  "first_query_after_load_ms": 104.93339999811724,
+  "time_to_ready_s": 0.10572300001513213
+ },
+ "mem_end": {
+  "rss_mb": 36.95703125,
+  "peak_mb": 62.6171875
+ },
+ "status": "ok",
+ "finished": "2026-11-16 11:18:48",
+ "load_before_pct": 12.049999999999994,
+ "load_contaminated": false,
+ "wall_s": 63.71775794029236,
+ "flag": null
+}

@@ -1,0 +1,18 @@
+D:\Goldmine\ISON\bench_data\rs_target_stagec\release\examples\stage_c_bench.exe --ds-dir D:\Goldmine\ISON\bench_data\prep/text384 --ds text384 --n 1000000 --mode exact --exp core,int8,conc --queries 1000 --budget 3 --label rust_exact --out D:\Goldmine\ISON\ison_dev\isongraphossworking\isongraph-vector\benchmarks\rust-stage-c\raw\rust_exact_text384_1000000_r1.json
+rust_exact: ds=text384 n=1000000 d=384 mode=exact int8=0 queries=1000 cpus=32 exps=["core", "int8", "conc"]
+  ingest 1.14s  rss 1629 MB
+  int8 study: f32 1T 11.1 qps, auto 25.2 qps, batch 560 qps
+  rerank x1: recall vs f32 0.9917 (worst 0.90) exact_scores=true applies=true int8 12.108 ms f32 39.078 ms
+    1T 33.0 qps (recall vs float64 truth 0.9907), auto 79.0 qps, batch 547 qps
+  rerank x2: recall vs f32 1.0000 (worst 1.00) exact_scores=true applies=true int8 12.974 ms f32 39.078 ms
+    1T 36.2 qps (recall vs float64 truth 1.0000), auto 80.0 qps, batch 549 qps
+  rerank x4: recall vs f32 1.0000 (worst 1.00) exact_scores=true applies=true int8 12.643 ms f32 39.078 ms
+    1T 33.0 qps (recall vs float64 truth 1.0000), auto 79.5 qps, batch 537 qps
+  rerank x8: recall vs f32 1.0000 (worst 1.00) exact_scores=true applies=true int8 13.126 ms f32 39.078 ms
+    1T 32.8 qps (recall vs float64 truth 1.0000), auto 80.7 qps, batch 520 qps
+  exact 1T recall=1.0000 qps=11.1 median=90.406ms | auto 25.2 qps | batch 560 qps
+  concurrent clients=1 (1 scan thread each): 4.9 qps
+  concurrent clients=2 (1 scan thread each): 8.2 qps
+  concurrent clients=4 (1 scan thread each): 17.3 qps
+  concurrent clients=8 (1 scan thread each): 37.0 qps
+  concurrent clients=16 (1 scan thread each): 60.2 qps

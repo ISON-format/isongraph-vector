@@ -1,0 +1,9 @@
+new: n=1000000 d=384 queries=2000 nprobe=128 has_batch=true
+  built: first query 2.10 ms, then median 1.523 ms p99 2.019 ms
+  built (1 thread): first query 4.33 ms, then median 4.115 ms p99 6.018 ms
+  insert 30k: 0.25s = 119198/s, per-write median 0.0010 ms p99 0.0075 ms max 3.665 ms
+  after 30k inserts (1 thread): first query 4.94 ms, then median 4.527 ms p99 9.597 ms
+  update 10k: 142182/s max 1.642 ms
+  delete 10k: 1083107/s
+  after 30k writes total (1 thread): first query 4.69 ms, then median 4.396 ms p99 8.350 ms
+wrote D:/Goldmine/ISON/ison_dev/isongraphossworking/isongraph-vector/benchmarks/rust-stage-a/raw/eb_new_1000000_writes_r1.json

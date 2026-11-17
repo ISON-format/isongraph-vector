@@ -1,0 +1,198 @@
+{
+  "all_threads": 32,
+  "budget": 3.0,
+  "build": {
+    "first_query_ms": 0.4515,
+    "index_s": 6.8565933999999995,
+    "ingest_s": 0.0986465,
+    "stats_build_seconds": 6.8564926,
+    "total_s": 6.9552399
+  },
+  "d": 384,
+  "ds": "text384",
+  "exps": [
+    "core"
+  ],
+  "first_exact_query_ms": 2.5442,
+  "index_stats": {
+    "ef_search_default": 96,
+    "graph_nodes": 100000,
+    "index_bytes": 14458880,
+    "max_level": 4,
+    "nlist": null,
+    "trained_n": 100000
+  },
+  "int8_rerank": 4,
+  "k": 10,
+  "knob_name": "ef_search",
+  "mem_after_build": {
+    "peak_mb": 246.66015625,
+    "rss_mb": 246.66015625
+  },
+  "mem_after_first_exact_query": {
+    "peak_mb": 207.7890625,
+    "rss_mb": 207.7890625
+  },
+  "mem_after_ingest": {
+    "peak_mb": 196.2578125,
+    "rss_mb": 168.9921875
+  },
+  "mem_after_sweep": {
+    "peak_mb": 249.19140625,
+    "rss_mb": 249.19140625
+  },
+  "mem_baseline": {
+    "peak_mb": 7.87109375,
+    "rss_mb": 7.87109375
+  },
+  "mem_end": {
+    "peak_mb": 249.21484375,
+    "rss_mb": 249.21484375
+  },
+  "memory_stats": {
+    "index_bytes": 14458880,
+    "matrix_bytes": 154140672,
+    "metadata_bytes": 12696122,
+    "quant_bytes": 39059456,
+    "total_bytes": 181295674
+  },
+  "mode": "hnsw",
+  "n": 100000,
+  "quant_build_s": 0.1071674,
+  "quant_bytes_mb": 37.25,
+  "queries": 1000,
+  "raw_vectors_mb": 146.484375,
+  "ref_knob": 128,
+  "ref_recall_pre": 0.9626,
+  "rss_delta_int8_mb": 37.02734375,
+  "started": "SystemTime { intervals: 134393523724343436 }",
+  "status": "ok",
+  "sweep": [
+    {
+      "batch": {
+        "nq": 1000,
+        "qps_batch": 24497.255082567997,
+        "qps_batch_max": 25322.16119581374,
+        "qps_batch_min": 24246.421228226714,
+        "qps_batch_runs": [
+          24497.255082567997,
+          24246.421228226714,
+          25322.16119581374
+        ],
+        "recall": 0.9145,
+        "threads": 32
+      },
+      "knob": 64,
+      "max_ms": 1.9908000000000001,
+      "mean_ms": 0.20320946666666675,
+      "median_ms": 0.20049999999999998,
+      "nq": 1000,
+      "p95_ms": 0.259,
+      "p99_ms": 0.3026,
+      "qps_1t": 5016.509332212305,
+      "qps_1t_max": 5102.295931123086,
+      "qps_1t_min": 4666.433967159504,
+      "qps_1t_runs": [
+        5102.295931123086,
+        4666.433967159504,
+        5016.509332212305
+      ],
+      "recall": 0.9145
+    },
+    {
+      "batch": {
+        "nq": 1000,
+        "qps_batch": 17919.57337079719,
+        "qps_batch_max": 18744.212724321365,
+        "qps_batch_min": 17671.9659001746,
+        "qps_batch_runs": [
+          18744.212724321365,
+          17919.57337079719,
+          17671.9659001746
+        ],
+        "recall": 0.9476,
+        "threads": 32
+      },
+      "knob": 96,
+      "max_ms": 2.4105,
+      "mean_ms": 0.2758743000000001,
+      "median_ms": 0.2748,
+      "nq": 1000,
+      "p95_ms": 0.33149999999999996,
+      "p99_ms": 0.3653,
+      "qps_1t": 3584.1780046164204,
+      "qps_1t_max": 3712.1150815069145,
+      "qps_1t_min": 3581.2681055485646,
+      "qps_1t_runs": [
+        3712.1150815069145,
+        3584.1780046164204,
+        3581.2681055485646
+      ],
+      "recall": 0.9476
+    },
+    {
+      "batch": {
+        "nq": 1000,
+        "qps_batch": 14797.299196950573,
+        "qps_batch_max": 15109.140879140472,
+        "qps_batch_min": 14529.118532907729,
+        "qps_batch_runs": [
+          14797.299196950573,
+          15109.140879140472,
+          14529.118532907729
+        ],
+        "recall": 0.9626,
+        "threads": 32
+      },
+      "knob": 128,
+      "max_ms": 2.0664,
+      "mean_ms": 0.35451056666666586,
+      "median_ms": 0.35579999999999995,
+      "nq": 1000,
+      "p95_ms": 0.4243,
+      "p99_ms": 0.4652,
+      "qps_1t": 2794.835591001526,
+      "qps_1t_max": 2903.817997980108,
+      "qps_1t_min": 2767.364033178487,
+      "qps_1t_runs": [
+        2903.817997980108,
+        2794.835591001526,
+        2767.364033178487
+      ],
+      "recall": 0.9626
+    },
+    {
+      "batch": {
+        "nq": 1000,
+        "qps_batch": 10341.208163349726,
+        "qps_batch_max": 10642.736119743553,
+        "qps_batch_min": 10234.021366589808,
+        "qps_batch_runs": [
+          10234.021366589808,
+          10341.208163349726,
+          10642.736119743553
+        ],
+        "recall": 0.9796,
+        "threads": 32
+      },
+      "knob": 192,
+      "max_ms": 1.1415,
+      "mean_ms": 0.5200692666666658,
+      "median_ms": 0.5216,
+      "nq": 1000,
+      "p95_ms": 0.6486999999999999,
+      "p99_ms": 0.749,
+      "qps_1t": 1969.2796316029205,
+      "qps_1t_max": 1991.3487843413095,
+      "qps_1t_min": 1817.4029783963483,
+      "qps_1t_runs": [
+        1991.3487843413095,
+        1969.2796316029205,
+        1817.4029783963483
+      ],
+      "recall": 0.9796
+    }
+  ],
+  "system": "rust_hnsw_i8x4",
+  "version": "isongraph-vector-rs HEAD (cargo release, default flags)"
+}

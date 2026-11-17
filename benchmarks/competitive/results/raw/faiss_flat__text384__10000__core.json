@@ -1,0 +1,91 @@
+{
+ "system": "faiss_flat",
+ "ds": "text384",
+ "n": 10000,
+ "d": 384,
+ "k": 10,
+ "queries": 2000,
+ "all_threads": 32,
+ "exps": [
+  "core"
+ ],
+ "started": "2026-11-16 08:57:31",
+ "mem_baseline": {
+  "rss_mb": 37.26171875,
+  "peak_mb": 37.26171875
+ },
+ "version": "faiss-cpu 1.16.0",
+ "build": {
+  "ingest_s": 0.004413699964061379,
+  "index_s": 1.200009137392044e-06,
+  "total_s": 0.0044148999731987715,
+  "first_query_ms": 0.8730000117793679,
+  "ready_s": 0.005287899984978139
+ },
+ "mem_after_build": {
+  "rss_mb": 69.9921875,
+  "peak_mb": 84.6484375
+ },
+ "mem_after_first_query": {
+  "rss_mb": 70.0703125,
+  "peak_mb": 84.6484375
+ },
+ "sweep": [
+  {
+   "nq": 2000,
+   "recall_queries": 2000,
+   "recall": 1.0,
+   "qps_1t_runs": [
+    2845.028324334414,
+    2752.5226171264526,
+    2860.3783559199533
+   ],
+   "qps_1t": 2845.028324334414,
+   "qps_1t_min": 2752.5226171264526,
+   "qps_1t_max": 2860.3783559199533,
+   "median_ms": 0.3364000003784895,
+   "p95_ms": 0.4412049864185974,
+   "p99_ms": 0.5895130062708634,
+   "mean_ms": 0.35479918311466463,
+   "knob": null,
+   "batch": {
+    "recall": 1.0,
+    "qps_batch_runs": [
+     57217.23959163985,
+     55693.241558925154,
+     50884.62930485946
+    ],
+    "qps_batch": 55693.241558925154,
+    "qps_batch_min": 50884.62930485946,
+    "qps_batch_max": 57217.23959163985,
+    "threads": 32
+   }
+  }
+ ],
+ "knob_name": null,
+ "loop_allthreads": {
+  "nq": 723,
+  "threads": 32,
+  "qps": 292.60018974727126,
+  "median_ms": 3.4824999747797847,
+  "p95_ms": 4.258919972926377,
+  "p99_ms": 5.689883986487994,
+  "mean_ms": 3.5678609504045404
+ },
+ "mem_after_sweep": {
+  "rss_mb": 81.8671875,
+  "peak_mb": 89.44140625
+ },
+ "ref_knob": null,
+ "ref_recall_pre": 1.0,
+ "mem_end": {
+  "rss_mb": 78.93359375,
+  "peak_mb": 89.44140625
+ },
+ "status": "ok",
+ "finished": "2026-11-16 08:57:41",
+ "load_before_pct": 4.443749999999998,
+ "load_contaminated": false,
+ "wall_s": 10.524060010910034,
+ "flag": null
+}

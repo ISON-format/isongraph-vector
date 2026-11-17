@@ -26,9 +26,28 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 use thiserror::Error;
 
+mod ann;
+pub use ann::quant::{Int8Recall, ScanPrecision, DEFAULT_RERANK_FACTOR};
+pub use ann::{
+    AnnConfig, AnnMode, AnnSearchCounts, AnnStats, MemoryStats, RecallReport, ANN_MIN_SIZE,
+    FOLD_BATCH,
+};
+mod hnsw;
+pub use hnsw::{HnswConfig, HNSW_EF_CONSTRUCTION, HNSW_M};
+mod pool;
+pub use pool::SearchPool;
+mod shared;
+pub use shared::SharedEmbeddingStore;
+mod snapshot;
+pub use snapshot::{
+    snapshot_path_for, LoadReport, LoadSource, SidecarId, SnapshotIdentity, SnapshotInfo,
+    SNAPSHOT_SUFFIX, SNAPSHOT_VERSION,
+};
+mod table;
+use table::VectorTable;
 mod digest;
 pub use digest::{
     graph_digest, graph_digest_of_text, graph_digest_with_int_ids, GRAPH_DIGEST_BASIS,
@@ -516,8 +535,21 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), Embedding
     result
 }
 
+/// Vectors, their text and model, searchable by cosine similarity.
+///
+/// The vectors live once, in a contiguous matrix; a record is a row of it (see
+/// `DESIGN.md`). Searches take `&self`, never lock the data and may run from
+/// any number of threads at once; writes take `&mut self`, so a search can
+/// never see a half-applied write. To read and write from different threads,
+/// share the store through [`SharedEmbeddingStore`] (a reader/writer lock with
+/// short write sections).
 pub struct EmbeddingStore {
-    embeddings: HashMap<String, EmbeddingRecord>,
+    /// The single copy of every vector, plus the per-row metadata and the key
+    /// index. Everything else derived from it (the approximate index) refers to
+    /// rows by slot number.
+    table: VectorTable,
+    /// One shared string per distinct model name, so a row holds a pointer.
+    model_names: HashMap<String, Arc<str>>,
     encoder: Option<Box<dyn EmbeddingEncoder>>,
     dimension: Option<usize>,
     version: Option<String>,
@@ -529,12 +561,27 @@ pub struct EmbeddingStore {
     /// Every warning this store has issued, so callers and tests can read them.
     warnings: Mutex<Vec<String>>,
     last_import_meta: ImportMeta,
+    /// The opt-in approximate index settings (`None` = every search exact).
+    ann: Option<AnnConfig>,
+    /// The most threads a search, batch, fold or build may use (0 = automatic).
+    scan_threads: usize,
+    /// The pool parallel work runs on (`None` = the process-wide one).
+    pool: Option<Arc<SearchPool>>,
+    /// The approximate index: built lazily by a search (the only time the lock
+    /// is written during a search), maintained by writes through `&mut self`
+    /// (no locking), never persisted.
+    ivf: ann::IvfSlot,
+    /// The HNSW graph (same life cycle as `ivf`; only one of the two is ever
+    /// built, the one `ann.mode` names).
+    hnsw: hnsw::HnswSlot,
+    counts: ann::Counters,
 }
 
 impl EmbeddingStore {
     pub fn new(encoder: Option<Box<dyn EmbeddingEncoder>>) -> Self {
         Self {
-            embeddings: HashMap::new(),
+            table: VectorTable::new(),
+            model_names: HashMap::new(),
             encoder,
             dimension: None,
             version: None,
@@ -543,6 +590,12 @@ impl EmbeddingStore {
             warned: Mutex::new(HashSet::new()),
             warnings: Mutex::new(Vec::new()),
             last_import_meta: ImportMeta::default(),
+            ann: None,
+            scan_threads: 0,
+            pool: None,
+            ivf: RwLock::new(None),
+            hnsw: RwLock::new(None),
+            counts: ann::Counters::default(),
         }
     }
 
@@ -596,6 +649,20 @@ impl EmbeddingStore {
         self.warnings.lock().map(|w| w.clone()).unwrap_or_default()
     }
 
+    /// Warn when the encoder version in use differs from the one recorded by
+    /// the last import (JSON or snapshot).
+    pub(crate) fn warn_on_version_skew(&self) {
+        let stored = self.last_import_meta().encoder_version.clone();
+        if let (Some(stored), Some(current)) = (stored, self.version()) {
+            if stored != current {
+                self.warn(format!(
+                    "embeddings were made by encoder version '{stored}', but the \
+                     encoder in use is version '{current}'"
+                ));
+            }
+        }
+    }
+
     pub fn clear_warnings(&self) {
         if let Ok(mut w) = self.warnings.lock() {
             w.clear();
@@ -647,27 +714,6 @@ impl EmbeddingStore {
                 expected,
             }),
             _ => Ok(()),
-        }
-    }
-
-    fn cosine_similarity(v1: &[f32], v2: &[f32]) -> f32 {
-        let mut dot = 0.0;
-        let mut norm1 = 0.0;
-        let mut norm2 = 0.0;
-
-        for (a, b) in v1.iter().zip(v2.iter()) {
-            dot += a * b;
-            norm1 += a * a;
-            norm2 += b * b;
-        }
-
-        norm1 = norm1.sqrt();
-        norm2 = norm2.sqrt();
-
-        if norm1 == 0.0 || norm2 == 0.0 {
-            0.0
-        } else {
-            dot / (norm1 * norm2)
         }
     }
 
@@ -751,20 +797,28 @@ impl EmbeddingStore {
     ) -> Vec<NodeId> {
         let model = model.map(String::from).or_else(|| self.current_model());
         let dimension = dimension.or_else(|| self.encoder.as_ref().map(|e| e.dimension()));
+        let by_dim = dimension.is_some_and(|d| self.table.dim != d);
         let mut out: Vec<NodeId> = self
-            .embeddings
-            .values()
-            .filter(|record| {
+            .table
+            .live_slots()
+            .filter(|&slot| {
+                let meta = self.table.meta(slot).expect("live rows have metadata");
                 let by_model = model.as_ref().is_some_and(|m| {
-                    record.model != *m && (include_unknown || !is_unknown_model(&record.model))
+                    *meta.model != **m && (include_unknown || !is_unknown_model(&meta.model))
                 });
-                let by_dim = dimension.is_some_and(|d| record.vector.len() != d);
                 by_model || by_dim
             })
-            .map(|record| record.node_id.clone())
+            .filter_map(|slot| self.table.node_id(slot))
             .collect();
         out.sort_by(|a, b| (&a.node_type, &a.id).cmp(&(&b.node_type, &b.id)));
         out
+    }
+
+    /// Encode one text with the store's encoder (no model-compatibility
+    /// check; that is for queries, see `resolve_query`).
+    pub fn encode(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        let encoder = self.encoder.as_ref().ok_or(EmbeddingError::NoEncoder)?;
+        Ok(encoder.encode(text))
     }
 
     /// Turn a query into a vector. Text needs an encoder, and is checked
@@ -782,33 +836,50 @@ impl EmbeddingStore {
 
     // -- writes ---------------------------------------------------------------
 
-    /// Insert or replace one record, keeping the per-model counts in step.
+    /// The shared string for a model name.
+    fn intern_model(&mut self, model: &str) -> Arc<str> {
+        if let Some(name) = self.model_names.get(model) {
+            return name.clone();
+        }
+        let name: Arc<str> = Arc::from(model);
+        self.model_names.insert(model.to_string(), name.clone());
+        name
+    }
+
+    /// One fewer record carries `model`.
+    fn uncount_model(&mut self, model: &str) {
+        if let Some(n) = self.model_counts.get_mut(model) {
+            *n -= 1;
+            if *n == 0 {
+                self.model_counts.remove(model);
+            }
+        }
+    }
+
+    /// Insert or replace one record, keeping the per-model counts in step. An
+    /// update overwrites the row in place (same slot); an insert takes the next
+    /// one. The write is complete when this returns: the row, its metadata, the
+    /// key index and the approximate index (including any fold it triggers).
     fn put(&mut self, node_id: NodeId, text: &str, vector: Vec<f32>, model: &str) -> String {
         let key = Self::node_id_to_key(&node_id);
-        self.forget(&key);
+        let model_name = self.intern_model(model);
+        let (slot, replaced) = self
+            .table
+            .put(&key, &node_id.node_type, &vector, text, &model_name);
+        if let Some(old) = replaced {
+            self.uncount_model(&old);
+        }
         *self.model_counts.entry(model.to_string()).or_insert(0) += 1;
-        self.embeddings.insert(
-            key.clone(),
-            EmbeddingRecord {
-                id: key.clone(),
-                node_id,
-                vector,
-                text: text.to_string(),
-                model: model.to_string(),
-            },
-        );
+        self.index_row_written(slot);
         key
     }
 
+    /// Remove a record: tombstone its row and take it out of the index.
     fn forget(&mut self, key: &str) -> bool {
-        match self.embeddings.remove(key) {
-            Some(old) => {
-                if let Some(n) = self.model_counts.get_mut(&old.model) {
-                    *n -= 1;
-                    if *n == 0 {
-                        self.model_counts.remove(&old.model);
-                    }
-                }
+        match self.table.remove(key) {
+            Some((slot, model)) => {
+                self.uncount_model(&model);
+                self.index_row_removed(slot);
                 true
             }
             None => false,
@@ -873,9 +944,18 @@ impl EmbeddingStore {
         Ok(entries.len())
     }
 
-    pub fn get(&self, node_id: &NodeId) -> Option<&EmbeddingRecord> {
+    /// The record for a node, copied out of the store (the vector is a row of
+    /// the shared matrix, so a record is built on request; use
+    /// [`get_vector`](Self::get_vector) to borrow it instead).
+    pub fn get(&self, node_id: &NodeId) -> Option<EmbeddingRecord> {
         let key = Self::node_id_to_key(node_id);
-        self.embeddings.get(&key)
+        self.table.record(self.table.slot_of(&key)? as usize)
+    }
+
+    /// The stored vector of a node, borrowed from the matrix.
+    pub fn get_vector(&self, node_id: &NodeId) -> Option<&[f32]> {
+        let key = Self::node_id_to_key(node_id);
+        Some(self.table.row(self.table.slot_of(&key)? as usize))
     }
 
     pub fn remove(&mut self, node_id: &NodeId) -> bool {
@@ -894,6 +974,13 @@ impl EmbeddingStore {
         self.similarity_search_vector(&query_vector, top_k, node_type, threshold)
     }
 
+    /// Best `top_k` matches for a vector, best first; equal scores come back
+    /// in a stable order (the order the vectors were stored in).
+    ///
+    /// `top_k = usize::MAX` returns every match. With an approximate index
+    /// configured (`set_ann`) a bounded `top_k` on a large enough store is
+    /// answered from it; use `similarity_search_vector_exact` to force the
+    /// full scan.
     pub fn similarity_search_vector(
         &self,
         query_vector: &[f32],
@@ -901,65 +988,19 @@ impl EmbeddingStore {
         node_type: Option<&str>,
         threshold: f32,
     ) -> Result<Vec<SimilarityResult>, EmbeddingError> {
-        self.check_query(query_vector)?;
-
-        let mut results: Vec<SimilarityResult> = self
-            .embeddings
-            .values()
-            .filter(|record| node_type.is_none_or(|t| record.node_id.node_type == t))
-            .filter_map(|record| {
-                let score = Self::cosine_similarity(query_vector, &record.vector);
-                if score >= threshold {
-                    Some(SimilarityResult {
-                        node_id: record.node_id.clone(),
-                        score,
-                        text: record.text.clone(),
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // Selecting the top k rather than ordering every candidate: O(n log k)
-        // against O(n log n), same rows in the same order.
-        let by_score = |a: &SimilarityResult, b: &SimilarityResult| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        };
-        if top_k == 0 {
-            return Ok(Vec::new());
-        }
-        if results.len() > top_k {
-            results.select_nth_unstable_by(top_k - 1, by_score);
-            results.truncate(top_k);
-        }
-        results.sort_by(by_score);
-
-        Ok(results)
+        self.search_vector(query_vector, top_k, node_type, threshold, false)
     }
 
     /// Cosine score for every embedded node, keyed by `type:id`.
     ///
     /// One scan serving both seed selection and the per-node relevance that
-    /// `semantic_multi_hop` blends in, instead of two.
+    /// `semantic_multi_hop` blends in, instead of two. Always the full scan.
     pub fn score_map(&self, query_vector: &[f32]) -> Result<HashMap<String, f32>, EmbeddingError> {
-        self.check_query(query_vector)?;
-        Ok(self
-            .embeddings
-            .iter()
-            .map(|(key, record)| {
-                (
-                    key.clone(),
-                    Self::cosine_similarity(query_vector, &record.vector),
-                )
-            })
-            .collect())
+        self.scan_scores(query_vector)
     }
 
     pub fn count(&self) -> usize {
-        self.embeddings.len()
+        self.table.live()
     }
 
     /// Remove every embedding and forget the pinned dimension, so the next
@@ -974,8 +1015,10 @@ impl EmbeddingStore {
     /// without it the store keeps refusing vectors of the wrong length even
     /// while empty.
     pub fn clear_with(&mut self, reset_dimension: bool) {
-        self.embeddings.clear();
+        self.table.clear();
         self.model_counts.clear();
+        *self.ivf_mut() = None;
+        *self.hnsw_mut() = None;
         if reset_dimension {
             self.dimension = None;
         }
@@ -994,17 +1037,21 @@ impl EmbeddingStore {
     /// and `graph_digest` / `graph_digest_basis` when a digest is given.
     pub fn export_embeddings_with(&self, graph_digest: Option<&str>) -> ExportedEmbeddings {
         let mut embeddings: Vec<ExportedEmbedding> = self
-            .embeddings
-            .values()
-            .map(|record| ExportedEmbedding {
-                node_type: record.node_id.node_type.clone(),
-                id: EmbeddingId::Str(record.node_id.id.clone()),
-                // Rust node ids are always strings; the other ports use this
-                // to tell a numeric id from a numeric-looking string one.
-                id_type: "str".to_string(),
-                text: record.text.clone(),
-                model: Some(record.model.clone()),
-                vector: record.vector.clone(),
+            .table
+            .live_slots()
+            .filter_map(|slot| {
+                let meta = self.table.meta(slot)?;
+                let node_id = self.table.node_id(slot)?;
+                Some(ExportedEmbedding {
+                    node_type: node_id.node_type,
+                    id: EmbeddingId::Str(node_id.id),
+                    // Rust node ids are always strings; the other ports use this
+                    // to tell a numeric id from a numeric-looking string one.
+                    id_type: "str".to_string(),
+                    text: meta.text.to_string(),
+                    model: Some(meta.model.to_string()),
+                    vector: self.table.row(slot).to_vec(),
+                })
             })
             .collect();
         embeddings.sort_by(|a, b| {
@@ -1289,6 +1336,9 @@ pub struct SimilarityOptions<'a> {
     /// Applied *before* `top_k` is taken, so a filtered-out best match does
     /// not cost a slot.
     pub filter: NodeFilter<'a>,
+    /// Force the full scan even when the store has an approximate index
+    /// (`set_ann`); no effect otherwise.
+    pub exact: bool,
 }
 
 impl Default for SimilarityOptions<'_> {
@@ -1298,6 +1348,7 @@ impl Default for SimilarityOptions<'_> {
             node_type: None,
             threshold: 0.0,
             filter: NodeFilter::default(),
+            exact: false,
         }
     }
 }
@@ -1581,6 +1632,46 @@ impl SemanticGraph {
         self.embedding_store.encoder()
     }
 
+    /// Switch the approximate (IVF-flat) index on, with these settings, or off
+    /// with `None`. See `AnnConfig`. Nothing is saved: a saved graph, its
+    /// sidecar and its digest are the same with or without it, and a loaded
+    /// graph builds the index again on its first search.
+    pub fn set_ann(&mut self, config: Option<AnnConfig>) -> Result<(), EmbeddingError> {
+        self.embedding_store.set_ann(config)
+    }
+
+    /// The approximate-index settings, or `None` while search is exact.
+    pub fn ann(&self) -> Option<&AnnConfig> {
+        self.embedding_store.ann()
+    }
+
+    /// Build the approximate index now (see `EmbeddingStore::build_ann_index`).
+    pub fn build_ann_index(&self, force: bool) -> Result<AnnStats, EmbeddingError> {
+        self.embedding_store.build_ann_index(force)
+    }
+
+    /// What the approximate index looks like right now.
+    pub fn ann_stats(&self) -> AnnStats {
+        self.embedding_store.ann_stats()
+    }
+
+    /// Recall@k of the approximate index against the exact scan (see
+    /// `EmbeddingStore::recall_check`).
+    pub fn recall_check<'q, I, Q>(
+        &self,
+        queries: I,
+        k: usize,
+        node_type: Option<&str>,
+        threshold: f32,
+    ) -> Result<RecallReport, EmbeddingError>
+    where
+        I: IntoIterator<Item = Q>,
+        Q: Into<Query<'q>>,
+    {
+        self.embedding_store
+            .recall_check(queries, k, node_type, threshold)
+    }
+
     /// Install an encoder, replacing any current one. Vectors already stored
     /// keep the model that made them; see `stale_embeddings`.
     pub fn set_encoder(&mut self, encoder: Box<dyn EmbeddingEncoder>) {
@@ -1684,7 +1775,7 @@ impl SemanticGraph {
         self.embedding_store.add_batch(items)
     }
 
-    pub fn get_embedding(&self, node_id: &NodeId) -> Option<&EmbeddingRecord> {
+    pub fn get_embedding(&self, node_id: &NodeId) -> Option<EmbeddingRecord> {
         self.embedding_store.get(node_id)
     }
 
@@ -1750,8 +1841,13 @@ impl SemanticGraph {
     /// Top-k similarity search among the nodes that pass `gate`.
     ///
     /// With a gate the store cannot truncate first: the best k *unfiltered*
-    /// matches may all be filtered out, so every match is scored, filtered,
-    /// and only then cut to k.
+    /// matches may all be filtered out, so matches are walked best first and
+    /// filtered until k have passed.
+    ///
+    /// With the store's approximate index the candidates are the probed cells
+    /// only. If fewer than k of them pass the gate, the probe is widened (4x
+    /// each step) and the search retried, ending in the full scan, so a
+    /// selective filter costs time rather than results.
     fn seed_search(
         &self,
         query_vector: &[f32],
@@ -1759,27 +1855,38 @@ impl SemanticGraph {
         node_type: Option<&str>,
         threshold: f32,
         gate: Option<&Gate>,
+        exact: bool,
     ) -> Result<Vec<SimilarityResult>, EmbeddingError> {
-        match gate {
-            None => self.embedding_store.similarity_search_vector(
+        let store = &self.embedding_store;
+        let Some(gate) = gate else {
+            return store.search_vector(
                 query_vector,
                 top_k.unwrap_or(usize::MAX),
                 node_type,
                 threshold,
-            ),
-            Some(gate) => {
-                let mut results = self.embedding_store.similarity_search_vector(
-                    query_vector,
-                    usize::MAX,
-                    node_type,
-                    threshold,
-                )?;
-                results.retain(|r| gate.passes(&r.node_id));
-                if let Some(k) = top_k {
-                    results.truncate(k);
+                exact,
+            );
+        };
+        if top_k == Some(0) {
+            return Ok(Vec::new());
+        }
+        let mut scale = (store.ann().is_some() && !exact && top_k.is_some()).then_some(1usize);
+        loop {
+            let (hits, approximate) =
+                store.ranked_hits(query_vector, node_type, threshold, scale)?;
+            let mut results = Vec::new();
+            for hit in hits {
+                if gate.passes(&hit.node_id) {
+                    results.push(hit);
+                    if top_k.is_some_and(|k| results.len() >= k) {
+                        break;
+                    }
                 }
-                Ok(results)
             }
+            if !approximate || top_k.is_some_and(|k| results.len() >= k) {
+                return Ok(results);
+            }
+            scale = scale.map(|s| s.saturating_mul(4));
         }
     }
 
@@ -1802,6 +1909,7 @@ impl SemanticGraph {
             options.node_type,
             options.threshold,
             gate.as_ref(),
+            options.exact,
         )
     }
 
@@ -1817,12 +1925,12 @@ impl SemanticGraph {
         node_type: Option<&str>,
         threshold: f32,
     ) -> Result<Vec<SimilarityResult>, EmbeddingError> {
-        let record = match self.embedding_store.get(node_id) {
-            Some(record) => record,
+        let vector = match self.embedding_store.get_vector(node_id) {
+            Some(vector) => vector,
             None => return Ok(vec![]),
         };
         let mut results = self.embedding_store.similarity_search_vector(
-            &record.vector,
+            vector,
             top_k + 1,
             node_type,
             threshold,
@@ -1887,6 +1995,9 @@ impl SemanticGraph {
             None,
             hops.threshold,
             gate,
+            // Blending scores every node anyway, so seeds come from the same
+            // exact scan rather than from the approximate index.
+            hops.blend > 0.0,
         )?;
         if seeds.is_empty() {
             return Ok(vec![]);
@@ -2180,6 +2291,7 @@ impl SemanticGraph {
             None,
             options.threshold,
             gate.as_ref(),
+            false,
         )?;
 
         let mut best: Option<SemanticSearchResult> = None;
@@ -2442,7 +2554,7 @@ impl SemanticGraph {
                 sub.embedding_store.add_with_model(
                     id.clone(),
                     &record.text,
-                    record.vector.clone(),
+                    record.vector,
                     &record.model,
                 )?;
             }
@@ -2596,7 +2708,31 @@ impl SemanticGraph {
         format: Option<&str>,
         embeddings: bool,
     ) -> Result<(), EmbeddingError> {
-        let path = path.as_ref();
+        self.save_impl(path.as_ref(), format, embeddings, false)
+    }
+
+    /// `save`, and also a binary snapshot of the embeddings at
+    /// `<path>.embeddings.snap` (see [`snapshot_path_for`]), written after and
+    /// in addition to the JSON sidecar, which stays the portable copy. `load`
+    /// uses the snapshot when it provably belongs to the graph and sidecar on
+    /// disk, and the JSON otherwise. If the snapshot cannot be written the
+    /// graph and sidecar are saved anyway, a stale snapshot is removed, and the
+    /// error is returned.
+    pub fn save_with_snapshot(
+        &self,
+        path: impl AsRef<Path>,
+        format: Option<&str>,
+    ) -> Result<(), EmbeddingError> {
+        self.save_impl(path.as_ref(), format, true, true)
+    }
+
+    fn save_impl(
+        &self,
+        path: &Path,
+        format: Option<&str>,
+        embeddings: bool,
+        snapshot: bool,
+    ) -> Result<(), EmbeddingError> {
         let isonl = Self::is_isonl(path, format);
         let text = if isonl {
             self.graph.to_isonl()
@@ -2608,8 +2744,26 @@ impl SemanticGraph {
         if embeddings {
             let (reread, int_ids) = digest::parse_graph_text(&text, isonl, Self::graph_name(path))?;
             let digest = graph_digest_with_int_ids(&reread, &int_ids);
+            let sidecar = Self::embeddings_path_for(path);
+            let snap = snapshot_path_for(path);
+            if !snapshot {
+                // the sidecar is about to change: a snapshot of the old one is stale
+                let _ = std::fs::remove_file(&snap);
+            }
             self.embedding_store
-                .save_embeddings_with(Self::embeddings_path_for(path), Some(&digest))?;
+                .save_embeddings_with(&sidecar, Some(&digest))?;
+            if snapshot {
+                let identity = SnapshotIdentity {
+                    graph_digest: Some(digest),
+                    sidecar: Some(SidecarId::of_file(&sidecar).map_err(|e| {
+                        EmbeddingError::Io(format!("reading {}: {e}", sidecar.display()))
+                    })?),
+                };
+                if let Err(e) = self.embedding_store.save_snapshot(&snap, &identity) {
+                    let _ = std::fs::remove_file(&snap);
+                    return Err(e);
+                }
+            }
         }
         Ok(())
     }
@@ -2634,6 +2788,30 @@ impl SemanticGraph {
         encoder: Box<dyn EmbeddingEncoder>,
         options: &LoadOptions,
     ) -> Result<Self, EmbeddingError> {
+        Self::load_with_report(path, encoder, options).map(|(graph, _)| graph)
+    }
+
+    /// `load_with`, also saying where the embeddings came from.
+    ///
+    /// If a binary snapshot (`<path>.embeddings.snap`, written by
+    /// [`save_with_snapshot`](Self::save_with_snapshot)) sits beside the
+    /// sidecar, it is used when its header names this graph's digest and the
+    /// sidecar file as it is now, and its checksum verifies; the result is
+    /// identical to loading the JSON. Otherwise the JSON sidecar is read,
+    /// exactly as before, and `LoadReport::snapshot_skipped` says why the
+    /// snapshot was not used.
+    pub fn load_with_report(
+        path: impl AsRef<Path>,
+        encoder: Box<dyn EmbeddingEncoder>,
+        options: &LoadOptions,
+    ) -> Result<(Self, LoadReport), EmbeddingError> {
+        let started = std::time::Instant::now();
+        let report = |source, snapshot_skipped, embeddings: usize| LoadReport {
+            source,
+            snapshot_skipped,
+            embeddings,
+            seconds: started.elapsed().as_secs_f64(),
+        };
         let path = path.as_ref();
         let isonl = Self::is_isonl(path, options.format.as_deref());
         let text = std::fs::read_to_string(path)
@@ -2665,11 +2843,28 @@ impl SemanticGraph {
         };
 
         if !options.embeddings {
-            return Ok(loaded);
+            return Ok((loaded, report(LoadSource::NoEmbeddings, None, 0)));
         }
         let sidecar = Self::embeddings_path_for(path);
         if !sidecar.is_file() {
-            return Ok(loaded);
+            return Ok((loaded, report(LoadSource::NoEmbeddings, None, 0)));
+        }
+
+        let snap = snapshot_path_for(path);
+        let mut snapshot_skipped = None;
+        if snap.is_file() {
+            let int_ids = digest::int_ids_of_text(&text, isonl)?;
+            let actual = graph_digest_with_int_ids(&loaded.graph, &int_ids);
+            match loaded
+                .embedding_store
+                .adopt_snapshot_for(&snap, &sidecar, &actual)
+            {
+                Ok(info) => {
+                    loaded.embedding_store.warn_on_version_skew();
+                    return Ok((loaded, report(LoadSource::Snapshot, None, info.count)));
+                }
+                Err(reason) => snapshot_skipped = Some(reason),
+            }
         }
 
         let json = std::fs::read_to_string(&sidecar)
@@ -2741,23 +2936,11 @@ impl SemanticGraph {
                     loaded.embedding_store.warn(problem);
                 }
                 loaded.embedding_store.import_embeddings(&payload, false)?;
-                let stored_version = loaded
-                    .embedding_store
-                    .last_import_meta()
-                    .encoder_version
-                    .clone();
-                let current_version = loaded.embedding_store.version();
-                if let (Some(stored), Some(current)) = (stored_version, current_version) {
-                    if stored != current {
-                        loaded.embedding_store.warn(format!(
-                            "embeddings were made by encoder version '{stored}', but the \
-                             encoder in use is version '{current}'"
-                        ));
-                    }
-                }
+                loaded.embedding_store.warn_on_version_skew();
             }
         }
-        Ok(loaded)
+        let restored = loaded.embedding_store.count();
+        Ok((loaded, report(LoadSource::Json, snapshot_skipped, restored)))
     }
 
     /// Embed all nodes in the graph, in one batched encoder call.

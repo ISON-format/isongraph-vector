@@ -1,0 +1,18 @@
+D:\Goldmine\ISON\bench_data\rs_target_stagec\release\examples\stage_c_bench.exe --ds-dir D:\Goldmine\ISON\bench_data\prep/text384 --ds text384 --n 100000 --mode hnsw --exp core,conc,writes --queries 1000 --budget 3 --label rust_hnsw --out D:\Goldmine\ISON\ison_dev\isongraphossworking\isongraph-vector\benchmarks\rust-stage-c\raw\rust_hnsw_text384_100000_r1.json
+rust_hnsw: ds=text384 n=100000 d=384 mode=hnsw int8=0 queries=1000 cpus=32 exps=["core", "conc", "writes"]
+  ingest 0.10s  rss 169 MB
+  hnsw build 7.26s (stats Some(7.2629425)) rss 206 MB (peak 209)
+  hnsw knob=24 recall=0.7816 qps1t=8823 median=0.089ms batch=45646
+  hnsw knob=48 recall=0.8850 qps1t=7752 median=0.126ms batch=28372
+  hnsw knob=64 recall=0.9145 qps1t=4480 median=0.212ms batch=22434
+  hnsw knob=96 recall=0.9476 qps1t=3967 median=0.231ms batch=16668
+  hnsw knob=128 recall=0.9626 qps1t=3526 median=0.275ms batch=13919
+  hnsw knob=192 recall=0.9796 qps1t=2502 median=0.386ms batch=10023
+  hnsw knob=256 recall=0.9863 qps1t=1929 median=0.492ms batch=8116
+  hnsw knob=400 recall=0.9936 qps1t=1399 median=0.708ms batch=5509
+  concurrent clients=1 (1 scan thread each): 1601.2 qps
+  concurrent clients=2 (1 scan thread each): 2994.5 qps
+  concurrent clients=4 (1 scan thread each): 5727.6 qps
+  concurrent clients=8 (1 scan thread each): 10038.7 qps
+  concurrent clients=16 (1 scan thread each): 14916.0 qps
+  writes: ins 944/s upd 936/s del 1069039/s first-query 0.7 ms recall_after=0.9582

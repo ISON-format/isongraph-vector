@@ -1,0 +1,79 @@
+{
+ "system": "sqlite_vec",
+ "ds": "text384",
+ "n": 10000,
+ "d": 384,
+ "k": 10,
+ "queries": 2000,
+ "all_threads": 32,
+ "exps": [
+  "core"
+ ],
+ "started": "2026-11-16 08:58:29",
+ "mem_baseline": {
+  "rss_mb": 37.29296875,
+  "peak_mb": 37.29296875
+ },
+ "version": "sqlite-vec 0.1.9 / sqlite 3.45.3",
+ "build": {
+  "ingest_s": 0.12505999999120831,
+  "index_s": 2.400018274784088e-06,
+  "total_s": 0.1250624000094831,
+  "first_query_ms": 9.759800042957067,
+  "ready_s": 0.13482220005244017
+ },
+ "mem_after_build": {
+  "rss_mb": 40.8359375,
+  "peak_mb": 55.48828125
+ },
+ "mem_after_first_query": {
+  "rss_mb": 40.87890625,
+  "peak_mb": 55.48828125
+ },
+ "sweep": [
+  {
+   "nq": 292,
+   "recall_queries": 1000,
+   "recall": 1.0,
+   "qps_1t_runs": [
+    103.71207908579683,
+    102.51495514706376,
+    104.71020944458607
+   ],
+   "qps_1t": 103.71207908579683,
+   "qps_1t_min": 102.51495514706376,
+   "qps_1t_max": 104.71020944458607,
+   "median_ms": 9.35500001651235,
+   "p95_ms": 11.23795002058614,
+   "p99_ms": 13.979025025037117,
+   "mean_ms": 9.648973288556208,
+   "knob": null
+  }
+ ],
+ "knob_name": null,
+ "loop_allthreads": {
+  "nq": 293,
+  "threads": 32,
+  "qps": 102.81119130601117,
+  "median_ms": 9.56530001712963,
+  "p95_ms": 10.552820021985099,
+  "p99_ms": 11.41818599542603,
+  "mean_ms": 9.673479749713584
+ },
+ "mem_after_sweep": {
+  "rss_mb": 42.3671875,
+  "peak_mb": 55.48828125
+ },
+ "ref_knob": null,
+ "ref_recall_pre": 1.0,
+ "mem_end": {
+  "rss_mb": 38.59375,
+  "peak_mb": 55.48828125
+ },
+ "status": "ok",
+ "finished": "2026-11-16 08:58:54",
+ "load_before_pct": 4.631250000000001,
+ "load_contaminated": false,
+ "wall_s": 24.769706964492798,
+ "flag": null
+}

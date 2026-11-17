@@ -1,0 +1,38 @@
+{
+ "system": "usearch",
+ "ds": "glove",
+ "n": 100000,
+ "d": 100,
+ "k": 10,
+ "queries": 2000,
+ "all_threads": 32,
+ "exps": [
+  "filter"
+ ],
+ "started": "2026-11-16 08:49:49",
+ "filter": {
+  "build_with_metadata_s": 1.5688168000197038,
+  "mem": {
+   "rss_mb": 108.9609375,
+   "peak_mb": 117.99609375
+  },
+  "subsets": {
+   "f10": {
+    "unsupported": true
+   },
+   "f01": {
+    "unsupported": true
+   }
+  }
+ },
+ "mem_end": {
+  "rss_mb": 42.11328125,
+  "peak_mb": 117.99609375
+ },
+ "status": "ok",
+ "finished": "2026-11-16 08:49:50",
+ "load_before_pct": 3.081249999999999,
+ "load_contaminated": false,
+ "wall_s": 1.7668533325195312,
+ "flag": null
+}

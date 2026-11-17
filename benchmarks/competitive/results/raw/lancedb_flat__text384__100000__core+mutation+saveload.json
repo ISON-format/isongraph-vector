@@ -1,0 +1,133 @@
+{
+ "system": "lancedb_flat",
+ "ds": "text384",
+ "n": 100000,
+ "d": 384,
+ "k": 10,
+ "queries": 2000,
+ "all_threads": 32,
+ "exps": [
+  "core",
+  "mutation",
+  "saveload"
+ ],
+ "started": "2026-11-16 08:05:18",
+ "mem_baseline": {
+  "rss_mb": 37.3515625,
+  "peak_mb": 37.3515625
+ },
+ "version": "lancedb 0.41.0",
+ "build": {
+  "ingest_s": 0.21901230001822114,
+  "index_s": 2.400018274784088e-06,
+  "total_s": 0.21901470003649592,
+  "first_query_ms": 64.86110005062073,
+  "ready_s": 0.28387580008711666,
+  "total_s_runs": [
+   0.21901470003649592,
+   0.21189370000502095,
+   0.21135139995021746
+  ]
+ },
+ "mem_after_build": {
+  "rss_mb": 173.78515625,
+  "peak_mb": 261.6875
+ },
+ "mem_after_first_query": {
+  "rss_mb": 186.32421875,
+  "peak_mb": 361.078125
+ },
+ "sweep": [
+  {
+   "nq": 30,
+   "recall_queries": 30,
+   "recall": 1.0,
+   "qps_1t_runs": [
+    7.163113575546817,
+    7.216794403598273,
+    7.188175853432592
+   ],
+   "qps_1t": 7.188175853432592,
+   "qps_1t_min": 7.163113575546817,
+   "qps_1t_max": 7.216794403598273,
+   "median_ms": 136.85725000686944,
+   "p95_ms": 150.51211501995567,
+   "p99_ms": 172.52110999659635,
+   "mean_ms": 139.09570889081806,
+   "knob": null
+  }
+ ],
+ "knob_name": "nprobes",
+ "loop_allthreads": {
+  "nq": 42,
+  "threads": 32,
+  "qps": 13.747629719819061,
+  "median_ms": 72.05929997144267,
+  "p95_ms": 80.92444996873382,
+  "p99_ms": 90.0290749996202,
+  "mean_ms": 72.53502539473601
+ },
+ "mem_after_sweep": {
+  "rss_mb": 194.8984375,
+  "peak_mb": 395.10546875
+ },
+ "ref_knob": null,
+ "ref_recall_pre": 1.0,
+ "mutation": {
+  "ref_knob": null,
+  "recall_before": 1.0,
+  "insert_10k": {
+   "seconds": 0.052557399962097406,
+   "per_s": 190268.1640874864,
+   "batch": 1000
+  },
+  "update_10k": {
+   "seconds": 0.16496710001956671,
+   "per_s": 60618.14749009895,
+   "batch": 1000
+  },
+  "delete_10k": {
+   "seconds": 0.11116339999716729,
+   "per_s": 89957.66592470925,
+   "batch": 1000
+  },
+  "mem_after": {
+   "rss_mb": 252.078125,
+   "peak_mb": 395.10546875
+  },
+  "first_query_after_ms": 103.32120000384748,
+  "after": {
+   "nq": 30,
+   "recall_queries": 30,
+   "recall": 1.0,
+   "qps_1t_runs": [
+    4.803872766892777
+   ],
+   "qps_1t": 4.803872766892777,
+   "qps_1t_min": 4.803872766892777,
+   "qps_1t_max": 4.803872766892777,
+   "median_ms": 202.50729998224415,
+   "p95_ms": 225.15360498800874,
+   "p99_ms": 309.4573300110643,
+   "mean_ms": 208.165380001689
+  },
+  "recall_after": 1.0
+ },
+ "saveload": {
+  "save_s": 1.100008375942707e-06,
+  "disk_mb": 176.77569484710693,
+  "load_s": 0.002555200015194714,
+  "first_query_after_load_ms": 110.22700002649799,
+  "time_to_ready_s": 0.1127822000416927
+ },
+ "mem_end": {
+  "rss_mb": 224.91796875,
+  "peak_mb": 464.95703125
+ },
+ "status": "ok",
+ "finished": "2026-11-16 08:05:58",
+ "load_before_pct": 4.240624999999999,
+ "load_contaminated": false,
+ "wall_s": 40.120402097702026,
+ "flag": null
+}

@@ -1,0 +1,16 @@
+D:\Goldmine\ISON\bench_data\rs_target_stagec\release\examples\stage_c_bench.exe --ds-dir D:\Goldmine\ISON\bench_data\prep/text384 --ds text384 --n 1000000 --mode ivf --exp core,conc,writes --queries 1000 --budget 3 --label rust_ivf --out D:\Goldmine\ISON\ison_dev\isongraphossworking\isongraph-vector\benchmarks\rust-stage-c\raw\rust_ivf_text384_1000000_r1.json
+rust_ivf: ds=text384 n=1000000 d=384 mode=ivf int8=0 queries=1000 cpus=32 exps=["core", "conc", "writes"]
+  ingest 1.10s  rss 1629 MB
+  ivf build 6.54s (stats Some(6.5388839)) rss 1651 MB (peak 1894)
+  ivf knob=16 recall=0.6991 qps1t=1412 median=0.706ms batch=19772
+  ivf knob=32 recall=0.7841 qps1t=829 median=1.205ms batch=16140
+  ivf knob=64 recall=0.8579 qps1t=444 median=2.219ms batch=14671
+  ivf knob=128 recall=0.9156 qps1t=244 median=4.091ms batch=12658
+  ivf knob=256 recall=0.9526 qps1t=131 median=7.570ms batch=10068
+  ivf knob=512 recall=0.9772 qps1t=67 median=14.704ms batch=6771
+  concurrent clients=1 (1 scan thread each): 129.0 qps
+  concurrent clients=2 (1 scan thread each): 216.5 qps
+  concurrent clients=4 (1 scan thread each): 334.6 qps
+  concurrent clients=8 (1 scan thread each): 418.9 qps
+  concurrent clients=16 (1 scan thread each): 385.4 qps
+  writes: ins 137936/s upd 133013/s del 1097249/s first-query 8.0 ms recall_after=0.9530413625304136

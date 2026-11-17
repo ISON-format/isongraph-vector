@@ -1,0 +1,8 @@
+{
+ "dataset": "musique",
+ "model": "minilm",
+ "corpus_size": 15405,
+ "n_questions": 1500,
+ "lib_similarity_search_same_top20_set": "200/200",
+ "seconds": 67.22751545906067
+}

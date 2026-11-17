@@ -1,0 +1,29 @@
+== rust_exact_text384_100000_r1  load total 17% pin-cpu 0% noisy=False
+   done in 115s ok=True
+== numpy_bf_text384_100000_r1  load total 24% pin-cpu 1% noisy=False
+   done in 32s ok=True
+== faiss_flat_text384_100000_r1  load total 17% pin-cpu 0% noisy=False
+   done in 27s ok=True
+== rust_ivf_text384_100000_r1  load total 12% pin-cpu 2% noisy=False
+   done in 45s ok=True
+== faiss_ivfflat_text384_100000_r1  load total 16% pin-cpu 0% noisy=False
+   done in 35s ok=True
+== rust_hnsw_text384_100000_r1  load total 16% pin-cpu 0% noisy=False
+   done in 56s ok=True
+== faiss_hnsw_text384_100000_r1  load total 13% pin-cpu 0% noisy=False
+   done in 32s ok=True
+== hnswlib_text384_100000_r1  load total 15% pin-cpu 0% noisy=False
+   done in 35s ok=True
+== usearch_text384_100000_r1  load total 11% pin-cpu 27% noisy=True
+   done in 39s ok=True
+== rust_ivf_i8x4_text384_100000_r1  load total 10% pin-cpu 0% noisy=False
+   done in 17s ok=True
+== rust_hnsw_i8x4_text384_100000_r1  load total 27% pin-cpu 71% noisy=True
+   done in 12s ok=True
+== rust_exact_text384_100000_r2  load total 13% pin-cpu 69% noisy=True
+   done in 104s ok=True
+== numpy_bf_text384_100000_r2  load total 9% pin-cpu 0% noisy=False
+   done in 27s ok=True
+== faiss_flat_text384_100000_r2  load total 20% pin-cpu 0% noisy=False
+   done in 27s ok=True
+== rust_ivf_text384_100000_r2  load total 12% pin-cpu 11% noisy=False

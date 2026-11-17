@@ -1,0 +1,122 @@
+{
+ "system": "isong_py",
+ "ds": "glove",
+ "n": 1000000,
+ "d": 100,
+ "k": 10,
+ "queries": 2000,
+ "all_threads": 32,
+ "exps": [
+  "core",
+  "mutation"
+ ],
+ "started": "2026-11-16 10:30:04",
+ "mem_baseline": {
+  "rss_mb": 35.0078125,
+  "peak_mb": 35.0078125
+ },
+ "version": "isongraph-vector (python, repo HEAD)",
+ "build": {
+  "ingest_s": 27.908122700056992,
+  "index_s": 4.200031980872154e-06,
+  "total_s": 27.908126900088973,
+  "first_query_ms": 4899.777499958873,
+  "ready_s": 32.807904400047846
+ },
+ "mem_after_build": {
+  "rss_mb": 729.9296875,
+  "peak_mb": 798.8125
+ },
+ "mem_after_first_query": {
+  "rss_mb": 1459.21875,
+  "peak_mb": 1470.53515625
+ },
+ "sweep": [
+  {
+   "nq": 84,
+   "recall_queries": 84,
+   "recall": 1.0,
+   "qps_1t_runs": [
+    27.887184253289014,
+    26.46472568856041,
+    26.159219335618886
+   ],
+   "qps_1t": 26.46472568856041,
+   "qps_1t_min": 26.159219335618886,
+   "qps_1t_max": 27.887184253289014,
+   "median_ms": 37.09220001474023,
+   "p95_ms": 42.527489989879534,
+   "p99_ms": 47.820610992494046,
+   "mean_ms": 37.29078412635274,
+   "knob": null
+  }
+ ],
+ "knob_name": null,
+ "loop_allthreads": {
+  "nq": 93,
+  "threads": 32,
+  "qps": 27.714460003367048,
+  "median_ms": 35.600699950009584,
+  "p95_ms": 49.929859989788376,
+  "p99_ms": 52.247072028694596,
+  "mean_ms": 36.24233978739556
+ },
+ "mem_after_sweep": {
+  "rss_mb": 1460.0703125,
+  "peak_mb": 1471.51953125
+ },
+ "ref_knob": null,
+ "ref_recall_pre": 1.0,
+ "mutation": {
+  "ref_knob": null,
+  "recall_before": 1.0,
+  "insert_10k": {
+   "seconds": 0.8805213999585249,
+   "per_s": 11356.907396539174,
+   "batch": 1000
+  },
+  "update_10k": {
+   "seconds": 0.6018026000238024,
+   "per_s": 16616.74442683445,
+   "batch": 1000
+  },
+  "delete_10k": {
+   "seconds": 0.5086630000150762,
+   "per_s": 19659.381554592353,
+   "batch": 1000
+  },
+  "mem_after": {
+   "rss_mb": 1472.03515625,
+   "peak_mb": 1472.03515625
+  },
+  "first_query_after_ms": 100.25179997319356,
+  "after": {
+   "nq": 77,
+   "recall_queries": 77,
+   "recall": 1.0,
+   "qps_1t_runs": [
+    26.34213520958877,
+    27.546546775197086,
+    27.93582075127861
+   ],
+   "qps_1t": 27.546546775197086,
+   "qps_1t_min": 26.34213520958877,
+   "qps_1t_max": 27.93582075127861,
+   "median_ms": 36.20279999449849,
+   "p95_ms": 42.87535001640208,
+   "p99_ms": 47.78328002430498,
+   "mean_ms": 36.68684026179029
+  },
+  "recall_after": 1.0
+ },
+ "mem_end": {
+  "rss_mb": 1464.3515625,
+  "peak_mb": 1483.6015625
+ },
+ "status": "ok",
+ "finished": "2026-11-16 10:31:13",
+ "load_before_pct": 7.521874999999993,
+ "load_contaminated": false,
+ "wall_s": 69.04397058486938,
+ "flag": null
+}

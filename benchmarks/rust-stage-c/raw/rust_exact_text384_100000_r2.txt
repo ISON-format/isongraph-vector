@@ -1,0 +1,4 @@
+D:\Goldmine\ISON\bench_data\rs_target_stagec\release\examples\stage_c_bench.exe --ds-dir D:\Goldmine\ISON\bench_data\prep/text384 --ds text384 --n 100000 --mode exact --exp core --queries 1000 --budget 3 --label rust_exact --out D:\Goldmine\ISON\ison_dev\isongraphossworking\isongraph-vector\benchmarks\rust-stage-c\raw\rust_exact_text384_100000_r2.json
+rust_exact: ds=text384 n=100000 d=384 mode=exact int8=0 queries=1000 cpus=32 exps=["core"]
+  ingest 0.10s  rss 169 MB
+  exact 1T recall=1.0000 qps=145.7 median=6.614ms | auto 284.1 qps | batch 5206 qps

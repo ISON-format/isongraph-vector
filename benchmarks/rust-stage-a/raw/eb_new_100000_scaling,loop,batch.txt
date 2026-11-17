@@ -1,0 +1,35 @@
+new: n=100000 d=384 queries=2000 nprobe=128 has_batch=true
+  scaling exact clients= 1 qps=    156.4 efficiency=1.00
+  scaling exact clients= 2 qps=    238.3 efficiency=0.76
+  scaling exact clients= 4 qps=    450.0 efficiency=0.72
+  scaling exact clients= 8 qps=    942.0 efficiency=0.75
+  scaling exact clients=16 qps=   1089.4 efficiency=0.44
+  scaling exact clients=24 qps=   1410.0 efficiency=0.38
+  scaling exact clients=32 qps=   1178.6 efficiency=0.24
+  scaling ivf clients= 1 qps=   1017.2 efficiency=1.00
+  scaling ivf clients= 2 qps=   1678.0 efficiency=0.82
+  scaling ivf clients= 4 qps=   2482.1 efficiency=0.61
+  scaling ivf clients= 8 qps=   3170.4 efficiency=0.39
+  scaling ivf clients=16 qps=   3333.2 efficiency=0.20
+  scaling ivf clients=24 qps=   3734.1 efficiency=0.15
+  scaling ivf clients=32 qps=   3929.6 efficiency=0.12
+  exact loop threads=1 qps=144.0 (min 139.3 max 147.6)
+  exact loop threads=2 qps=234.1 (min 215.0 max 237.2)
+  exact loop threads=4 qps=271.7 (min 256.9 max 286.7)
+  exact loop threads=8 qps=243.8 (min 236.6 max 288.4)
+  exact loop threads=0 qps=282.3 (min 224.9 max 295.6)
+  batch exact threads= 1 qps=   1216.6 recall=1.0000 equals_single(first200)=true
+  batch exact threads= 2 qps=   2432.3 recall=1.0000 equals_single(first200)=true
+  batch exact threads= 4 qps=   4647.9 recall=1.0000 equals_single(first200)=true
+  batch exact threads= 8 qps=   8269.5 recall=1.0000 equals_single(first200)=true
+  batch exact threads=16 qps=  11514.4 recall=1.0000 equals_single(first200)=true
+  batch exact threads=24 qps=  13135.5 recall=1.0000 equals_single(first200)=true
+  batch exact threads=32 qps=  13553.4 recall=1.0000 equals_single(first200)=true
+  batch ivf threads= 1 qps=   8006.0 recall=0.9548 equals_single(first200)=true
+  batch ivf threads= 2 qps=  15497.3 recall=0.9548 equals_single(first200)=true
+  batch ivf threads= 4 qps=  28464.0 recall=0.9548 equals_single(first200)=true
+  batch ivf threads= 8 qps=  45111.9 recall=0.9548 equals_single(first200)=true
+  batch ivf threads=16 qps=  56781.6 recall=0.9548 equals_single(first200)=true
+  batch ivf threads=24 qps=  59332.0 recall=0.9548 equals_single(first200)=true
+  batch ivf threads=32 qps=  57944.5 recall=0.9548 equals_single(first200)=true
+wrote D:/Goldmine/ISON/ison_dev/isongraphossworking/isongraph-vector/benchmarks/rust-stage-a/raw/eb_new_100000_scaling,loop,batch.json

@@ -1,0 +1,98 @@
+{
+ "hotpotqa/minilm": {
+  "frac_test_queries_top1_cos_below_0.3": 0.0,
+  "mean_top1_cos": 0.6355993747711182,
+  "threshold=0.3": {
+   "all@10": 0.772,
+   "recall@10": 0.8575,
+   "mean_returned": 7.899,
+   "frac_empty": 0.0
+  },
+  "threshold=-1.0": {
+   "all@10": 0.773,
+   "recall@10": 0.858,
+   "mean_returned": 7.917,
+   "frac_empty": 0.0
+  }
+ },
+ "hotpotqa/bge": {
+  "frac_test_queries_top1_cos_below_0.3": 0.0,
+  "mean_top1_cos": 0.744337260723114,
+  "threshold=0.3": {
+   "all@10": 0.875,
+   "recall@10": 0.9265,
+   "mean_returned": 7.844,
+   "frac_empty": 0.0
+  },
+  "threshold=-1.0": {
+   "all@10": 0.875,
+   "recall@10": 0.9265,
+   "mean_returned": 7.844,
+   "frac_empty": 0.0
+  }
+ },
+ "2wiki/minilm": {
+  "frac_test_queries_top1_cos_below_0.3": 0.0,
+  "mean_top1_cos": 0.6492449045181274,
+  "threshold=0.3": {
+   "all@10": 0.795,
+   "recall@10": 0.89025,
+   "mean_returned": 7.865,
+   "frac_empty": 0.0
+  },
+  "threshold=-1.0": {
+   "all@10": 0.795,
+   "recall@10": 0.89025,
+   "mean_returned": 7.867,
+   "frac_empty": 0.0
+  }
+ },
+ "2wiki/bge": {
+  "frac_test_queries_top1_cos_below_0.3": 0.0,
+  "mean_top1_cos": 0.7257882356643677,
+  "threshold=0.3": {
+   "all@10": 0.946,
+   "recall@10": 0.974,
+   "mean_returned": 8.577,
+   "frac_empty": 0.0
+  },
+  "threshold=-1.0": {
+   "all@10": 0.946,
+   "recall@10": 0.974,
+   "mean_returned": 8.577,
+   "frac_empty": 0.0
+  }
+ },
+ "musique/minilm": {
+  "frac_test_queries_top1_cos_below_0.3": 0.0,
+  "mean_top1_cos": 0.5775226950645447,
+  "threshold=0.3": {
+   "all@10": 0.245,
+   "recall@10": 0.5356666666666666,
+   "mean_returned": 8.722,
+   "frac_empty": 0.0
+  },
+  "threshold=-1.0": {
+   "all@10": 0.245,
+   "recall@10": 0.5356666666666666,
+   "mean_returned": 8.722,
+   "frac_empty": 0.0
+  }
+ },
+ "musique/bge": {
+  "frac_test_queries_top1_cos_below_0.3": 0.0,
+  "mean_top1_cos": 0.6993334889411926,
+  "threshold=0.3": {
+   "all@10": 0.263,
+   "recall@10": 0.5716666666666667,
+   "mean_returned": 9.007,
+   "frac_empty": 0.0
+  },
+  "threshold=-1.0": {
+   "all@10": 0.263,
+   "recall@10": 0.5716666666666667,
+   "mean_returned": 9.007,
+   "frac_empty": 0.0
+  }
+ }
+}

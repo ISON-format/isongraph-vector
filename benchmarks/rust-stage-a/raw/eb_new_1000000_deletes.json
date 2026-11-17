@@ -1,0 +1,20 @@
+{
+  "d": 384,
+  "deletes": {
+    "after_exact_search": {
+      "ns_each": 564.69,
+      "per_s": 1770883.1394216297
+    },
+    "ivf_built": {
+      "ns_each": 3550.09,
+      "per_s": 281682.99958592595
+    },
+    "never_searched": {
+      "ns_each": 484.87,
+      "per_s": 2062408.4806236723
+    }
+  },
+  "label": "new",
+  "n": 1000000,
+  "nprobe": 128
+}
