@@ -259,15 +259,41 @@ search rather than filtering its results.
 ## Searching large stores
 
 Search is exact unless you switch the approximate index on, and the exact path
-is fast. The first search copies the vectors into one contiguous `f32` matrix
-(a second copy in memory: built once, patched in place by writes and deletes,
-never saved) and every search after that is a single pass over it: a SIMD dot
-product per row (AVX2 + FMA when the CPU has them, checked at run time), a
-bounded heap for the top k, and, for a big store, up to eight threads
-(`set_scan_threads(1)` keeps it on one). Equal scores come back in a fixed order
-(by key when the cache is built, then by arrival), so a search gives the same
-answer on every run and for any thread count. Scores are the usual cosine, to
-within a rounding error of the old scan.
+is fast. The vectors live **once**, in one contiguous chunked `f32` matrix that
+is the store itself (a record is a row of it; there is no second copy, about
+1.1x the raw vector bytes at a million 384-d vectors). A search is a single pass
+over it: a SIMD dot product per row (AVX2 + FMA when the CPU has them, checked
+at run time), a bounded heap for the top k, and, for a big store, up to eight
+threads of a persistent pool (`set_scan_threads(1)` keeps it on one). Equal
+scores come back in the order the vectors were stored, so a search gives the
+same answer on every run and for any thread count. See `DESIGN.md` for the
+layout, the concurrency model and the write path.
+
+### Many queries, many threads
+
+```rust
+// one call, many queries: ~10x the throughput of a loop on a big store, and
+// every answer is identical (ids, scores, order) to the one-query call
+let answers = store.similarity_search_vector_batch(&queries, 10, None, 0.0)?;
+let by_text = store.similarity_search_batch(&["first", "second"], 10, None, 0.0)?;
+
+// searches take &self, never lock the data, and scale across threads
+std::thread::scope(|s| {
+    for q in &queries { let store = &store; s.spawn(move || store.similarity_search_vector(q, 10, None, 0.0)); }
+});
+
+// readers and a writer on different threads: a reader/writer lock with short write sections
+let shared = SharedEmbeddingStore::new(store);
+let writer = shared.clone();
+std::thread::spawn(move || writer.add(NodeId::new("doc", "9"), "new text", None));
+let hits = shared.similarity_search_vector(&q, 10, None, 0.0)?;   // never sees a half-applied write
+```
+
+Batch calls run on a persistent thread pool shared by all stores (one worker per
+logical CPU; `ISONGRAPH_VECTOR_THREADS=n` or `store.set_search_pool(Some(Arc::new(SearchPool::new(n))))`
+changes it, `set_scan_threads(n)` caps one call). The exact batch scores 16
+queries against each block of rows while it is in cache; with the index on, the
+batch scores each probed cell once for all the queries that probe it.
 
 For stores past a few hundred thousand vectors there is an opt-in approximate
 index, IVF-flat, matching the Python port:
@@ -291,9 +317,11 @@ seeded spherical k-means, and a query scores only the `nprobe` nearest cells
 first search that wants it, is never saved (a saved graph, its sidecar and its
 digest are identical with it on or off), and is used only for a bounded `top_k`
 on a store of at least `AnnConfig::min_size` (default 50,000) vectors. Writes
-are visible at once: new and updated vectors are scored exactly until enough
-have piled up to fold into cells, deletes stop being returned, and heavy churn
-retrains. A `node_type`, `threshold` or `NodeFilter` applies to the probed rows;
+are visible at once: new and updated vectors are scored exactly until 256 of
+them have piled up, and the write that makes it 256 folds them into their cells
+(a pause of a millisecond or two at a million vectors), so a search never pays
+for a backlog; deletes stop being returned, and heavy churn retrains on the next
+search (call `build_ann_index(true)` yourself, off the hot path, to choose when). A `node_type`, `threshold` or `NodeFilter` applies to the probed rows;
 if fewer than `top_k` survive, the probe widens 4x and tries again, ending in
 the full scan. `build_ann_index`, `ann_stats` and `recall_check` are on both
 `EmbeddingStore` and `SemanticGraph`. The SQLite store has no approximate index
@@ -405,8 +433,7 @@ store.from_json(&json, false)?;
 - **Search is brute force** unless you switch on the opt-in IVF index (see
   *Searching large stores*), sqlite-vec included: linear in the number of
   nodes. This is built for an application's own knowledge graph, not as a
-  vector-database replacement. The first search also keeps a second, contiguous
-  copy of every vector in memory.
+  vector-database replacement.
 - **The approximate index is approximate.** A true neighbour in an unprobed cell
   is missed; recall was measured on synthetic data only. Its k-means uses this
   port's own seeded generator, so the same `seed` builds a different (equally
@@ -420,9 +447,15 @@ store.from_json(&json, false)?;
 - **`NodeId` is string-typed here.** The shared payload format carries an
   `id_type` of `str` or `int`; this port reads and preserves `int` written by
   another, but every id it originates is a string.
-- **Equal scores are ordered by key, then by arrival.** Searches no longer
-  depend on `HashMap` order; the order is fixed when the scan cache is first
-  built (sorted by `type:id`), and vectors stored afterwards come after those.
+- **Equal scores are ordered by arrival.** Searches do not depend on `HashMap`
+  order: rows are kept in the order they were stored (an update keeps its row,
+  a delete and re-add goes to the end), and ties come back in that order.
+- **`EmbeddingStore::get` returns an owned `EmbeddingRecord`** (the vector is a
+  row of the shared matrix, so the record is built on request). Use `get_vector`
+  to borrow the floats without a copy.
+- **Compaction is a pause.** A store whose rows are a quarter deleted squeezes
+  the matrix (order preserving), a pause proportional to its size; call
+  `compact()` at a quiet moment to choose when.
 - **The graph digest sees integer ids only through the file text.** `NodeId`
   is a string here, so `graph_digest(&graph)` hashes every id as a string (right
   for anything built in Rust); `save` and `load` read the id column's types from

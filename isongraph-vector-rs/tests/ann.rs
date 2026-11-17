@@ -9,7 +9,7 @@ use ison_graph_rs::Node;
 use isongraph_vector_rs::{
     graph_digest, AnnConfig, EmbeddingError, EmbeddingStore, MockEncoder, MultiHopOptions,
     NodeFilter, NodeId, PropertyValue, SearchOptions, SemanticGraph, SimilarityOptions,
-    SimilarityResult,
+    SimilarityResult, FOLD_BATCH,
 };
 use std::collections::HashSet;
 
@@ -553,13 +553,20 @@ fn pending_rows_fold_and_heavy_churn_retrains() {
             .add(NodeId::new("late", i.to_string()), "", Some(v.clone()))
             .unwrap();
     }
-    assert_eq!(fx.store.ann_stats().pending, 700);
+    // folding is done by the writes themselves, FOLD_BATCH rows at a time: 700
+    // writes made two folds and left 188 rows waiting
+    let stats = fx.store.ann_stats();
+    assert_eq!(stats.pending, 700 % FOLD_BATCH);
+    assert_eq!(stats.folds, (700 / FOLD_BATCH) as u64);
     fx.store
         .similarity_search_vector(&extra[0], 5, None, 0.0)
-        .unwrap(); // >= 512 pending: folded
+        .unwrap(); // a search folds nothing and rebuilds nothing
     let stats = fx.store.ann_stats();
-    assert_eq!(stats.pending, 0);
+    assert_eq!(stats.pending, 700 % FOLD_BATCH);
+    assert_eq!(stats.folds, (700 / FOLD_BATCH) as u64);
     assert_eq!(stats.searches.builds, builds);
+    fx.store.build_ann_index(false).unwrap(); // folds the remainder on request
+    assert_eq!(fx.store.ann_stats().pending, 0);
 
     let more = fx.queries(1200);
     for (i, v) in more.iter().enumerate() {
@@ -593,7 +600,7 @@ fn small_writes_stay_pending_until_enough() {
     }
     let q = fx.queries(1).remove(0);
     fx.store.similarity_search_vector(&q, 5, None, 0.0).unwrap();
-    // 100 < max(512, 2%): scored exactly, not yet folded, and no rebuild
+    // 100 < FOLD_BATCH: scored exactly, not yet folded, and no rebuild
     let stats = fx.store.ann_stats();
     assert_eq!(stats.pending, 100);
     assert_eq!(stats.churn, 100);
@@ -1095,7 +1102,36 @@ fn node_filter_gets_k_results_even_when_selective() {
             },
         )
         .unwrap();
-    assert!(ref_set(&res).intersection(&ref_set(&want)).count() >= 7);
+    assert!(!want.is_empty());
+    // The widened search finds most of the exact answers: judged over many
+    // queries, because one query's overlap depends on which sample the index
+    // was trained on (the old single-query bound of 7 of 10 held only for the
+    // sample that the sorted-key row order happened to give).
+    let (mut overlap, mut asked) = (0, 0);
+    for q in clusters.draw(10, &mut rng) {
+        let res = graph
+            .similarity_search_with(
+                &q,
+                &SimilarityOptions {
+                    filter: filter.clone(),
+                    ..SimilarityOptions::default()
+                },
+            )
+            .unwrap();
+        let want = graph
+            .similarity_search_with(
+                &q,
+                &SimilarityOptions {
+                    filter: filter.clone(),
+                    exact: true,
+                    ..SimilarityOptions::default()
+                },
+            )
+            .unwrap();
+        overlap += ref_set(&res).intersection(&ref_set(&want)).count();
+        asked += want.len();
+    }
+    assert!(overlap * 100 >= asked * 80, "{overlap} of {asked}");
 
     // a filter nothing passes terminates, empty
     let never = |_: &Node| false;

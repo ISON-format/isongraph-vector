@@ -26,13 +26,19 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 use thiserror::Error;
 
-use ann::ScanState;
-
 mod ann;
-pub use ann::{AnnConfig, AnnSearchCounts, AnnStats, RecallReport, ANN_MIN_SIZE};
+pub use ann::{
+    AnnConfig, AnnSearchCounts, AnnStats, MemoryStats, RecallReport, ANN_MIN_SIZE, FOLD_BATCH,
+};
+mod pool;
+pub use pool::SearchPool;
+mod shared;
+pub use shared::SharedEmbeddingStore;
+mod table;
+use table::VectorTable;
 mod digest;
 pub use digest::{
     graph_digest, graph_digest_of_text, graph_digest_with_int_ids, GRAPH_DIGEST_BASIS,
@@ -520,8 +526,21 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), Embedding
     result
 }
 
+/// Vectors, their text and model, searchable by cosine similarity.
+///
+/// The vectors live once, in a contiguous matrix; a record is a row of it (see
+/// `DESIGN.md`). Searches take `&self`, never lock the data and may run from
+/// any number of threads at once; writes take `&mut self`, so a search can
+/// never see a half-applied write. To read and write from different threads,
+/// share the store through [`SharedEmbeddingStore`] (a reader/writer lock with
+/// short write sections).
 pub struct EmbeddingStore {
-    embeddings: HashMap<String, EmbeddingRecord>,
+    /// The single copy of every vector, plus the per-row metadata and the key
+    /// index. Everything else derived from it (the approximate index) refers to
+    /// rows by slot number.
+    table: VectorTable,
+    /// One shared string per distinct model name, so a row holds a pointer.
+    model_names: HashMap<String, Arc<str>>,
     encoder: Option<Box<dyn EmbeddingEncoder>>,
     dimension: Option<usize>,
     version: Option<String>,
@@ -535,17 +554,22 @@ pub struct EmbeddingStore {
     last_import_meta: ImportMeta,
     /// The opt-in approximate index settings (`None` = every search exact).
     ann: Option<AnnConfig>,
-    /// Threads a full scan may use (0 = automatic).
+    /// The most threads a search, batch, fold or build may use (0 = automatic).
     scan_threads: usize,
-    /// The scan cache and the index built over it: derived from `embeddings`,
-    /// built by the first search, patched by writes, never persisted.
-    scan: Mutex<ScanState>,
+    /// The pool parallel work runs on (`None` = the process-wide one).
+    pool: Option<Arc<SearchPool>>,
+    /// The approximate index: built lazily by a search (the only time the lock
+    /// is written during a search), maintained by writes through `&mut self`
+    /// (no locking), never persisted.
+    ivf: ann::IvfSlot,
+    counts: ann::Counters,
 }
 
 impl EmbeddingStore {
     pub fn new(encoder: Option<Box<dyn EmbeddingEncoder>>) -> Self {
         Self {
-            embeddings: HashMap::new(),
+            table: VectorTable::new(),
+            model_names: HashMap::new(),
             encoder,
             dimension: None,
             version: None,
@@ -556,7 +580,9 @@ impl EmbeddingStore {
             last_import_meta: ImportMeta::default(),
             ann: None,
             scan_threads: 0,
-            scan: Mutex::new(ScanState::default()),
+            pool: None,
+            ivf: RwLock::new(None),
+            counts: ann::Counters::default(),
         }
     }
 
@@ -744,20 +770,28 @@ impl EmbeddingStore {
     ) -> Vec<NodeId> {
         let model = model.map(String::from).or_else(|| self.current_model());
         let dimension = dimension.or_else(|| self.encoder.as_ref().map(|e| e.dimension()));
+        let by_dim = dimension.is_some_and(|d| self.table.dim != d);
         let mut out: Vec<NodeId> = self
-            .embeddings
-            .values()
-            .filter(|record| {
+            .table
+            .live_slots()
+            .filter(|&slot| {
+                let meta = self.table.meta(slot).expect("live rows have metadata");
                 let by_model = model.as_ref().is_some_and(|m| {
-                    record.model != *m && (include_unknown || !is_unknown_model(&record.model))
+                    *meta.model != **m && (include_unknown || !is_unknown_model(&meta.model))
                 });
-                let by_dim = dimension.is_some_and(|d| record.vector.len() != d);
                 by_model || by_dim
             })
-            .map(|record| record.node_id.clone())
+            .filter_map(|slot| self.table.node_id(slot))
             .collect();
         out.sort_by(|a, b| (&a.node_type, &a.id).cmp(&(&b.node_type, &b.id)));
         out
+    }
+
+    /// Encode one text with the store's encoder (no model-compatibility
+    /// check; that is for queries, see `resolve_query`).
+    pub fn encode(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        let encoder = self.encoder.as_ref().ok_or(EmbeddingError::NoEncoder)?;
+        Ok(encoder.encode(text))
     }
 
     /// Turn a query into a vector. Text needs an encoder, and is checked
@@ -775,44 +809,50 @@ impl EmbeddingStore {
 
     // -- writes ---------------------------------------------------------------
 
-    /// Insert or replace one record, keeping the per-model counts in step.
+    /// The shared string for a model name.
+    fn intern_model(&mut self, model: &str) -> Arc<str> {
+        if let Some(name) = self.model_names.get(model) {
+            return name.clone();
+        }
+        let name: Arc<str> = Arc::from(model);
+        self.model_names.insert(model.to_string(), name.clone());
+        name
+    }
+
+    /// One fewer record carries `model`.
+    fn uncount_model(&mut self, model: &str) {
+        if let Some(n) = self.model_counts.get_mut(model) {
+            *n -= 1;
+            if *n == 0 {
+                self.model_counts.remove(model);
+            }
+        }
+    }
+
+    /// Insert or replace one record, keeping the per-model counts in step. An
+    /// update overwrites the row in place (same slot); an insert takes the next
+    /// one. The write is complete when this returns: the row, its metadata, the
+    /// key index and the approximate index (including any fold it triggers).
     fn put(&mut self, node_id: NodeId, text: &str, vector: Vec<f32>, model: &str) -> String {
         let key = Self::node_id_to_key(&node_id);
-        self.forget_record(&key);
-        // An update overwrites the cached row in place; an insert appends one.
-        self.scan_state_mut()
-            .note_put(&key, &node_id.node_type, &vector);
+        let model_name = self.intern_model(model);
+        let (slot, replaced) = self
+            .table
+            .put(&key, &node_id.node_type, &vector, text, &model_name);
+        if let Some(old) = replaced {
+            self.uncount_model(&old);
+        }
         *self.model_counts.entry(model.to_string()).or_insert(0) += 1;
-        self.embeddings.insert(
-            key.clone(),
-            EmbeddingRecord {
-                id: key.clone(),
-                node_id,
-                vector,
-                text: text.to_string(),
-                model: model.to_string(),
-            },
-        );
+        self.index_row_written(slot);
         key
     }
 
-    /// Remove a record and take it out of the search cache.
+    /// Remove a record: tombstone its row and take it out of the index.
     fn forget(&mut self, key: &str) -> bool {
-        self.scan_state_mut().note_remove(key);
-        self.forget_record(key)
-    }
-
-    /// Remove a record, keeping the per-model counts in step. The search cache
-    /// is the caller's business (`put` overwrites its row in place).
-    fn forget_record(&mut self, key: &str) -> bool {
-        match self.embeddings.remove(key) {
-            Some(old) => {
-                if let Some(n) = self.model_counts.get_mut(&old.model) {
-                    *n -= 1;
-                    if *n == 0 {
-                        self.model_counts.remove(&old.model);
-                    }
-                }
+        match self.table.remove(key) {
+            Some((slot, model)) => {
+                self.uncount_model(&model);
+                self.index_row_removed(slot);
                 true
             }
             None => false,
@@ -877,9 +917,18 @@ impl EmbeddingStore {
         Ok(entries.len())
     }
 
-    pub fn get(&self, node_id: &NodeId) -> Option<&EmbeddingRecord> {
+    /// The record for a node, copied out of the store (the vector is a row of
+    /// the shared matrix, so a record is built on request; use
+    /// [`get_vector`](Self::get_vector) to borrow it instead).
+    pub fn get(&self, node_id: &NodeId) -> Option<EmbeddingRecord> {
         let key = Self::node_id_to_key(node_id);
-        self.embeddings.get(&key)
+        self.table.record(self.table.slot_of(&key)? as usize)
+    }
+
+    /// The stored vector of a node, borrowed from the matrix.
+    pub fn get_vector(&self, node_id: &NodeId) -> Option<&[f32]> {
+        let key = Self::node_id_to_key(node_id);
+        Some(self.table.row(self.table.slot_of(&key)? as usize))
     }
 
     pub fn remove(&mut self, node_id: &NodeId) -> bool {
@@ -924,7 +973,7 @@ impl EmbeddingStore {
     }
 
     pub fn count(&self) -> usize {
-        self.embeddings.len()
+        self.table.live()
     }
 
     /// Remove every embedding and forget the pinned dimension, so the next
@@ -939,9 +988,9 @@ impl EmbeddingStore {
     /// without it the store keeps refusing vectors of the wrong length even
     /// while empty.
     pub fn clear_with(&mut self, reset_dimension: bool) {
-        self.embeddings.clear();
+        self.table.clear();
         self.model_counts.clear();
-        self.scan_state_mut().reset();
+        *self.ivf_mut() = None;
         if reset_dimension {
             self.dimension = None;
         }
@@ -960,17 +1009,21 @@ impl EmbeddingStore {
     /// and `graph_digest` / `graph_digest_basis` when a digest is given.
     pub fn export_embeddings_with(&self, graph_digest: Option<&str>) -> ExportedEmbeddings {
         let mut embeddings: Vec<ExportedEmbedding> = self
-            .embeddings
-            .values()
-            .map(|record| ExportedEmbedding {
-                node_type: record.node_id.node_type.clone(),
-                id: EmbeddingId::Str(record.node_id.id.clone()),
-                // Rust node ids are always strings; the other ports use this
-                // to tell a numeric id from a numeric-looking string one.
-                id_type: "str".to_string(),
-                text: record.text.clone(),
-                model: Some(record.model.clone()),
-                vector: record.vector.clone(),
+            .table
+            .live_slots()
+            .filter_map(|slot| {
+                let meta = self.table.meta(slot)?;
+                let node_id = self.table.node_id(slot)?;
+                Some(ExportedEmbedding {
+                    node_type: node_id.node_type,
+                    id: EmbeddingId::Str(node_id.id),
+                    // Rust node ids are always strings; the other ports use this
+                    // to tell a numeric id from a numeric-looking string one.
+                    id_type: "str".to_string(),
+                    text: meta.text.to_string(),
+                    model: Some(meta.model.to_string()),
+                    vector: self.table.row(slot).to_vec(),
+                })
             })
             .collect();
         embeddings.sort_by(|a, b| {
@@ -1694,7 +1747,7 @@ impl SemanticGraph {
         self.embedding_store.add_batch(items)
     }
 
-    pub fn get_embedding(&self, node_id: &NodeId) -> Option<&EmbeddingRecord> {
+    pub fn get_embedding(&self, node_id: &NodeId) -> Option<EmbeddingRecord> {
         self.embedding_store.get(node_id)
     }
 
@@ -1844,12 +1897,12 @@ impl SemanticGraph {
         node_type: Option<&str>,
         threshold: f32,
     ) -> Result<Vec<SimilarityResult>, EmbeddingError> {
-        let record = match self.embedding_store.get(node_id) {
-            Some(record) => record,
+        let vector = match self.embedding_store.get_vector(node_id) {
+            Some(vector) => vector,
             None => return Ok(vec![]),
         };
         let mut results = self.embedding_store.similarity_search_vector(
-            &record.vector,
+            vector,
             top_k + 1,
             node_type,
             threshold,
@@ -2473,7 +2526,7 @@ impl SemanticGraph {
                 sub.embedding_store.add_with_model(
                     id.clone(),
                     &record.text,
-                    record.vector.clone(),
+                    record.vector,
                     &record.model,
                 )?;
             }

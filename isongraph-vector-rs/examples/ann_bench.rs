@@ -1,7 +1,7 @@
 //! Exact search against the opt-in IVF index on synthetic clustered vectors.
 //!
 //! For each size and data regime it prints: the ingest rate, the first query
-//! (which builds the scan cache), warm exact latency on one thread and on all
+//! (nothing to build: the vectors are already one matrix), warm exact latency on one thread and on all
 //! of them, the index build time and size, and a sweep over `nprobe` with
 //! recall@10 against the exact scan and the speed-up.
 //!
@@ -22,8 +22,8 @@
 //!
 //! Options: `--sizes a,b,c`  `--regimes clustered,diffuse`  `--queries N`
 //! `--dim D`  `--nprobe 1,4,16,64,auto`  `--k K`  `--json FILE`  `--no-index`.
-//! Needs about 3.1 GB of RAM per million vectors (the store keeps the vectors
-//! once for the records and once in the scan cache).
+//! Needs about 1.7 GB of RAM per million vectors (the store keeps the vectors
+//! once, in one matrix).
 
 use isongraph_vector_rs::{AnnConfig, EmbeddingStore, NodeId, SimilarityResult};
 use std::collections::HashSet;
@@ -303,7 +303,7 @@ fn main() {
             println!("* ingest {:.0} vectors/s", ingest);
 
             let queries = regime.sample(o.queries, 7);
-            // first query: builds the scan cache
+            // first query: no cache to build, since the matrix is the store
             let t = Instant::now();
             store
                 .similarity_search_vector_exact(&queries[0], o.k, None, 0.0)

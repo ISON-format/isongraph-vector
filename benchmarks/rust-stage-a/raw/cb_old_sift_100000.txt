@@ -1,0 +1,18 @@
+old: ds=sift n=100000 d=128 queries=2000 cpus=32 release=true
+  ingest 0.06s
+  exact 1T recall=1.0 qps=437.7 median=2.182ms
+  exact auto-threads qps=1030.1 median=0.846ms
+  exact 8 concurrent clients (scan threads 1): 487.6 qps
+  ivf build 0.20s nlist=Some(1265)
+  ivf nprobe=1 recall=0.2912 qps1t=48238 median=0.021ms allthreads_qps=48288
+  ivf nprobe=2 recall=0.4356 qps1t=37905 median=0.026ms allthreads_qps=38582
+  ivf nprobe=4 recall=0.5955 qps1t=28205 median=0.034ms allthreads_qps=30561
+  ivf nprobe=8 recall=0.7474 qps1t=20786 median=0.047ms allthreads_qps=21162
+  ivf nprobe=16 recall=0.8710 qps1t=13859 median=0.071ms allthreads_qps=13222
+  ivf nprobe=32 recall=0.9486 qps1t=7691 median=0.127ms allthreads_qps=7239
+  ivf nprobe=64 recall=0.9860 qps1t=4639 median=0.210ms allthreads_qps=4604
+  ivf nprobe=128 recall=0.9984 qps1t=2558 median=0.382ms allthreads_qps=2569
+  ivf nprobe=256 recall=0.9998 qps1t=1360 median=0.731ms allthreads_qps=1894
+  ivf nprobe=1265 recall=1.0000 qps1t=544 median=1.804ms allthreads_qps=1206
+  mutation: ins 0.02s upd 0.02s del 0.01s recall_after=0.98545
+wrote D:/Goldmine/ISON/ison_dev/isongraphossworking/isongraph-vector/benchmarks/rust-stage-a/raw/cb_old_sift_100000.json

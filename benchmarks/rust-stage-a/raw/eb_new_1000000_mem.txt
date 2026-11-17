@@ -1,0 +1,3 @@
+new: n=1000000 d=384 queries=2000 nprobe=128 has_batch=true
+  mem raw=1465 MB: after ingest 1621 (1.11x raw, peak 1649), after first query 1622, after IVF build 1641 (1.12x raw, peak 1884); ingest 1.1s
+wrote D:/Goldmine/ISON/ison_dev/isongraphossworking/isongraph-vector/benchmarks/rust-stage-a/raw/eb_new_1000000_mem.json

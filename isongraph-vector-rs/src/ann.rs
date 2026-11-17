@@ -1,23 +1,25 @@
-//! Fast search for [`EmbeddingStore`]: a contiguous scan cache for exact
-//! search, and the opt-in IVF-flat approximate index built on top of it.
+//! Search for [`EmbeddingStore`]: the exact scan, the batched scan, and the
+//! opt-in IVF-flat approximate index built on top of the store's matrix.
+//! `DESIGN.md` is the specification; this file is its Rust realisation.
 //!
-//! # The scan cache
+//! # The matrix
 //!
-//! The store keeps one [`EmbeddingRecord`] per node (that is the public,
-//! `HashMap`-backed view). The first search additionally decodes every vector
-//! into one row-major `f32` matrix with a norm, a type code and a liveness flag
-//! per row. A search is then a single pass over contiguous memory: a dot
-//! product per row, a bounded heap for the best `k`, no per-row allocation and
-//! no hashing. Writes patch the matrix in place (an insert appends a row, an
-//! update overwrites one, a delete tombstones one; a quarter of dead rows
-//! triggers a compaction), so a write never throws the cache away.
+//! The store's vectors live once, in a [`VectorTable`] (see `table.rs`): a
+//! chunked row-major `f32` matrix with a norm and a type code per row. A search
+//! is a pass over that memory: a dot product per row, a bounded heap for the
+//! best `k`, no per-row allocation, no hashing, **no lock**. Writes need
+//! `&mut self`, so a search can never overlap one (see `shared.rs` for the
+//! reader/writer wrapper).
 //!
-//! The matrix is a second copy of the vectors. It exists only once a search has
-//! asked for it and is never written anywhere.
+//! # One definition of a score
 //!
-//! Rows are ordered by key when the cache is first built and by arrival after
-//! that, and ties between equal scores come back in that order, so a search
-//! returns the same answer on every run.
+//! Every cosine in the crate (single query, batch, index probe, fold, k-means)
+//! is `dot / (|row| * |query|)` where `dot` has one fixed summation order: a
+//! single 8-lane accumulator walked in ascending order, a fixed horizontal-sum
+//! tree, then the scalar tail. Kernels differ only in how many (query, row)
+//! pairs they compute at once; none changes the order inside a pair, so a
+//! batched answer is bit-identical to the one-query answer, and the answer does
+//! not depend on thread count.
 //!
 //! # The IVF-flat index
 //!
@@ -25,32 +27,40 @@
 //! partitions the rows into `nlist` cells by direction; a query scores the
 //! `nprobe` cells whose centroids are nearest and only the rows inside them,
 //! with exactly the cosine the exact scan uses. The index stores no vectors:
-//! it is a cell number per row, the rows grouped by cell, and the centroids.
-//! It follows the cache through writes and deletes instead of being rebuilt
-//! (see [`AnnConfig`] for the policy), is built lazily, and is never persisted.
+//! per-cell lists of slot numbers, a cell number per slot, and the centroids.
+//! New and updated rows wait in a short `pending` list that every query scores
+//! exactly; the write that makes it [`FOLD_BATCH`] long folds it into cells on
+//! the spot, so a search never has a backlog to pay for. The index is built
+//! lazily by the first search that wants it (or by `build_ann_index`) and is
+//! never persisted.
 //!
 //! The behaviour deliberately mirrors the Python port's `ann="ivf"`.
 
+use crate::pool::SearchPool;
+use crate::table::{Rows, VectorTable, CHUNK_ROWS};
 use crate::{EmbeddingEncoder, EmbeddingError, EmbeddingStore, Query, SimilarityResult};
-use std::collections::{BTreeSet, HashMap};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use std::time::Instant;
 
 /// Below this many vectors the index is not used and search stays exact.
 pub const ANN_MIN_SIZE: usize = 50_000;
-/// Pending rows are folded into cells at this many ...
-const FOLD_MIN: usize = 512;
-/// ... and at least this fraction of the indexed rows.
-const FOLD_FRACTION: f64 = 0.02;
+/// Rows that are new or rewritten since the last fold wait in `pending`, scored
+/// exactly by every query. The write that makes the list this long assigns all
+/// of them to cells. Smaller is a shorter write pause and a cheaper query-side
+/// exact tail; larger is fewer, bigger pauses.
+pub const FOLD_BATCH: usize = 256;
 /// Retrain once writes plus deletes exceed this fraction of the trained size.
 const RETRAIN_FRACTION: f64 = 0.5;
 const KMEANS_ITERATIONS: usize = 8;
 const SAMPLE_PER_CELL: usize = 40;
-/// Threads a scan uses when none is configured (see `workers`).
+/// Threads one single-query scan uses when none is configured (memory
+/// bandwidth, not compute, limits it; see `workers`).
 const SCAN_AUTO_THREADS: usize = 8;
-/// Floats per scan block handed to a worker (2 MiB).
-const BLOCK_FLOATS: usize = 1 << 19;
+/// Rows per scan task. Divides the table's chunk size, so a block never
+/// straddles chunks.
+const BLOCK_ROWS: usize = 1024;
 /// A scan spreads over threads only past this many floats per thread.
 const PAR_MIN_FLOATS: usize = 1 << 21;
 /// The same for the rows of probed cells, which cost more per float.
@@ -59,6 +69,13 @@ const PAR_MIN_CELL_FLOATS: usize = 1 << 20;
 const NEAR_BLOCK: usize = 256;
 /// Points per tile of the assignment kernel (the tile stays in L2).
 const TILE: usize = 64;
+/// Queries scored together against one block of rows in a batch.
+const BATCH_TILE: usize = 16;
+/// Queries handled per pass of a big batch (bounds the per-thread heaps).
+const BATCH_CHUNK: usize = 4096;
+
+const NO_CELL: i32 = -1;
+const PENDING: i32 = -2;
 
 // =============================================================================
 // Public types
@@ -73,18 +90,18 @@ const TILE: usize = 64;
 /// scan gives, but a true neighbour in an unprobed cell can be missing:
 /// measure it with [`EmbeddingStore::recall_check`] on your own queries.
 ///
-/// Policy (identical to the Python port):
+/// Policy (the Python port's, except that folding is eager):
 ///
 /// * the index is built by the first search that wants it (or by
 ///   `build_ann_index`), from k-means on a sample of up to `40 * nlist` live
 ///   vectors, and is never persisted;
-/// * new and updated vectors are scored exactly until at least
-///   `max(512, 2%)` of the indexed rows are pending, then folded into their
-///   nearest cell;
+/// * new and updated vectors are scored exactly until [`FOLD_BATCH`] of them
+///   are pending, then the write that reaches that count folds them into their
+///   nearest cells;
 /// * a delete just stops the row being returned;
 /// * once writes plus deletes since training exceed 50% of the trained size
-///   the index is retrained (with an automatic `nlist`, re-chosen for the new
-///   size);
+///   the next search retrains the index (with an automatic `nlist`, re-chosen
+///   for the new size);
 /// * a clear, or a store that shrinks below `min_size`, drops the index;
 /// * a filter (`node_type`, `threshold`, a graph `node_filter`) applies to the
 ///   probed rows; if fewer than `top_k` survive the probe is widened 4x and
@@ -158,15 +175,46 @@ pub struct AnnStats {
     pub nprobe: Option<usize>,
     /// Vectors the centroids were trained on.
     pub trained_n: Option<usize>,
-    /// Rows scored exactly until they are folded into cells.
+    /// Rows scored exactly until they are folded into cells (always fewer than
+    /// [`FOLD_BATCH`] between writes).
     pub pending: usize,
     /// Writes plus deletes since training.
     pub churn: usize,
     pub build_seconds: Option<f64>,
-    /// Memory on top of the cached vectors.
+    /// Memory the index holds (it stores no vectors).
     pub index_bytes: usize,
     pub min_size: Option<usize>,
     pub searches: AnnSearchCounts,
+    /// Fold steps run by writes since the index was built.
+    pub folds: u64,
+    /// Total time those steps took.
+    pub fold_seconds: f64,
+}
+
+/// Where a store's memory goes; see [`EmbeddingStore::memory_stats`]. The
+/// vectors are held once, so `matrix_bytes` is the only part that scales with
+/// the dimension.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MemoryStats {
+    /// Row slots in use, tombstones included.
+    pub rows: usize,
+    pub live: usize,
+    pub dead: usize,
+    pub chunks: usize,
+    /// Bytes allocated for the matrix (`f32` rows).
+    pub matrix_bytes: usize,
+    /// Bytes the live vectors need at minimum: `live * dim * 4`.
+    pub live_vector_bytes: usize,
+    /// Norms, type codes, per-row metadata, keys, text, the key index.
+    pub metadata_bytes: usize,
+    /// The approximate index, if built.
+    pub index_bytes: usize,
+}
+
+impl MemoryStats {
+    pub fn total_bytes(&self) -> usize {
+        self.matrix_bytes + self.metadata_bytes + self.index_bytes
+    }
 }
 
 /// Recall of the approximate index against the exact scan, over some queries.
@@ -188,6 +236,26 @@ pub struct RecallReport {
     pub approximate: bool,
     pub ann_ms: f64,
     pub exact_ms: f64,
+}
+
+/// The search counters, updated without a lock.
+#[derive(Default)]
+pub(crate) struct Counters {
+    approximate: AtomicU64,
+    exact: AtomicU64,
+    widened: AtomicU64,
+    builds: AtomicU64,
+}
+
+impl Counters {
+    fn snapshot(&self) -> AnnSearchCounts {
+        AnnSearchCounts {
+            approximate: self.approximate.load(Ordering::Relaxed),
+            exact: self.exact.load(Ordering::Relaxed),
+            widened: self.widened.load(Ordering::Relaxed),
+            builds: self.builds.load(Ordering::Relaxed),
+        }
+    }
 }
 
 // =============================================================================
@@ -244,35 +312,55 @@ fn auto_nlist(n: usize) -> usize {
     (round_half_even(4.0 * (n as f64).sqrt()).max(16.0) as usize).min(65_536)
 }
 
-fn auto_threads() -> usize {
-    static THREADS: OnceLock<usize> = OnceLock::new();
-    *THREADS.get_or_init(|| {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-    })
+/// How a step may use the pool: the store's configured thread count (0 = auto)
+/// and the pool to run on.
+#[derive(Clone, Copy)]
+pub(crate) struct Par<'a> {
+    configured: usize,
+    pool: &'a Option<Arc<SearchPool>>,
 }
 
-/// Workers for `tasks` units of work: the configured count, or with 0 the
-/// number of CPUs up to `auto_cap`. Memory bandwidth, not compute, limits a
-/// scan, and on the machine this was tuned on eight threads were within a few
-/// percent of thirty-two with a much steadier tail.
-fn workers(configured: usize, tasks: usize, auto_cap: usize) -> usize {
-    let want = if configured == 0 {
-        auto_threads().min(auto_cap)
-    } else {
-        configured
-    };
-    want.min(tasks).max(1)
+impl Par<'_> {
+    /// Threads available: the pool's size.
+    fn size(&self) -> usize {
+        self.pool
+            .as_ref()
+            .map_or_else(SearchPool::default_threads, |p| p.threads())
+    }
+
+    /// Participants for `tasks` units of work: the configured count, or with 0
+    /// the pool size up to `auto_cap`. A single-query scan is limited by memory
+    /// bandwidth, not compute; on the machine this was tuned on eight threads
+    /// were within a few percent of thirty-two with a much steadier tail.
+    fn workers(&self, tasks: usize, auto_cap: usize) -> usize {
+        let want = if self.configured == 0 {
+            self.size().min(auto_cap)
+        } else {
+            self.configured
+        };
+        want.min(tasks).max(1)
+    }
+
+    fn run(&self, participants: usize, work: &(dyn Fn(usize) + Sync)) {
+        if participants <= 1 {
+            work(0);
+            return;
+        }
+        match self.pool {
+            Some(pool) => pool.run(participants, work),
+            None => SearchPool::global().run(participants, work),
+        }
+    }
 }
 
 // =============================================================================
 // Kernels
 //
-// Each hot routine is written once as an `#[inline(always)]` generic over
-// `FMA`, then instantiated twice: with AVX2 + FMA enabled (picked at run time
-// when the CPU has them) and with whatever the build targets. The `FMA = true`
-// instantiation is only ever reached through a function that enables the
+// One family, `block::<Q, R, F>`: Q queries against R rows at once, returning
+// the Q x R dot products. Each (query, row) pair is summed in the same order
+// whatever Q and R are (see the module docs), so callers pick the shape that
+// suits the loop they are in. `F` selects fused multiply-add; the `true`
+// instantiation is only ever reached through a function that enabled the
 // feature, so `mul_add` compiles to one instruction, never a library call.
 // =============================================================================
 
@@ -285,9 +373,6 @@ fn fma<const F: bool>(a: f32, b: f32, c: f32) -> f32 {
     }
 }
 
-/// Explicit AVX2 + FMA kernels. The portable loops below do not reliably
-/// vectorise (measured: about scalar speed), so the fast instantiation calls
-/// these. Only reachable through the `dispatch!` wrappers, which check the CPU.
 #[cfg(target_arch = "x86_64")]
 mod x86 {
     use std::arch::x86_64::*;
@@ -295,6 +380,8 @@ mod x86 {
     #[inline]
     #[target_feature(enable = "avx2,fma")]
     unsafe fn hsum(v: __m256) -> f32 {
+        // (l0+l4, l1+l5, l2+l6, l3+l7), then (t0+t2) + (t1+t3): the tree the
+        // portable path spells out.
         let lo = _mm256_castps256_ps128(v);
         let hi = _mm256_extractf128_ps(v, 1);
         let s = _mm_add_ps(lo, hi);
@@ -303,93 +390,48 @@ mod x86 {
         _mm_cvtss_f32(s)
     }
 
-    /// # Safety
-    /// The CPU must support AVX2 and FMA; `a` and `b` must have equal length.
-    #[inline]
-    #[target_feature(enable = "avx2,fma")]
-    pub unsafe fn dot(a: &[f32], b: &[f32]) -> f32 {
-        debug_assert_eq!(a.len(), b.len());
-        let n = a.len().min(b.len());
-        let (pa, pb) = (a.as_ptr(), b.as_ptr());
-        let mut s0 = _mm256_setzero_ps();
-        let mut s1 = _mm256_setzero_ps();
-        let mut s2 = _mm256_setzero_ps();
-        let mut s3 = _mm256_setzero_ps();
-        let mut i = 0;
-        while i + 32 <= n {
-            s0 = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i)), s0);
-            s1 = _mm256_fmadd_ps(
-                _mm256_loadu_ps(pa.add(i + 8)),
-                _mm256_loadu_ps(pb.add(i + 8)),
-                s1,
-            );
-            s2 = _mm256_fmadd_ps(
-                _mm256_loadu_ps(pa.add(i + 16)),
-                _mm256_loadu_ps(pb.add(i + 16)),
-                s2,
-            );
-            s3 = _mm256_fmadd_ps(
-                _mm256_loadu_ps(pa.add(i + 24)),
-                _mm256_loadu_ps(pb.add(i + 24)),
-                s3,
-            );
-            i += 32;
-        }
-        while i + 8 <= n {
-            s0 = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i)), s0);
-            i += 8;
-        }
-        let mut total = hsum(_mm256_add_ps(_mm256_add_ps(s0, s1), _mm256_add_ps(s2, s3)));
-        while i < n {
-            total += *pa.add(i) * *pb.add(i);
-            i += 1;
-        }
-        total
-    }
-
-    /// Two points against four centroids.
+    /// `Q` queries against `R` rows.
     ///
     /// # Safety
-    /// The CPU must support AVX2 and FMA; all six slices must have equal length.
+    /// The CPU must support AVX2 and FMA; every slice must be exactly `dim`
+    /// long (the callers slice rows to `dim`).
     #[inline]
     #[target_feature(enable = "avx2,fma")]
-    pub unsafe fn dot_2x4(x0: &[f32], x1: &[f32], c: [&[f32]; 4]) -> [[f32; 4]; 2] {
-        let n = x0.len();
-        debug_assert!(x1.len() == n && c.iter().all(|s| s.len() == n));
-        let (p0, p1) = (x0.as_ptr(), x1.as_ptr());
-        let cp = [c[0].as_ptr(), c[1].as_ptr(), c[2].as_ptr(), c[3].as_ptr()];
-        let z = _mm256_setzero_ps();
-        let (mut a00, mut a01, mut a02, mut a03) = (z, z, z, z);
-        let (mut a10, mut a11, mut a12, mut a13) = (z, z, z, z);
+    pub unsafe fn block<const Q: usize, const R: usize>(
+        q: [&[f32]; Q],
+        r: [&[f32]; R],
+        dim: usize,
+    ) -> [[f32; R]; Q] {
+        debug_assert!(q.iter().all(|s| s.len() == dim) && r.iter().all(|s| s.len() == dim));
+        let qp: [*const f32; Q] = std::array::from_fn(|i| q[i].as_ptr());
+        let rp: [*const f32; R] = std::array::from_fn(|i| r[i].as_ptr());
+        let mut acc = [[_mm256_setzero_ps(); R]; Q];
+        let body = dim & !7;
         let mut i = 0;
-        while i + 8 <= n {
-            let v0 = _mm256_loadu_ps(p0.add(i));
-            let v1 = _mm256_loadu_ps(p1.add(i));
-            let y0 = _mm256_loadu_ps(cp[0].add(i));
-            a00 = _mm256_fmadd_ps(v0, y0, a00);
-            a10 = _mm256_fmadd_ps(v1, y0, a10);
-            let y1 = _mm256_loadu_ps(cp[1].add(i));
-            a01 = _mm256_fmadd_ps(v0, y1, a01);
-            a11 = _mm256_fmadd_ps(v1, y1, a11);
-            let y2 = _mm256_loadu_ps(cp[2].add(i));
-            a02 = _mm256_fmadd_ps(v0, y2, a02);
-            a12 = _mm256_fmadd_ps(v1, y2, a12);
-            let y3 = _mm256_loadu_ps(cp[3].add(i));
-            a03 = _mm256_fmadd_ps(v0, y3, a03);
-            a13 = _mm256_fmadd_ps(v1, y3, a13);
+        while i < body {
+            let mut rv = [_mm256_setzero_ps(); R];
+            for j in 0..R {
+                rv[j] = _mm256_loadu_ps(rp[j].add(i));
+            }
+            for a in 0..Q {
+                let qv = _mm256_loadu_ps(qp[a].add(i));
+                for j in 0..R {
+                    acc[a][j] = _mm256_fmadd_ps(qv, rv[j], acc[a][j]);
+                }
+            }
             i += 8;
         }
-        let mut out = [
-            [hsum(a00), hsum(a01), hsum(a02), hsum(a03)],
-            [hsum(a10), hsum(a11), hsum(a12), hsum(a13)],
-        ];
-        while i < n {
-            for (ci, base) in cp.iter().enumerate() {
-                let y = *base.add(i);
-                out[0][ci] += *p0.add(i) * y;
-                out[1][ci] += *p1.add(i) * y;
+        let mut out = [[0.0f32; R]; Q];
+        for a in 0..Q {
+            for j in 0..R {
+                let mut s = hsum(acc[a][j]);
+                let mut t = body;
+                while t < dim {
+                    s += *qp[a].add(t) * *rp[j].add(t);
+                    t += 1;
+                }
+                out[a][j] = s;
             }
-            i += 1;
         }
         out
     }
@@ -403,9 +445,9 @@ fn has_avx2_fma() -> bool {
 /// Define `$name` as a run-time dispatch between the AVX2+FMA and the portable
 /// instantiation of `$imp`.
 macro_rules! dispatch {
-    ($(#[$meta:meta])* fn $name:ident($($arg:ident: $ty:ty),* $(,)?) $(-> $ret:ty)? = $imp:ident) => {
+    ($(#[$meta:meta])* $vis:vis fn $name:ident($($arg:ident: $ty:ty),* $(,)?) $(-> $ret:ty)? = $imp:ident) => {
         $(#[$meta])*
-        fn $name($($arg: $ty),*) $(-> $ret)? {
+        $vis fn $name($($arg: $ty),*) $(-> $ret)? {
             #[cfg(target_arch = "x86_64")]
             {
                 #[target_feature(enable = "avx2,fma")]
@@ -423,49 +465,74 @@ macro_rules! dispatch {
     };
 }
 
-/// Dot product with 32 independent partial sums, so the loop is limited by
-/// memory rather than by the latency of one running total.
+/// `Q` queries against `R` rows, each exactly `dim` floats.
 #[inline(always)]
-fn dot_impl<const F: bool>(a: &[f32], b: &[f32]) -> f32 {
+fn block<const Q: usize, const R: usize, const F: bool>(
+    q: [&[f32]; Q],
+    r: [&[f32]; R],
+) -> [[f32; R]; Q] {
+    let dim = q[0].len();
     #[cfg(target_arch = "x86_64")]
     if F {
+        // the kernel reads `dim` floats from every slice: make that a fact, not a hope
+        assert!(q.iter().all(|s| s.len() == dim) && r.iter().all(|s| s.len() == dim));
         // SAFETY: `F` is true only in the instantiation reached through a
         // `dispatch!` wrapper, which has checked for AVX2 and FMA.
-        return unsafe { x86::dot(a, b) };
+        return unsafe { x86::block::<Q, R>(q, r, dim) };
     }
     const LANES: usize = 8;
-    const UNROLL: usize = 4;
-    let mut acc = [[0.0f32; LANES]; UNROLL];
-    let mut ca = a.chunks_exact(LANES * UNROLL);
-    let mut cb = b.chunks_exact(LANES * UNROLL);
-    for (x, y) in (&mut ca).zip(&mut cb) {
-        for (u, lanes) in acc.iter_mut().enumerate() {
-            for (l, slot) in lanes.iter_mut().enumerate() {
-                let i = u * LANES + l;
-                *slot = fma::<F>(x[i], y[i], *slot);
+    let body = dim - dim % LANES;
+    let mut acc = [[[0.0f32; LANES]; R]; Q];
+    let mut i = 0;
+    while i < body {
+        for a in 0..Q {
+            for j in 0..R {
+                for l in 0..LANES {
+                    acc[a][j][l] = fma::<F>(q[a][i + l], r[j][i + l], acc[a][j][l]);
+                }
             }
         }
+        i += LANES;
     }
-    let mut tail = 0.0f32;
-    for (x, y) in ca.remainder().iter().zip(cb.remainder()) {
-        tail = fma::<F>(*x, *y, tail);
+    let mut out = [[0.0f32; R]; Q];
+    for a in 0..Q {
+        for j in 0..R {
+            let v = &acc[a][j];
+            let t = [v[0] + v[4], v[1] + v[5], v[2] + v[6], v[3] + v[7]];
+            let mut s = (t[0] + t[2]) + (t[1] + t[3]);
+            for x in body..dim {
+                s += q[a][x] * r[j][x];
+            }
+            out[a][j] = s;
+        }
     }
-    let mut s = [0.0f32; LANES];
-    for (l, slot) in s.iter_mut().enumerate() {
-        *slot = (acc[0][l] + acc[1][l]) + (acc[2][l] + acc[3][l]);
-    }
-    (((s[0] + s[4]) + (s[1] + s[5])) + ((s[2] + s[6]) + (s[3] + s[7]))) + tail
+    out
+}
+
+/// Dot product in the crate's one summation order.
+#[inline(always)]
+fn dot_impl<const F: bool>(a: &[f32], b: &[f32]) -> f32 {
+    block::<1, 1, F>([a], [b])[0][0]
 }
 
 dispatch! {
-    fn dot_f32(a: &[f32], b: &[f32]) -> f32 = dot_impl
+    pub(crate) fn dot_f32(a: &[f32], b: &[f32]) -> f32 = dot_impl
 }
 
 /// `out[i] = dot(query, row i of mat)`.
 #[inline(always)]
 fn dots_impl<const F: bool>(query: &[f32], mat: &[f32], dim: usize, out: &mut [f32]) {
-    for (slot, row) in out.iter_mut().zip(mat.chunks_exact(dim)) {
-        *slot = dot_impl::<F>(query, row);
+    let n = out.len();
+    let row = |i: usize| &mat[i * dim..(i + 1) * dim];
+    let mut i = 0;
+    while i + 4 <= n {
+        let d = block::<1, 4, F>([query], [row(i), row(i + 1), row(i + 2), row(i + 3)]);
+        out[i..i + 4].copy_from_slice(&d[0]);
+        i += 4;
+    }
+    while i < n {
+        out[i] = block::<1, 1, F>([query], [row(i)])[0][0];
+        i += 1;
     }
 }
 
@@ -473,49 +540,11 @@ dispatch! {
     fn dots_into(query: &[f32], mat: &[f32], dim: usize, out: &mut [f32]) = dots_impl
 }
 
-/// Two points against four centroids, sharing every load: eight running
-/// vector sums instead of one, a quarter of the memory traffic per multiply.
-#[inline(always)]
-fn dot_2x4<const F: bool>(x0: &[f32], x1: &[f32], c: [&[f32]; 4]) -> [[f32; 4]; 2] {
-    #[cfg(target_arch = "x86_64")]
-    if F {
-        // SAFETY: as in `dot_impl`.
-        return unsafe { x86::dot_2x4(x0, x1, c) };
-    }
-    const LANES: usize = 8;
-    let dim = x0.len();
-    let body = dim - dim % LANES;
-    let mut acc = [[[0.0f32; LANES]; 4]; 2];
-    let mut d = 0;
-    while d < body {
-        let a0 = &x0[d..d + LANES];
-        let a1 = &x1[d..d + LANES];
-        for (ci, centroid) in c.iter().enumerate() {
-            let y = &centroid[d..d + LANES];
-            for l in 0..LANES {
-                acc[0][ci][l] = fma::<F>(a0[l], y[l], acc[0][ci][l]);
-                acc[1][ci][l] = fma::<F>(a1[l], y[l], acc[1][ci][l]);
-            }
-        }
-        d += LANES;
-    }
-    let mut out = [[0.0f32; 4]; 2];
-    for (p, x) in [x0, x1].into_iter().enumerate() {
-        for (ci, centroid) in c.iter().enumerate() {
-            let a = &acc[p][ci];
-            let mut s = ((a[0] + a[4]) + (a[1] + a[5])) + ((a[2] + a[6]) + (a[3] + a[7]));
-            for t in body..dim {
-                s = fma::<F>(x[t], centroid[t], s);
-            }
-            out[p][ci] = s;
-        }
-    }
-    out
-}
-
 /// For each point in `pts` (row-major, `out.len()` rows of `dim`), the index of
 /// the centroid with the largest dot product (the first on a tie). Points are
-/// handled in tiles that stay in cache while the centroids stream past.
+/// handled in tiles that stay in cache while the centroids stream past. Every
+/// point's dot products use the canonical order, so its answer does not depend
+/// on which tile or block it is in.
 #[inline(always)]
 fn nearest_impl<const F: bool>(
     pts: &[f32],
@@ -525,6 +554,8 @@ fn nearest_impl<const F: bool>(
     out: &mut [i32],
 ) {
     let m = out.len();
+    let point = |p: usize| &pts[p * dim..(p + 1) * dim];
+    let cent = |c: usize| &cents[c * dim..(c + 1) * dim];
     let mut best_s = [f32::NEG_INFINITY; TILE];
     let mut best_i = [0i32; TILE];
     let mut p0 = 0;
@@ -534,17 +565,10 @@ fn nearest_impl<const F: bool>(
         best_i[..t].fill(0);
         let mut c = 0;
         while c + 4 <= nlist {
-            let group = [
-                &cents[c * dim..(c + 1) * dim],
-                &cents[(c + 1) * dim..(c + 2) * dim],
-                &cents[(c + 2) * dim..(c + 3) * dim],
-                &cents[(c + 3) * dim..(c + 4) * dim],
-            ];
+            let group = [cent(c), cent(c + 1), cent(c + 2), cent(c + 3)];
             let mut p = 0;
             while p + 2 <= t {
-                let x0 = &pts[(p0 + p) * dim..(p0 + p + 1) * dim];
-                let x1 = &pts[(p0 + p + 1) * dim..(p0 + p + 2) * dim];
-                let d = dot_2x4::<F>(x0, x1, group);
+                let d = block::<2, 4, F>([point(p0 + p), point(p0 + p + 1)], group);
                 for (pi, row) in d.iter().enumerate() {
                     for (ci, &s) in row.iter().enumerate() {
                         if s > best_s[p + pi] {
@@ -556,9 +580,8 @@ fn nearest_impl<const F: bool>(
                 p += 2;
             }
             if p < t {
-                let x = &pts[(p0 + p) * dim..(p0 + p + 1) * dim];
-                for (ci, centroid) in group.iter().enumerate() {
-                    let s = dot_impl::<F>(x, centroid);
+                let d = block::<1, 4, F>([point(p0 + p)], group);
+                for (ci, &s) in d[0].iter().enumerate() {
                     if s > best_s[p] {
                         best_s[p] = s;
                         best_i[p] = (c + ci) as i32;
@@ -568,10 +591,19 @@ fn nearest_impl<const F: bool>(
             c += 4;
         }
         while c < nlist {
-            let centroid = &cents[c * dim..(c + 1) * dim];
-            for p in 0..t {
-                let x = &pts[(p0 + p) * dim..(p0 + p + 1) * dim];
-                let s = dot_impl::<F>(x, centroid);
+            let mut p = 0;
+            while p + 2 <= t {
+                let d = block::<2, 1, F>([point(p0 + p), point(p0 + p + 1)], [cent(c)]);
+                for pi in 0..2 {
+                    if d[pi][0] > best_s[p + pi] {
+                        best_s[p + pi] = d[pi][0];
+                        best_i[p + pi] = c as i32;
+                    }
+                }
+                p += 2;
+            }
+            if p < t {
+                let s = block::<1, 1, F>([point(p0 + p)], [cent(c)])[0][0];
                 if s > best_s[p] {
                     best_s[p] = s;
                     best_i[p] = c as i32;
@@ -588,43 +620,44 @@ dispatch! {
     fn nearest_block(pts: &[f32], dim: usize, cents: &[f32], nlist: usize, out: &mut [i32]) = nearest_impl
 }
 
-/// `nearest_block` spread over threads in fixed-size blocks, so the answer for
-/// a point never depends on how many threads there are.
-fn nearest_parallel(
-    pts: &[f32],
+/// `nearest_block` over `m = out.len()` points spread over threads in fixed
+/// blocks. `points(lo, len)` returns the contiguous floats of points
+/// `lo..lo + len`; a block never straddles a table chunk because the block
+/// sizes divide the chunk size.
+fn nearest_parallel<'a>(
+    points: &(dyn Fn(usize, usize) -> &'a [f32] + Sync),
     dim: usize,
     cents: &[f32],
     nlist: usize,
     out: &mut [i32],
-    threads: usize,
+    par: Par,
 ) {
-    let blocks = out.len().div_ceil(NEAR_BLOCK);
-    let work = out.len().saturating_mul(nlist).saturating_mul(dim);
+    let m = out.len();
+    // big jobs in NEAR_BLOCK units; a small one (a fold) is cut finer, so that
+    // every thread of the pool gets a piece
+    let block = if m >= 8 * NEAR_BLOCK {
+        NEAR_BLOCK
+    } else {
+        (m / par.size().max(1)).next_power_of_two().clamp(16, TILE)
+    };
+    let blocks = m.div_ceil(block);
+    let work = m.saturating_mul(nlist).saturating_mul(dim);
     let threads = if work < (1 << 24) {
         1
     } else {
-        workers(threads, blocks, usize::MAX)
+        par.workers(blocks, usize::MAX)
     };
     if threads <= 1 {
-        nearest_block(pts, dim, cents, nlist, out);
+        for (b, chunk) in out.chunks_mut(block).enumerate() {
+            nearest_block(points(b * block, chunk.len()), dim, cents, nlist, chunk);
+        }
         return;
     }
-    let queue = Mutex::new(out.chunks_mut(NEAR_BLOCK).enumerate());
-    std::thread::scope(|scope| {
-        for _ in 0..threads {
-            scope.spawn(|| loop {
-                let next = queue.lock().ok().and_then(|mut q| q.next());
-                let Some((b, chunk)) = next else { break };
-                let lo = b * NEAR_BLOCK;
-                nearest_block(
-                    &pts[lo * dim..(lo + chunk.len()) * dim],
-                    dim,
-                    cents,
-                    nlist,
-                    chunk,
-                );
-            });
-        }
+    let queue = Mutex::new(out.chunks_mut(block).enumerate());
+    par.run(threads, &|_| loop {
+        let next = queue.lock().ok().and_then(|mut q| q.next());
+        let Some((b, chunk)) = next else { break };
+        nearest_block(points(b * block, chunk.len()), dim, cents, nlist, chunk);
     });
 }
 
@@ -773,25 +806,86 @@ impl<'a> QueryVec<'a> {
     }
 }
 
-/// The matrix side of the cache, borrowed for a scan.
-#[derive(Clone, Copy)]
-struct Rows<'a> {
-    data: &'a [f32],
-    norms: &'a [f32],
-    codes: &'a [u32],
-    dim: usize,
-}
-
-/// Cosine of `q` against one row. A zero-length row scores 0, a tombstone
-/// (norm NaN) scores NaN and is dropped by the collector.
+/// Cosine from a dot product and the two norms. A zero-length row scores 0, a
+/// tombstone (norm NaN) scores NaN and is dropped by the collector.
 #[inline(always)]
-fn score_row<const F: bool>(q: &QueryVec, row: &[f32], norm: f32) -> f32 {
-    let dot = dot_impl::<F>(q.v, row);
-    let denom = norm * q.norm;
+fn cosine(dot: f32, row_norm: f32, query_norm: f32) -> f32 {
+    let denom = row_norm * query_norm;
     if denom == 0.0 {
         0.0
     } else {
         dot / denom
+    }
+}
+
+/// Rows scored per kernel call by a single query.
+const QW: usize = 4;
+
+/// Collects rows `QW` at a time so one query is scored against `QW` rows per
+/// kernel call (`QW` independent dependency chains and memory streams).
+struct Quad<'a> {
+    slots: [usize; QW],
+    rows: [&'a [f32]; QW],
+    m: usize,
+}
+
+impl<'a> Quad<'a> {
+    #[inline(always)]
+    fn new() -> Self {
+        Self {
+            slots: [0; QW],
+            rows: [&[]; QW],
+            m: 0,
+        }
+    }
+
+    /// Queue `slot`, looking its row up in the (chunked) matrix.
+    #[inline(always)]
+    fn push<const F: bool>(
+        &mut self,
+        rows: &Rows<'a>,
+        q: &QueryVec,
+        slot: usize,
+        sink: &mut impl FnMut(usize, f32),
+    ) {
+        self.push_row::<F>(rows.norms, q, slot, rows.row(slot), sink);
+    }
+
+    /// Queue `slot` whose row the caller already has in hand.
+    #[inline(always)]
+    fn push_row<const F: bool>(
+        &mut self,
+        norms: &[f32],
+        q: &QueryVec,
+        slot: usize,
+        row: &'a [f32],
+        sink: &mut impl FnMut(usize, f32),
+    ) {
+        self.slots[self.m] = slot;
+        self.rows[self.m] = row;
+        self.m += 1;
+        if self.m == QW {
+            self.m = 0;
+            let d = block::<1, QW, F>([q.v], self.rows);
+            for i in 0..QW {
+                sink(self.slots[i], cosine(d[0][i], norms[self.slots[i]], q.norm));
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn finish<const F: bool>(
+        &mut self,
+        rows: &Rows,
+        q: &QueryVec,
+        sink: &mut impl FnMut(usize, f32),
+    ) {
+        for i in 0..self.m {
+            let slot = self.slots[i];
+            let d = block::<1, 1, F>([q.v], [self.rows[i]]);
+            sink(slot, cosine(d[0][0], rows.norms[slot], q.norm));
+        }
+        self.m = 0;
     }
 }
 
@@ -805,29 +899,61 @@ fn scan_range_impl<const F: bool>(
     hi: usize,
     top: &mut TopK,
 ) {
+    let mut quad = Quad::new();
+    let mut sink = |slot: usize, score: f32| top.offer(score, slot as u32);
+    // walk the matrix one contiguous run (the rest of a chunk) at a time, so a
+    // row is a slice of the run rather than two dependent lookups
     let dim = rows.dim;
-    for slot in lo..hi {
-        if let Some(code) = code {
-            if rows.codes[slot] != code {
-                continue;
+    let mut at = lo;
+    while at < hi {
+        let (flat, count) = rows.run(at, hi);
+        for i in 0..count {
+            let slot = at + i;
+            if let Some(code) = code {
+                if rows.codes[slot] != code {
+                    continue;
+                }
             }
+            quad.push_row::<F>(
+                rows.norms,
+                q,
+                slot,
+                &flat[i * dim..(i + 1) * dim],
+                &mut sink,
+            );
         }
-        let row = &rows.data[slot * dim..(slot + 1) * dim];
-        top.offer(score_row::<F>(q, row, rows.norms[slot]), slot as u32);
+        at += count;
     }
+    quad.finish::<F>(&rows, q, &mut sink);
 }
 
 dispatch! {
     fn scan_range(rows: Rows, q: &QueryVec, code: Option<u32>, lo: usize, hi: usize, top: &mut TopK) = scan_range_impl
 }
 
+/// Score every live row (for the score map) and hand `(slot, score)` on.
+#[inline(always)]
+fn score_all_impl<const F: bool>(rows: Rows, q: &QueryVec, n: usize, out: &mut Vec<(u32, f32)>) {
+    let mut quad = Quad::new();
+    let mut sink = |slot: usize, score: f32| out.push((slot as u32, score));
+    for slot in 0..n {
+        if rows.norms[slot].is_nan() {
+            continue;
+        }
+        quad.push::<F>(&rows, q, slot, &mut sink);
+    }
+    quad.finish::<F>(&rows, q, &mut sink);
+}
+
+dispatch! {
+    fn score_all(rows: Rows, q: &QueryVec, n: usize, out: &mut Vec<(u32, f32)>) = score_all_impl
+}
+
 /// The parts of an [`Ivf`] a cell scan reads.
 #[derive(Clone, Copy)]
 struct Cells<'a> {
-    order: &'a [u32],
-    offsets: &'a [usize],
-    assign: &'a [i32],
-    pending: &'a BTreeSet<u32>,
+    lists: &'a [Vec<u32>],
+    pending: &'a [u32],
 }
 
 /// Score the rows of the `chosen` cells, and every pending row if asked.
@@ -841,184 +967,81 @@ fn scan_cells_impl<const F: bool>(
     code: Option<u32>,
     top: &mut TopK,
 ) {
-    let dim = rows.dim;
-    let visit = |slot: usize, top: &mut TopK| {
-        if let Some(code) = code {
-            if rows.codes[slot] != code {
-                return;
-            }
-        }
-        let row = &rows.data[slot * dim..(slot + 1) * dim];
-        top.offer(score_row::<F>(q, row, rows.norms[slot]), slot as u32);
-    };
+    let mut quad = Quad::new();
+    let mut sink = |slot: usize, score: f32| top.offer(score, slot as u32);
     for &c in chosen {
-        let c = c as usize;
-        for &slot in &cells.order[cells.offsets[c]..cells.offsets[c + 1]] {
-            // Entries can be stale: a row deleted or rewritten since the
-            // lists were last regrouped no longer belongs to this cell.
-            if cells.assign[slot as usize] == c as i32 {
-                visit(slot as usize, top);
+        for &slot in &cells.lists[c as usize] {
+            let slot = slot as usize;
+            if let Some(code) = code {
+                if rows.codes[slot] != code {
+                    continue;
+                }
             }
+            quad.push::<F>(&rows, q, slot, &mut sink);
         }
     }
     if with_pending {
         for &slot in cells.pending {
-            visit(slot as usize, top);
+            let slot = slot as usize;
+            if let Some(code) = code {
+                if rows.codes[slot] != code {
+                    continue;
+                }
+            }
+            quad.push::<F>(&rows, q, slot, &mut sink);
         }
     }
+    quad.finish::<F>(&rows, q, &mut sink);
 }
 
 dispatch! {
     fn scan_cells(rows: Rows, cells: Cells, chosen: &[u32], with_pending: bool, q: &QueryVec, code: Option<u32>, top: &mut TopK) = scan_cells_impl
 }
 
-// =============================================================================
-// The scan cache
-// =============================================================================
-
-/// Row-major snapshot of every vector, patched in place by writes.
-pub(crate) struct ScanCache {
-    dim: usize,
-    data: Vec<f32>,
-    /// Euclidean norm per row; NaN marks a tombstone.
-    norms: Vec<f32>,
-    codes: Vec<u32>,
-    alive: Vec<bool>,
-    keys: Vec<Option<Arc<str>>>,
-    slot_of: HashMap<Arc<str>, u32>,
-    code_of: HashMap<String, u32>,
-    /// Slots in use, tombstones included.
-    n: usize,
-    dead: usize,
-}
-
-impl ScanCache {
-    fn empty(dim: usize) -> Self {
-        Self {
-            dim,
-            data: Vec::new(),
-            norms: Vec::new(),
-            codes: Vec::new(),
-            alive: Vec::new(),
-            keys: Vec::new(),
-            slot_of: HashMap::new(),
-            code_of: HashMap::new(),
-            n: 0,
-            dead: 0,
-        }
-    }
-
-    fn build(records: &HashMap<String, crate::EmbeddingRecord>, dim: usize) -> Self {
-        let mut cache = Self::empty(dim);
-        let mut keys: Vec<&String> = records.keys().collect();
-        keys.sort_unstable();
-        cache.data.reserve_exact(keys.len() * dim);
-        cache.norms.reserve_exact(keys.len());
-        cache.codes.reserve_exact(keys.len());
-        cache.alive.reserve_exact(keys.len());
-        cache.keys.reserve_exact(keys.len());
-        cache.slot_of.reserve(keys.len());
-        for key in keys {
-            let record = &records[key];
-            cache.put(key, &record.node_id.node_type, &record.vector);
-        }
-        cache
-    }
-
-    fn live(&self) -> usize {
-        self.n - self.dead
-    }
-
-    fn row(&self, slot: usize) -> &[f32] {
-        &self.data[slot * self.dim..(slot + 1) * self.dim]
-    }
-
-    fn rows(&self) -> Rows<'_> {
-        Rows {
-            data: &self.data,
-            norms: &self.norms,
-            codes: &self.codes,
-            dim: self.dim,
-        }
-    }
-
-    fn code_for(&mut self, node_type: &str) -> u32 {
-        if let Some(&code) = self.code_of.get(node_type) {
-            return code;
-        }
-        let code = self.code_of.len() as u32;
-        self.code_of.insert(node_type.to_string(), code);
-        code
-    }
-
-    /// Insert or overwrite the row for `key`; returns its slot.
-    fn put(&mut self, key: &str, node_type: &str, vector: &[f32]) -> u32 {
-        let code = self.code_for(node_type);
-        let norm = dot_f32(vector, vector).sqrt();
-        if let Some(&slot) = self.slot_of.get(key) {
-            let s = slot as usize;
-            self.data[s * self.dim..(s + 1) * self.dim].copy_from_slice(vector);
-            self.norms[s] = norm;
-            self.codes[s] = code;
-            return slot;
-        }
-        let slot = self.n as u32;
-        let key: Arc<str> = Arc::from(key);
-        self.data.extend_from_slice(vector);
-        self.norms.push(norm);
-        self.codes.push(code);
-        self.alive.push(true);
-        self.keys.push(Some(key.clone()));
-        self.slot_of.insert(key, slot);
-        self.n += 1;
-        slot
-    }
-
-    /// Tombstone the row for `key`; returns its slot.
-    fn remove(&mut self, key: &str) -> Option<u32> {
-        let slot = self.slot_of.remove(key)?;
-        let s = slot as usize;
-        self.norms[s] = f32::NAN;
-        self.alive[s] = false;
-        self.keys[s] = None;
-        self.dead += 1;
-        Some(slot)
-    }
-
-    fn should_compact(&self) -> bool {
-        self.dead > 0 && self.dead * 4 > self.n
-    }
-
-    /// Drop the tombstones, keeping row order. Returns the old slot of every
-    /// surviving row, in order, so an index can follow the move.
-    fn compact(&mut self) -> Vec<u32> {
-        let dim = self.dim;
-        let live: Vec<u32> = (0..self.n as u32)
-            .filter(|&s| self.alive[s as usize])
-            .collect();
-        for (new, &old) in live.iter().enumerate() {
-            let old = old as usize;
-            if new != old {
-                self.data.copy_within(old * dim..(old + 1) * dim, new * dim);
-                self.norms[new] = self.norms[old];
-                self.codes[new] = self.codes[old];
-                self.keys.swap(new, old);
-                if let Some(key) = &self.keys[new] {
-                    self.slot_of.insert(key.clone(), new as u32);
+/// A tile of queries against one block of rows (`slots`, already filtered by
+/// type): four queries against two rows per kernel call, so a row loaded from
+/// L2 is used by four queries and a query loaded from L1 by two rows.
+#[inline(always)]
+fn batch_block_impl<const F: bool>(rows: Rows, qs: &[&QueryVec], slots: &[u32], tops: &mut [TopK]) {
+    let mut base = 0;
+    for group in qs.chunks(4) {
+        if group.len() == 4 {
+            let qv = [group[0].v, group[1].v, group[2].v, group[3].v];
+            let mut i = 0;
+            while i + 2 <= slots.len() {
+                let (s0, s1) = (slots[i] as usize, slots[i + 1] as usize);
+                let d = block::<4, 2, F>(qv, [rows.row(s0), rows.row(s1)]);
+                for a in 0..4 {
+                    let top = &mut tops[base + a];
+                    top.offer(cosine(d[a][0], rows.norms[s0], group[a].norm), s0 as u32);
+                    top.offer(cosine(d[a][1], rows.norms[s1], group[a].norm), s1 as u32);
+                }
+                i += 2;
+            }
+            if i < slots.len() {
+                let s0 = slots[i] as usize;
+                let d = block::<4, 1, F>(qv, [rows.row(s0)]);
+                for a in 0..4 {
+                    tops[base + a].offer(cosine(d[a][0], rows.norms[s0], group[a].norm), s0 as u32);
                 }
             }
+        } else {
+            for (a, q) in group.iter().enumerate() {
+                let top = &mut tops[base + a];
+                let mut quad = Quad::new();
+                let mut sink = |slot: usize, score: f32| top.offer(score, slot as u32);
+                for &slot in slots {
+                    quad.push::<F>(&rows, q, slot as usize, &mut sink);
+                }
+                quad.finish::<F>(&rows, q, &mut sink);
+            }
         }
-        let kept = live.len();
-        self.data.truncate(kept * dim);
-        self.norms.truncate(kept);
-        self.codes.truncate(kept);
-        self.keys.truncate(kept);
-        self.alive.clear();
-        self.alive.resize(kept, true);
-        self.n = kept;
-        self.dead = 0;
-        live
+        base += group.len();
     }
+}
+
+dispatch! {
+    fn batch_block(rows: Rows, qs: &[&QueryVec], slots: &[u32], tops: &mut [TopK]) = batch_block_impl
 }
 
 // =============================================================================
@@ -1030,29 +1053,29 @@ pub(crate) struct Ivf {
     centroids: Vec<f32>,
     nlist: usize,
     dim: usize,
-    /// Cell per row slot; -1 = in no cell (deleted, or pending).
+    /// Per row slot: its cell, `PENDING`, or `NO_CELL` (deleted).
     assign: Vec<i32>,
-    /// Row slots grouped by cell, ascending within a cell.
-    order: Vec<u32>,
-    /// `order[offsets[c]..offsets[c + 1]]` is cell `c`.
-    offsets: Vec<usize>,
+    /// Per row slot: its position in its cell's list (or in `pending`), so a
+    /// row leaves a list in O(1).
+    pos: Vec<u32>,
+    /// The slots of each cell. No stale entries: a list holds exactly the live,
+    /// folded rows assigned to it.
+    lists: Vec<Vec<u32>>,
     /// Live rows with no cell yet; every query scores them exactly.
-    pending: BTreeSet<u32>,
+    pending: Vec<u32>,
     churn: usize,
     trained_n: usize,
     build_seconds: f64,
-    /// Per-query scratch, kept so a search allocates nothing in its hot path.
-    cell_scores: Vec<f32>,
-    cell_order: Vec<u32>,
-    chosen: Vec<u32>,
+    folds: u64,
+    fold_seconds: f64,
 }
 
 impl Ivf {
     /// Train centroids on a sample, then give every live row its cell.
-    fn build(cache: &ScanCache, nlist: usize, seed: u64, threads: usize) -> Ivf {
+    fn build(table: &VectorTable, nlist: usize, seed: u64, par: Par) -> Ivf {
         let started = Instant::now();
-        let (n, dim) = (cache.n, cache.dim);
-        let live: Vec<u32> = (0..n as u32).filter(|&s| cache.alive[s as usize]).collect();
+        let (n, dim) = (table.slots(), table.dim);
+        let live: Vec<u32> = table.live_slots().map(|s| s as u32).collect();
         let total = live.len();
         let nlist = nlist.clamp(1, total.max(1));
         let mut rng = Rng(seed);
@@ -1069,7 +1092,7 @@ impl Ivf {
         // Unit-length copies of the sample (a zero row stays as it is).
         let mut x = vec![0.0f32; sample_n * dim];
         for (i, &slot) in sample.iter().enumerate() {
-            let norm = cache.norms[slot as usize];
+            let norm = table.norm(slot as usize);
             let scale = if norm > 0.0 && norm.is_finite() {
                 1.0 / norm
             } else {
@@ -1077,7 +1100,7 @@ impl Ivf {
             };
             for (dst, src) in x[i * dim..(i + 1) * dim]
                 .iter_mut()
-                .zip(cache.row(slot as usize))
+                .zip(table.row(slot as usize))
             {
                 *dst = src * scale;
             }
@@ -1093,7 +1116,14 @@ impl Ivf {
         let mut sums = vec![0.0f64; nlist * dim];
         let mut counts = vec![0u32; nlist];
         for _ in 0..KMEANS_ITERATIONS {
-            nearest_parallel(&x, dim, &centroids, nlist, &mut cell, threads);
+            nearest_parallel(
+                &|lo, len| &x[lo * dim..(lo + len) * dim],
+                dim,
+                &centroids,
+                nlist,
+                &mut cell,
+                par,
+            );
             sums.fill(0.0);
             counts.fill(0);
             for (i, &c) in cell.iter().enumerate() {
@@ -1127,16 +1157,16 @@ impl Ivf {
         // nearest cell; the dead are then taken out again.
         let mut assign = vec![0i32; n];
         nearest_parallel(
-            &cache.data[..n * dim],
+            &|lo, len| table.run(lo, lo + len).0,
             dim,
             &centroids,
             nlist,
             &mut assign,
-            threads,
+            par,
         );
-        for (a, alive) in assign.iter_mut().zip(&cache.alive) {
-            if !alive {
-                *a = -1;
+        for (slot, a) in assign.iter_mut().enumerate() {
+            if !table.is_live(slot) {
+                *a = NO_CELL;
             }
         }
         let mut index = Ivf {
@@ -1144,437 +1174,220 @@ impl Ivf {
             nlist,
             dim,
             assign,
-            order: Vec::new(),
-            offsets: Vec::new(),
-            pending: BTreeSet::new(),
+            pos: vec![0; n],
+            lists: Vec::new(),
+            pending: Vec::new(),
             churn: 0,
             trained_n: total,
             build_seconds: 0.0,
-            cell_scores: vec![0.0; nlist],
-            cell_order: Vec::new(),
-            chosen: Vec::new(),
+            folds: 0,
+            fold_seconds: 0.0,
         };
-        index.relist(n);
+        index.relist();
         index.build_seconds = started.elapsed().as_secs_f64();
         index
     }
 
-    /// Regroup the rows by cell (a stable counting sort of `assign`).
-    fn relist(&mut self, n: usize) {
-        if self.assign.len() < n {
-            self.assign.resize(n, -1);
-        }
-        let mut offsets = vec![0usize; self.nlist + 1];
-        for &c in &self.assign[..n] {
+    /// Rebuild every cell list from `assign` (slot order within a cell).
+    fn relist(&mut self) {
+        let mut counts = vec![0usize; self.nlist];
+        for &c in &self.assign {
             if c >= 0 {
-                offsets[c as usize + 1] += 1;
+                counts[c as usize] += 1;
             }
         }
-        for c in 0..self.nlist {
-            offsets[c + 1] += offsets[c];
-        }
-        let mut cursor = offsets.clone();
-        let mut order = vec![0u32; offsets[self.nlist]];
-        for (slot, &c) in self.assign[..n].iter().enumerate() {
+        self.lists = counts.iter().map(|&c| Vec::with_capacity(c)).collect();
+        for (slot, &c) in self.assign.iter().enumerate() {
             if c >= 0 {
-                let at = &mut cursor[c as usize];
-                order[*at] = slot as u32;
-                *at += 1;
+                let list = &mut self.lists[c as usize];
+                self.pos[slot] = list.len() as u32;
+                list.push(slot as u32);
             }
         }
-        self.order = order;
-        self.offsets = offsets;
     }
 
-    /// Give every pending row its nearest cell and regroup.
-    fn fold(&mut self, cache: &ScanCache, threads: usize) {
-        if !self.pending.is_empty() {
-            let dim = self.dim;
-            let slots: Vec<u32> = self.pending.iter().copied().collect();
-            let mut gathered = Vec::with_capacity(slots.len() * dim);
-            for &s in &slots {
-                gathered.extend_from_slice(cache.row(s as usize));
-            }
-            let mut cells = vec![0i32; slots.len()];
-            nearest_parallel(
-                &gathered,
-                dim,
-                &self.centroids,
-                self.nlist,
-                &mut cells,
-                threads,
-            );
-            for (&s, &c) in slots.iter().zip(&cells) {
-                self.assign[s as usize] = c;
-            }
-            self.pending.clear();
-        }
-        self.relist(cache.n);
+    /// Past the churn that calls for retraining.
+    fn stale(&self) -> bool {
+        self.churn as f64 > RETRAIN_FRACTION * self.trained_n as f64
     }
 
+    /// Take `slot` out of whatever list holds it.
+    fn detach(&mut self, slot: u32) {
+        let s = slot as usize;
+        let Some(&cell) = self.assign.get(s) else {
+            return;
+        };
+        let at = self.pos[s] as usize;
+        let list = match cell {
+            NO_CELL => return,
+            PENDING => &mut self.pending,
+            c => &mut self.lists[c as usize],
+        };
+        let last = list.len() - 1;
+        list.swap_remove(at);
+        if at != last {
+            self.pos[list[at] as usize] = at as u32;
+        }
+        self.assign[s] = NO_CELL;
+    }
+
+    /// A row was written (new, or its vector replaced): it waits in `pending`.
     fn note_put(&mut self, slot: u32) {
         let s = slot as usize;
         if s >= self.assign.len() {
-            self.assign.resize(s + 1, -1);
+            self.assign.resize(s + 1, NO_CELL);
+            self.pos.resize(s + 1, 0);
         }
-        self.assign[s] = -1;
-        self.pending.insert(slot);
+        self.detach(slot);
+        self.assign[s] = PENDING;
+        self.pos[s] = self.pending.len() as u32;
+        self.pending.push(slot);
         self.churn += 1;
     }
 
     fn note_drop(&mut self, slot: u32) {
-        if let Some(a) = self.assign.get_mut(slot as usize) {
-            *a = -1;
-        }
-        self.pending.remove(&slot);
+        self.detach(slot);
         self.churn += 1;
     }
 
-    /// Follow the cache's compaction (`live` = old slots kept, in order).
+    /// Give every pending row its nearest cell.
+    fn fold(&mut self, table: &VectorTable, par: Par) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let started = Instant::now();
+        let dim = self.dim;
+        let slots = std::mem::take(&mut self.pending);
+        let mut gathered = Vec::with_capacity(slots.len() * dim);
+        for &s in &slots {
+            gathered.extend_from_slice(table.row(s as usize));
+        }
+        let mut cells = vec![0i32; slots.len()];
+        nearest_parallel(
+            &|lo, len| &gathered[lo * dim..(lo + len) * dim],
+            dim,
+            &self.centroids,
+            self.nlist,
+            &mut cells,
+            par,
+        );
+        for (&s, &c) in slots.iter().zip(&cells) {
+            let list = &mut self.lists[c as usize];
+            self.assign[s as usize] = c;
+            self.pos[s as usize] = list.len() as u32;
+            list.push(s);
+        }
+        self.folds += 1;
+        self.fold_seconds += started.elapsed().as_secs_f64();
+    }
+
+    /// Follow the table's compaction (`live` = old slots kept, in order).
     fn compact(&mut self, live: &[u32]) {
         let moved: Vec<i32> = live.iter().map(|&old| self.assign[old as usize]).collect();
-        self.assign = moved;
-        self.pending = self
+        let pending: Vec<u32> = self
             .pending
             .iter()
             .filter_map(|old| live.binary_search(old).ok().map(|new| new as u32))
             .collect();
-        self.relist(live.len());
+        self.assign = moved;
+        self.pos = vec![0; live.len()];
+        self.relist();
+        for (i, &slot) in pending.iter().enumerate() {
+            self.pos[slot as usize] = i as u32;
+        }
+        self.pending = pending;
+    }
+
+    /// Every invariant of the index against the table it indexes.
+    fn check(&self, table: &VectorTable, pending_cap: usize) -> Result<(), String> {
+        let n = table.slots();
+        if self.assign.len() != n || self.pos.len() != n {
+            return Err(format!(
+                "index covers {} rows (pos {}), table has {n}",
+                self.assign.len(),
+                self.pos.len()
+            ));
+        }
+        if self.pending.len() >= pending_cap {
+            return Err(format!(
+                "{} rows pending, the cap is {pending_cap}",
+                self.pending.len()
+            ));
+        }
+        let mut seen = 0usize;
+        for (c, list) in self.lists.iter().enumerate() {
+            for (at, &slot) in list.iter().enumerate() {
+                let s = slot as usize;
+                if self.assign[s] != c as i32 || self.pos[s] as usize != at {
+                    return Err(format!(
+                        "slot {slot} listed in cell {c} at {at} but assigned {} at {}",
+                        self.assign[s], self.pos[s]
+                    ));
+                }
+                if !table.is_live(s) {
+                    return Err(format!("dead slot {slot} still in cell {c}"));
+                }
+                seen += 1;
+            }
+        }
+        for (at, &slot) in self.pending.iter().enumerate() {
+            let s = slot as usize;
+            if self.assign[s] != PENDING || self.pos[s] as usize != at || !table.is_live(s) {
+                return Err(format!("pending slot {slot} is inconsistent"));
+            }
+            seen += 1;
+        }
+        for slot in 0..n {
+            let live = table.is_live(slot);
+            match (live, self.assign[slot]) {
+                (false, NO_CELL) => {}
+                (false, a) => return Err(format!("dead slot {slot} assigned {a}")),
+                (true, NO_CELL) => return Err(format!("live slot {slot} is in no cell")),
+                (true, _) => {}
+            }
+        }
+        if seen != table.live() {
+            return Err(format!("{seen} rows in lists, {} live", table.live()));
+        }
+        Ok(())
     }
 
     fn nbytes(&self) -> usize {
         self.centroids.len() * 4
             + self.assign.len() * 4
-            + self.order.len() * 4
-            + self.offsets.len() * std::mem::size_of::<usize>()
+            + self.pos.len() * 4
+            + self
+                .lists
+                .iter()
+                .map(|l| l.capacity() * 4 + 24)
+                .sum::<usize>()
+            + self.pending.capacity() * 4
     }
 
-    /// The `lists` cells whose centroids are most similar to the query, into
-    /// `self.chosen` (ascending, for memory locality).
-    fn choose_cells(&mut self, q: &QueryVec, lists: usize) {
-        self.chosen.clear();
+    /// The `lists` cells whose centroids are most similar to the query
+    /// (ascending, for memory locality).
+    fn choose_cells(&self, q: &QueryVec, lists: usize) -> Vec<u32> {
         if lists >= self.nlist {
-            self.chosen.extend(0..self.nlist as u32);
-            return;
+            return (0..self.nlist as u32).collect();
         }
-        dots_into(q.v, &self.centroids, self.dim, &mut self.cell_scores);
-        self.cell_order.clear();
-        self.cell_order.extend(0..self.nlist as u32);
-        let scores = &self.cell_scores;
-        self.cell_order.select_nth_unstable_by(lists - 1, |&a, &b| {
+        let mut scores = vec![0.0f32; self.nlist];
+        dots_into(q.v, &self.centroids, self.dim, &mut scores);
+        let mut order: Vec<u32> = (0..self.nlist as u32).collect();
+        order.select_nth_unstable_by(lists - 1, |&a, &b| {
             scores[b as usize]
                 .total_cmp(&scores[a as usize])
                 .then(a.cmp(&b))
         });
-        self.chosen.extend_from_slice(&self.cell_order[..lists]);
-        self.chosen.sort_unstable();
+        order.truncate(lists);
+        order.sort_unstable();
+        order
     }
-}
-
-// =============================================================================
-// State kept behind the store's lock
-// =============================================================================
-
-#[derive(Default)]
-pub(crate) struct ScanState {
-    cache: Option<ScanCache>,
-    ivf: Option<Ivf>,
-    counts: AnnSearchCounts,
-}
-
-impl ScanState {
-    /// Forget everything derived from the vectors (the counters stay).
-    pub(crate) fn reset(&mut self) {
-        self.cache = None;
-        self.ivf = None;
-    }
-
-    /// A vector was written: patch the cache and the index if they exist.
-    pub(crate) fn note_put(&mut self, key: &str, node_type: &str, vector: &[f32]) {
-        let Some(cache) = self.cache.as_mut() else {
-            return;
-        };
-        if cache.dim != vector.len() {
-            self.reset();
-            return;
-        }
-        let slot = cache.put(key, node_type, vector);
-        if let Some(ivf) = self.ivf.as_mut() {
-            ivf.note_put(slot);
-        }
-    }
-
-    /// A vector was removed.
-    pub(crate) fn note_remove(&mut self, key: &str) {
-        let Some(cache) = self.cache.as_mut() else {
-            return;
-        };
-        let Some(slot) = cache.remove(key) else {
-            return;
-        };
-        if let Some(ivf) = self.ivf.as_mut() {
-            ivf.note_drop(slot);
-        }
-        if cache.should_compact() {
-            let live = cache.compact();
-            if let Some(ivf) = self.ivf.as_mut() {
-                ivf.compact(&live);
-            }
-        }
-    }
-
-    /// Build or maintain the index as the policy says; false = answer exactly.
-    fn index_ready(&mut self, cfg: &AnnConfig, threads: usize) -> bool {
-        let Some(cache) = self.cache.as_ref() else {
-            return false;
-        };
-        if cache.live() < cfg.min_size.max(2) {
-            self.ivf = None;
-            return false;
-        }
-        if self
-            .ivf
-            .as_ref()
-            .is_some_and(|i| i.churn as f64 > RETRAIN_FRACTION * i.trained_n as f64)
-        {
-            self.ivf = None;
-        }
-        match self.ivf.as_mut() {
-            None => {
-                let nlist = cfg.nlist.unwrap_or_else(|| auto_nlist(cache.live()));
-                self.ivf = Some(Ivf::build(cache, nlist, cfg.seed, threads));
-                self.counts.builds += 1;
-            }
-            Some(ivf) => {
-                let fold_at = (FOLD_MIN as f64).max(FOLD_FRACTION * ivf.trained_n as f64);
-                if ivf.pending.len() as f64 >= fold_at {
-                    ivf.fold(cache, threads);
-                }
-            }
-        }
-        true
-    }
-
-    /// Rows scored from the probed cells, or `None` meaning "use the scan".
-    ///
-    /// `scale` 1 honours `nprobe` as configured (`nprobe >= nlist` is the
-    /// scan). Later steps multiply it by 4 and give up on the index once they
-    /// would touch half the cells, where scanning everything costs about the
-    /// same.
-    #[allow(clippy::too_many_arguments)]
-    fn probe(
-        &mut self,
-        cfg: &AnnConfig,
-        q: &QueryVec,
-        code: Option<u32>,
-        threshold: f32,
-        k: usize,
-        scale: usize,
-        threads: usize,
-    ) -> Option<TopK> {
-        let cache = self.cache.as_ref()?;
-        let ivf = self.ivf.as_mut()?;
-        let nprobe = effective_nprobe(cfg, ivf.nlist);
-        let lists = nprobe.saturating_mul(scale);
-        let exhausted = if scale == 1 {
-            lists >= ivf.nlist
-        } else {
-            lists.saturating_mul(2) >= ivf.nlist
-        };
-        if exhausted {
-            return None;
-        }
-        ivf.choose_cells(q, lists);
-        let cells = Cells {
-            order: &ivf.order,
-            offsets: &ivf.offsets,
-            assign: &ivf.assign,
-            pending: &ivf.pending,
-        };
-        Some(scan_probed(
-            cache,
-            cells,
-            &ivf.chosen,
-            q,
-            code,
-            threshold,
-            k,
-            threads,
-        ))
-    }
-
-    /// Top `k` from the index, or `None` to fall back to the scan.
-    fn approximate_topk(
-        &mut self,
-        cfg: &AnnConfig,
-        threads: usize,
-        q: &QueryVec,
-        code: Option<u32>,
-        threshold: f32,
-        k: usize,
-    ) -> Option<Vec<Hit>> {
-        if !q.has_direction() || !self.index_ready(cfg, threads) {
-            return None;
-        }
-        let mut scale = 1usize;
-        loop {
-            let top = self.probe(cfg, q, code, threshold, k, scale, threads)?;
-            if top.len() >= k {
-                self.counts.approximate += 1;
-                if scale > 1 {
-                    self.counts.widened += 1;
-                }
-                return Some(top.into_sorted());
-            }
-            scale = scale.saturating_mul(4);
-        }
-    }
-
-    /// Every row the probed cells yield (for a caller that filters further),
-    /// best first; `None` to fall back to the scan.
-    fn approximate_ranked(
-        &mut self,
-        cfg: &AnnConfig,
-        threads: usize,
-        q: &QueryVec,
-        code: Option<u32>,
-        threshold: f32,
-        scale: usize,
-    ) -> Option<Vec<Hit>> {
-        if !q.has_direction() || !self.index_ready(cfg, threads) {
-            return None;
-        }
-        let top = self.probe(cfg, q, code, threshold, usize::MAX, scale, threads)?;
-        self.counts.approximate += 1;
-        if scale > 1 {
-            self.counts.widened += 1;
-        }
-        Some(top.into_sorted())
-    }
-}
-
-/// Score the probed cells (and the pending rows). The rows of a cell are
-/// scattered through the matrix, so one thread is limited by how many cache
-/// lines it can have in flight, not by bandwidth: a large probe is shared out
-/// a few cells at a time. The answer does not depend on the thread count.
-#[allow(clippy::too_many_arguments)]
-fn scan_probed(
-    cache: &ScanCache,
-    cells: Cells,
-    chosen: &[u32],
-    q: &QueryVec,
-    code: Option<u32>,
-    threshold: f32,
-    k: usize,
-    configured_threads: usize,
-) -> TopK {
-    const CELLS_PER_TASK: usize = 4;
-    let rows = cache.rows();
-    let candidates: usize = chosen
-        .iter()
-        .map(|&c| cells.offsets[c as usize + 1] - cells.offsets[c as usize])
-        .sum::<usize>()
-        + cells.pending.len();
-    let tasks = chosen.len().div_ceil(CELLS_PER_TASK);
-    let threads = if configured_threads == 0 {
-        workers(0, tasks, SCAN_AUTO_THREADS)
-            .min((candidates * cache.dim / PAR_MIN_CELL_FLOATS).max(1))
-    } else {
-        workers(configured_threads, tasks, SCAN_AUTO_THREADS)
-    };
-    let mut top = TopK::new(k, threshold, cache.live());
-    if threads <= 1 {
-        scan_cells(rows, cells, chosen, true, q, code, &mut top);
-        return top;
-    }
-    let next = AtomicUsize::new(0);
-    let parts: Vec<TopK> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..threads)
-            .map(|_| {
-                scope.spawn(|| {
-                    let mut local = TopK::new(k, threshold, cache.live());
-                    loop {
-                        let t = next.fetch_add(1, Ordering::Relaxed);
-                        if t >= tasks {
-                            break;
-                        }
-                        let lo = t * CELLS_PER_TASK;
-                        let hi = (lo + CELLS_PER_TASK).min(chosen.len());
-                        // the pending rows ride with the first task only
-                        scan_cells(rows, cells, &chosen[lo..hi], t == 0, q, code, &mut local);
-                    }
-                    local
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("scan worker panicked"))
-            .collect()
-    });
-    for part in parts {
-        top.merge(part);
-    }
-    top
 }
 
 fn effective_nprobe(cfg: &AnnConfig, nlist: usize) -> usize {
     cfg.nprobe
         .unwrap_or_else(|| (round_half_even(0.05 * nlist as f64) as usize).max(1))
         .min(nlist)
-}
-
-/// The full scan: every live row, spread over threads for a big store.
-fn exact_hits(
-    cache: &ScanCache,
-    q: &QueryVec,
-    code: Option<u32>,
-    threshold: f32,
-    k: usize,
-    configured_threads: usize,
-) -> Vec<Hit> {
-    let (n, dim) = (cache.n, cache.dim);
-    let rows = cache.rows();
-    let block = (BLOCK_FLOATS / dim.max(1)).max(64);
-    let blocks = n.div_ceil(block);
-    let threads = if configured_threads == 0 {
-        workers(0, blocks, SCAN_AUTO_THREADS).min((n * dim / PAR_MIN_FLOATS).max(1))
-    } else {
-        workers(configured_threads, blocks, SCAN_AUTO_THREADS)
-    };
-    if threads <= 1 {
-        let mut top = TopK::new(k, threshold, cache.live());
-        scan_range(rows, q, code, 0, n, &mut top);
-        return top.into_sorted();
-    }
-    let next = AtomicUsize::new(0);
-    let parts: Vec<TopK> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..threads)
-            .map(|_| {
-                scope.spawn(|| {
-                    let mut top = TopK::new(k, threshold, cache.live());
-                    loop {
-                        let b = next.fetch_add(1, Ordering::Relaxed);
-                        if b >= blocks {
-                            break;
-                        }
-                        scan_range(rows, q, code, b * block, ((b + 1) * block).min(n), &mut top);
-                    }
-                    top
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("scan worker panicked"))
-            .collect()
-    });
-    let mut parts = parts.into_iter();
-    let mut merged = parts.next().expect("at least one worker");
-    for part in parts {
-        merged.merge(part);
-    }
-    merged.into_sorted()
 }
 
 // =============================================================================
@@ -1621,7 +1434,7 @@ impl EmbeddingStore {
             config.validate()?;
         }
         self.ann = config;
-        self.scan_state_mut().ivf = None;
+        *self.ivf_mut() = None;
         Ok(())
     }
 
@@ -1649,61 +1462,354 @@ impl EmbeddingStore {
         }
     }
 
-    /// Threads a full scan may use (0, the default, picks automatically from
-    /// the store's size; 1 never spawns). The answer does not depend on it.
+    /// The most threads one search, batch, fold or index build may use (0, the
+    /// default, picks automatically: a single scan up to 8, a batch or a build
+    /// the whole pool; 1 never touches the pool). The answer does not depend
+    /// on it.
     pub fn set_scan_threads(&mut self, threads: usize) {
         self.scan_threads = threads;
     }
 
-    /// The configured scan thread count (0 = automatic).
+    /// The configured thread cap (0 = automatic).
     pub fn scan_threads(&self) -> usize {
         self.scan_threads
     }
 
-    /// Lock the derived search state. A thread that panicked while holding it
-    /// may have left it half-patched, so a poisoned lock rebuilds from scratch.
-    fn scan_state(&self) -> MutexGuard<'_, ScanState> {
-        self.scan.lock().unwrap_or_else(|poisoned| {
-            let mut guard = poisoned.into_inner();
-            guard.reset();
-            self.scan.clear_poison();
-            guard
-        })
+    /// Use this pool instead of the process-wide one (`SearchPool::global`),
+    /// e.g. to give a store its own fixed number of workers. `None` goes back
+    /// to the shared pool.
+    pub fn set_search_pool(&mut self, pool: Option<Arc<SearchPool>>) {
+        self.pool = pool;
     }
 
-    pub(crate) fn scan_state_mut(&mut self) -> &mut ScanState {
-        if self.scan.is_poisoned() {
-            self.scan.clear_poison();
-            self.scan
-                .get_mut()
-                .unwrap_or_else(|e| e.into_inner())
-                .reset();
+    /// The pool this store runs parallel work on (the shared one by default).
+    pub fn search_pool(&self) -> Arc<SearchPool> {
+        self.pool.clone().unwrap_or_else(SearchPool::global)
+    }
+
+    fn par(&self) -> Par<'_> {
+        Par {
+            configured: self.scan_threads,
+            pool: &self.pool,
         }
-        self.scan.get_mut().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Build the cache on first use.
-    fn ensure_cache<'s>(&self, state: &'s mut ScanState) -> &'s mut ScanCache {
-        state
-            .cache
-            .get_or_insert_with(|| ScanCache::build(&self.embeddings, self.dimension.unwrap_or(0)))
+    pub(crate) fn ivf_mut(&mut self) -> &mut Option<Ivf> {
+        self.ivf.get_mut().unwrap_or_else(|e| e.into_inner())
     }
+
+    fn ivf_read(&self) -> RwLockReadGuard<'_, Option<Ivf>> {
+        self.ivf.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    // -- write-side upkeep of the index (the caller holds `&mut self`) --------
+
+    /// A row was written: it joins `pending`, and a full `pending` is folded
+    /// now, by the write that filled it.
+    pub(crate) fn index_row_written(&mut self, slot: u32) {
+        let (table, pool, configured) = (&self.table, &self.pool, self.scan_threads);
+        let guard = self.ivf.get_mut().unwrap_or_else(|e| e.into_inner());
+        if let Some(ivf) = guard.as_mut() {
+            ivf.note_put(slot);
+            if ivf.pending.len() >= FOLD_BATCH {
+                ivf.fold(table, Par { configured, pool });
+            }
+        }
+    }
+
+    /// A row was deleted (and the table compacted if it was a quarter dead).
+    pub(crate) fn index_row_removed(&mut self, slot: u32) {
+        if let Some(ivf) = self.ivf_mut().as_mut() {
+            ivf.note_drop(slot);
+        }
+        if self.table.should_compact() {
+            self.compact_now();
+        }
+        if let Some(cfg) = &self.ann {
+            if self.table.live() < cfg.min_size.max(2) {
+                *self.ivf_mut() = None;
+            }
+        }
+    }
+
+    /// Squeeze the tombstones out of the matrix now (it happens by itself once
+    /// a quarter of the rows are dead). Order-preserving, so results do not
+    /// change; a pause proportional to the store's size.
+    pub fn compact(&mut self) {
+        if self.table.dead() > 0 {
+            self.compact_now();
+        }
+    }
+
+    fn compact_now(&mut self) {
+        let live = self.table.compact();
+        if let Some(ivf) = self.ivf_mut().as_mut() {
+            ivf.compact(&live);
+        }
+    }
+
+    // -- the index, as the searches see it ------------------------------------
+
+    /// A read lock on a usable index, building or retraining first if the
+    /// policy says so; `None` means "answer exactly" (the store is under
+    /// `min_size`). Concurrent searches share the read lock; only a build
+    /// takes the write lock.
+    fn ready_index(&self, cfg: &AnnConfig) -> Option<RwLockReadGuard<'_, Option<Ivf>>> {
+        if self.table.live() < cfg.min_size.max(2) {
+            return None;
+        }
+        loop {
+            {
+                let guard = self.ivf_read();
+                if guard.as_ref().is_some_and(|i| !i.stale()) {
+                    return Some(guard);
+                }
+            }
+            let mut guard = self.ivf.write().unwrap_or_else(|e| e.into_inner());
+            if guard.as_ref().is_none_or(|i| i.stale()) {
+                let nlist = cfg.nlist.unwrap_or_else(|| auto_nlist(self.table.live()));
+                *guard = Some(Ivf::build(&self.table, nlist, cfg.seed, self.par()));
+                self.counts.builds.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Top `k` from the index, or `None` to fall back to the scan.
+    ///
+    /// `scale` 1 honours `nprobe` as configured (`nprobe >= nlist` is the
+    /// scan). Later widening steps multiply it by 4 and give up on the index
+    /// once they would touch half the cells, where scanning everything costs
+    /// about the same. `threads` is the cap for scanning one query's cells.
+    #[allow(clippy::too_many_arguments)]
+    fn approximate_topk(
+        &self,
+        cfg: &AnnConfig,
+        ivf: &Ivf,
+        q: &QueryVec,
+        code: Option<u32>,
+        threshold: f32,
+        k: usize,
+        par: Par,
+    ) -> Option<Vec<Hit>> {
+        if !q.has_direction() {
+            return None;
+        }
+        let mut scale = 1usize;
+        loop {
+            let top = self.probe(cfg, ivf, q, code, threshold, k, scale, par)?;
+            if top.len() >= k {
+                self.counts.approximate.fetch_add(1, Ordering::Relaxed);
+                if scale > 1 {
+                    self.counts.widened.fetch_add(1, Ordering::Relaxed);
+                }
+                return Some(top.into_sorted());
+            }
+            scale = scale.saturating_mul(4);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn probe(
+        &self,
+        cfg: &AnnConfig,
+        ivf: &Ivf,
+        q: &QueryVec,
+        code: Option<u32>,
+        threshold: f32,
+        k: usize,
+        scale: usize,
+        par: Par,
+    ) -> Option<TopK> {
+        let nprobe = effective_nprobe(cfg, ivf.nlist);
+        let lists = nprobe.saturating_mul(scale);
+        let exhausted = if scale == 1 {
+            lists >= ivf.nlist
+        } else {
+            lists.saturating_mul(2) >= ivf.nlist
+        };
+        if exhausted {
+            return None;
+        }
+        let chosen = ivf.choose_cells(q, lists);
+        let cells = Cells {
+            lists: &ivf.lists,
+            pending: &ivf.pending,
+        };
+        Some(scan_probed(
+            &self.table,
+            cells,
+            &chosen,
+            q,
+            code,
+            threshold,
+            k,
+            par,
+        ))
+    }
+
+    /// Every row the probed cells yield (for a caller that filters further),
+    /// best first; `None` to fall back to the scan.
+    fn approximate_ranked(
+        &self,
+        cfg: &AnnConfig,
+        q: &QueryVec,
+        code: Option<u32>,
+        threshold: f32,
+        scale: usize,
+    ) -> Option<Vec<Hit>> {
+        if !q.has_direction() {
+            return None;
+        }
+        let guard = self.ready_index(cfg)?;
+        let ivf = guard.as_ref()?;
+        let top = self.probe(cfg, ivf, q, code, threshold, usize::MAX, scale, self.par())?;
+        self.counts.approximate.fetch_add(1, Ordering::Relaxed);
+        if scale > 1 {
+            self.counts.widened.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(top.into_sorted())
+    }
+
+    // -- exact scans ----------------------------------------------------------
+
+    /// The full scan: every live row, spread over threads for a big store.
+    fn exact_hits(&self, q: &QueryVec, code: Option<u32>, threshold: f32, k: usize) -> Vec<Hit> {
+        let table = &self.table;
+        let (n, dim) = (table.slots(), table.dim);
+        let rows = table.rows();
+        let live = table.live();
+        let blocks = n.div_ceil(BLOCK_ROWS);
+        let par = self.par();
+        let threads = if par.configured == 0 {
+            par.workers(blocks, SCAN_AUTO_THREADS)
+                .min((n * dim / PAR_MIN_FLOATS).max(1))
+        } else {
+            par.workers(blocks, SCAN_AUTO_THREADS)
+        };
+        if threads <= 1 {
+            let mut top = TopK::new(k, threshold, live);
+            scan_range(rows, q, code, 0, n, &mut top);
+            return top.into_sorted();
+        }
+        let next = AtomicUsize::new(0);
+        let parts = Mutex::new(Vec::with_capacity(threads));
+        par.run(threads, &|_| {
+            let mut top = TopK::new(k, threshold, live);
+            loop {
+                let b = next.fetch_add(1, Ordering::Relaxed);
+                if b >= blocks {
+                    break;
+                }
+                scan_range(
+                    rows,
+                    q,
+                    code,
+                    b * BLOCK_ROWS,
+                    ((b + 1) * BLOCK_ROWS).min(n),
+                    &mut top,
+                );
+            }
+            parts.lock().unwrap_or_else(|e| e.into_inner()).push(top);
+        });
+        let mut parts = parts.into_inner().unwrap_or_else(|e| e.into_inner());
+        let mut merged = parts.pop().expect("at least one participant");
+        for part in parts {
+            merged.merge(part);
+        }
+        merged.into_sorted()
+    }
+
+    /// Many queries against the whole matrix at once: the work is cut into
+    /// (block of rows) x (tile of queries) tasks claimed from one counter, with
+    /// all tiles of a block adjacent so threads share the block in cache.
+    fn exact_batch_hits(
+        &self,
+        qs: &[QueryVec],
+        code: Option<u32>,
+        threshold: f32,
+        k: usize,
+    ) -> Vec<Vec<Hit>> {
+        let table = &self.table;
+        let n = table.slots();
+        let rows = table.rows();
+        let live = table.live();
+        let blocks = n.div_ceil(BLOCK_ROWS);
+        let tiles = qs.len().div_ceil(BATCH_TILE);
+        let total = blocks * tiles;
+        let par = self.par();
+        let threads = par.workers(total, usize::MAX);
+        let next = AtomicUsize::new(0);
+        let parts: Mutex<Vec<Vec<TopK>>> = Mutex::new(Vec::with_capacity(threads));
+        par.run(threads, &|_| {
+            let mut tops: Vec<TopK> = Vec::new();
+            let mut slots: Vec<u32> = Vec::with_capacity(BLOCK_ROWS);
+            loop {
+                let t = next.fetch_add(1, Ordering::Relaxed);
+                if t >= total {
+                    break;
+                }
+                if tops.is_empty() {
+                    tops = (0..qs.len())
+                        .map(|_| TopK::new(k, threshold, live))
+                        .collect();
+                }
+                let (block, tile) = (t / tiles, t % tiles);
+                let (lo, hi) = (block * BLOCK_ROWS, ((block + 1) * BLOCK_ROWS).min(n));
+                slots.clear();
+                match code {
+                    None => slots.extend(lo as u32..hi as u32),
+                    Some(c) => {
+                        slots.extend((lo..hi).filter(|&s| rows.codes[s] == c).map(|s| s as u32))
+                    }
+                }
+                let (q_lo, q_hi) = (tile * BATCH_TILE, ((tile + 1) * BATCH_TILE).min(qs.len()));
+                let tile_queries: Vec<&QueryVec> = qs[q_lo..q_hi].iter().collect();
+                batch_block(rows, &tile_queries, &slots, &mut tops[q_lo..q_hi]);
+            }
+            if !tops.is_empty() {
+                parts.lock().unwrap_or_else(|e| e.into_inner()).push(tops);
+            }
+        });
+        let mut parts = parts.into_inner().unwrap_or_else(|e| e.into_inner());
+        let Some(mut merged) = parts.pop() else {
+            return qs.iter().map(|_| Vec::new()).collect();
+        };
+        for part in parts {
+            for (m, p) in merged.iter_mut().zip(part) {
+                m.merge(p);
+            }
+        }
+        merged.into_iter().map(TopK::into_sorted).collect()
+    }
+
+    // -- results --------------------------------------------------------------
 
     fn resolve_hit(&self, hit: Hit) -> Option<SimilarityResult> {
-        let state = self.scan_state();
-        let key = state
-            .cache
-            .as_ref()?
-            .keys
-            .get(hit.slot as usize)?
-            .as_ref()?;
-        let record = self.embeddings.get(&**key)?;
+        let slot = hit.slot as usize;
+        let meta = self.table.meta(slot)?;
         Some(SimilarityResult {
-            node_id: record.node_id.clone(),
+            node_id: self.table.node_id(slot)?,
             score: hit.score,
-            text: record.text.clone(),
+            text: meta.text.to_string(),
         })
     }
+
+    fn materialise(&self, hits: &[Hit]) -> Vec<SimilarityResult> {
+        hits.iter()
+            .filter_map(|&hit| self.resolve_hit(hit))
+            .collect()
+    }
+
+    /// The type filter as a code: `Ok(None)` no filter, `Err(())` a type the
+    /// store has never held (nothing can match).
+    fn type_filter(&self, node_type: Option<&str>) -> Result<Option<u32>, ()> {
+        match node_type {
+            None => Ok(None),
+            Some(t) => self.table.type_code(t).map(Some).ok_or(()),
+        }
+    }
+
+    // -- public search surface ------------------------------------------------
 
     /// Best `k` matches for a vector, from the index when one is configured
     /// and `exact` is false, else from the full scan.
@@ -1719,52 +1825,357 @@ impl EmbeddingStore {
         if top_k == 0 {
             return Ok(Vec::new());
         }
-        let mut guard = self.scan_state();
-        let state = &mut *guard;
-        self.ensure_cache(state);
-        let cache = state.cache.as_ref().expect("cache was just built");
-        let live = cache.live();
-        let code = match node_type {
-            None => None,
-            Some(t) => match cache.code_of.get(t) {
-                Some(&code) => Some(code),
-                None => return Ok(Vec::new()),
-            },
+        let live = self.table.live();
+        let Ok(code) = self.type_filter(node_type) else {
+            return Ok(Vec::new());
         };
         if live == 0 {
             return Ok(Vec::new());
         }
         let q = QueryVec::new(query_vector);
+        let hits = self.hits_for(&q, code, threshold, top_k, exact);
+        Ok(self.materialise(&hits))
+    }
 
-        let mut hits = None;
+    fn hits_for(
+        &self,
+        q: &QueryVec,
+        code: Option<u32>,
+        threshold: f32,
+        top_k: usize,
+        exact: bool,
+    ) -> Vec<Hit> {
         if let Some(cfg) = &self.ann {
-            if exact || top_k >= live {
-                state.counts.exact += 1;
+            if exact || top_k >= self.table.live() {
+                self.counts.exact.fetch_add(1, Ordering::Relaxed);
             } else {
-                hits = state.approximate_topk(cfg, self.scan_threads, &q, code, threshold, top_k);
-                if hits.is_none() {
-                    state.counts.exact += 1;
+                let approx = self.ready_index(cfg).and_then(|guard| {
+                    let ivf = guard.as_ref()?;
+                    self.approximate_topk(cfg, ivf, q, code, threshold, top_k, self.par())
+                });
+                match approx {
+                    Some(hits) => return hits,
+                    None => {
+                        self.counts.exact.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         }
-        let cache = state.cache.as_ref().expect("cache was just built");
-        let hits = hits
-            .unwrap_or_else(|| exact_hits(cache, &q, code, threshold, top_k, self.scan_threads));
-        Ok(self.materialise(cache, &hits))
+        self.exact_hits(q, code, threshold, top_k)
     }
 
-    fn materialise(&self, cache: &ScanCache, hits: &[Hit]) -> Vec<SimilarityResult> {
-        hits.iter()
-            .filter_map(|hit| {
-                let key = cache.keys[hit.slot as usize].as_ref()?;
-                let record = self.embeddings.get(&**key)?;
-                Some(SimilarityResult {
-                    node_id: record.node_id.clone(),
-                    score: hit.score,
-                    text: record.text.clone(),
+    /// Search with many vector queries in one call, best `top_k` for each,
+    /// in query order. Each answer is **identical** (same ids, same bit-exact
+    /// scores, same order) to `similarity_search_vector` on that query alone;
+    /// the batch is only faster, because the work is spread over the thread
+    /// pool and, for the exact scan, queries share every pass over the matrix.
+    ///
+    /// With an approximate index configured, queries are answered from it
+    /// exactly as the single-query path would. The first bad query (wrong
+    /// dimension, empty) fails the whole call.
+    pub fn similarity_search_vector_batch<V: AsRef<[f32]> + Sync>(
+        &self,
+        queries: &[V],
+        top_k: usize,
+        node_type: Option<&str>,
+        threshold: f32,
+    ) -> Result<Vec<Vec<SimilarityResult>>, EmbeddingError> {
+        self.search_batch(queries, top_k, node_type, threshold, false)
+    }
+
+    /// Like [`similarity_search_vector_batch`](Self::similarity_search_vector_batch)
+    /// but always the full scan, even with an approximate index configured.
+    pub fn similarity_search_vector_exact_batch<V: AsRef<[f32]> + Sync>(
+        &self,
+        queries: &[V],
+        top_k: usize,
+        node_type: Option<&str>,
+        threshold: f32,
+    ) -> Result<Vec<Vec<SimilarityResult>>, EmbeddingError> {
+        self.search_batch(queries, top_k, node_type, threshold, true)
+    }
+
+    /// Search with many text queries in one call (encoded together with the
+    /// encoder's `encode_batch`), then as `similarity_search_vector_batch`.
+    pub fn similarity_search_batch(
+        &self,
+        queries: &[&str],
+        top_k: usize,
+        node_type: Option<&str>,
+        threshold: f32,
+    ) -> Result<Vec<Vec<SimilarityResult>>, EmbeddingError> {
+        let vectors = self.resolve_text_batch(queries)?;
+        self.search_batch(&vectors, top_k, node_type, threshold, false)
+    }
+
+    /// Text batch, always the full scan.
+    pub fn similarity_search_exact_batch(
+        &self,
+        queries: &[&str],
+        top_k: usize,
+        node_type: Option<&str>,
+        threshold: f32,
+    ) -> Result<Vec<Vec<SimilarityResult>>, EmbeddingError> {
+        let vectors = self.resolve_text_batch(queries)?;
+        self.search_batch(&vectors, top_k, node_type, threshold, true)
+    }
+
+    fn resolve_text_batch(&self, queries: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        if queries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let encoder = self.encoder.as_ref().ok_or(EmbeddingError::NoEncoder)?;
+        self.check_model_compat()?;
+        Ok(encoder.encode_batch(queries))
+    }
+
+    fn search_batch<V: AsRef<[f32]> + Sync>(
+        &self,
+        queries: &[V],
+        top_k: usize,
+        node_type: Option<&str>,
+        threshold: f32,
+        exact: bool,
+    ) -> Result<Vec<Vec<SimilarityResult>>, EmbeddingError> {
+        for q in queries {
+            self.check_query(q.as_ref())?;
+        }
+        let empty = || queries.iter().map(|_| Vec::new()).collect::<Vec<_>>();
+        if top_k == 0 || queries.is_empty() {
+            return Ok(empty());
+        }
+        let live = self.table.live();
+        let Ok(code) = self.type_filter(node_type) else {
+            return Ok(empty());
+        };
+        if live == 0 {
+            return Ok(empty());
+        }
+        if top_k >= live {
+            // "everything" answers hold every row: no shared heaps to bound
+            return queries
+                .iter()
+                .map(|q| self.search_vector(q.as_ref(), top_k, node_type, threshold, exact))
+                .collect();
+        }
+        let mut out: Vec<Vec<SimilarityResult>> = Vec::with_capacity(queries.len());
+        for chunk in queries.chunks(BATCH_CHUNK) {
+            let qs: Vec<QueryVec> = chunk.iter().map(|q| QueryVec::new(q.as_ref())).collect();
+            let hits = self.batch_hits(&qs, code, threshold, top_k, exact);
+            out.extend(hits.iter().map(|h| self.materialise(h)));
+        }
+        Ok(out)
+    }
+
+    fn batch_hits(
+        &self,
+        qs: &[QueryVec],
+        code: Option<u32>,
+        threshold: f32,
+        top_k: usize,
+        exact: bool,
+    ) -> Vec<Vec<Hit>> {
+        let mut answers: Vec<Option<Vec<Hit>>> = (0..qs.len()).map(|_| None).collect();
+        if let Some(cfg) = &self.ann {
+            if exact {
+                self.counts
+                    .exact
+                    .fetch_add(qs.len() as u64, Ordering::Relaxed);
+            } else if let Some(guard) = self.ready_index(cfg) {
+                if let Some(ivf) = guard.as_ref() {
+                    self.approximate_batch(cfg, ivf, qs, code, threshold, top_k, &mut answers);
+                }
+                let fallbacks = answers.iter().filter(|a| a.is_none()).count() as u64;
+                self.counts.exact.fetch_add(fallbacks, Ordering::Relaxed);
+            } else {
+                self.counts
+                    .exact
+                    .fetch_add(qs.len() as u64, Ordering::Relaxed);
+            }
+        }
+        // whatever the index did not answer goes through the batched scan
+        let todo: Vec<usize> = (0..qs.len()).filter(|&i| answers[i].is_none()).collect();
+        if !todo.is_empty() {
+            let rest: Vec<QueryVec> = todo
+                .iter()
+                .map(|&i| QueryVec {
+                    v: qs[i].v,
+                    norm: qs[i].norm,
                 })
-            })
-            .collect()
+                .collect();
+            let exact_hits = self.exact_batch_hits(&rest, code, threshold, top_k);
+            for (i, hits) in todo.into_iter().zip(exact_hits) {
+                answers[i] = Some(hits);
+            }
+        }
+        answers.into_iter().map(|a| a.unwrap_or_default()).collect()
+    }
+
+    /// Answer a batch from the index, **cell-major**: work out which cells each
+    /// query probes, invert that into "the queries that probe cell c", and score
+    /// each probed cell once against all of its queries (the same 4-query x
+    /// 2-row kernel the exact batch uses), instead of once per query. The rows
+    /// scored for a query are exactly the rows the single-query probe scores
+    /// (its cells plus the pending rows), so the answer is identical. A query
+    /// that comes up short (a selective filter) is re-run on the single-query
+    /// path, which widens.
+    #[allow(clippy::too_many_arguments)]
+    fn approximate_batch(
+        &self,
+        cfg: &AnnConfig,
+        ivf: &Ivf,
+        qs: &[QueryVec],
+        code: Option<u32>,
+        threshold: f32,
+        top_k: usize,
+        answers: &mut [Option<Vec<Hit>>],
+    ) {
+        let nprobe = effective_nprobe(cfg, ivf.nlist);
+        if nprobe >= ivf.nlist {
+            return; // probing everything is the exact scan
+        }
+        let rows = self.table.rows();
+        let live = self.table.live();
+        let par = self.par();
+
+        // 1. the cells each query probes
+        let mut chosen: Vec<Option<Vec<u32>>> = (0..qs.len()).map(|_| None).collect();
+        {
+            let next = AtomicUsize::new(0);
+            let done: Mutex<Vec<(usize, Vec<u32>)>> = Mutex::new(Vec::new());
+            par.run(par.workers(qs.len(), usize::MAX), &|_| {
+                let mut local = Vec::new();
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= qs.len() {
+                        break;
+                    }
+                    if qs[i].has_direction() {
+                        local.push((i, ivf.choose_cells(&qs[i], nprobe)));
+                    }
+                }
+                done.lock().unwrap_or_else(|e| e.into_inner()).extend(local);
+            });
+            for (i, cells) in done.into_inner().unwrap_or_else(|e| e.into_inner()) {
+                chosen[i] = Some(cells);
+            }
+        }
+
+        // 2. invert: the queries of each cell; the extra last entry is the
+        //    pending rows, which every query scores
+        let mut by_cell: Vec<Vec<u32>> = vec![Vec::new(); ivf.nlist + 1];
+        for (i, cells) in chosen.iter().enumerate() {
+            if let Some(cells) = cells {
+                for &c in cells {
+                    by_cell[c as usize].push(i as u32);
+                }
+                by_cell[ivf.nlist].push(i as u32);
+            }
+        }
+        let members_of = |c: usize| -> &[u32] {
+            if c == ivf.nlist {
+                &ivf.pending
+            } else {
+                &ivf.lists[c]
+            }
+        };
+        let tasks: Vec<usize> = (0..=ivf.nlist)
+            .filter(|&c| !by_cell[c].is_empty() && !members_of(c).is_empty())
+            .collect();
+
+        // 3. score every probed cell once against all of its queries
+        let next = AtomicUsize::new(0);
+        let parts: Mutex<Vec<Vec<TopK>>> = Mutex::new(Vec::new());
+        par.run(par.workers(tasks.len(), usize::MAX), &|_| {
+            let mut tops: Vec<TopK> = Vec::new();
+            let mut slots: Vec<u32> = Vec::new();
+            loop {
+                let t = next.fetch_add(1, Ordering::Relaxed);
+                if t >= tasks.len() {
+                    break;
+                }
+                if tops.is_empty() {
+                    tops = (0..qs.len())
+                        .map(|_| TopK::new(top_k, threshold, live))
+                        .collect();
+                }
+                let c = tasks[t];
+                slots.clear();
+                slots.extend(
+                    members_of(c)
+                        .iter()
+                        .copied()
+                        .filter(|&s| code.is_none_or(|code| rows.codes[s as usize] == code)),
+                );
+                for group in by_cell[c].chunks(4) {
+                    let refs: Vec<&QueryVec> = group.iter().map(|&i| &qs[i as usize]).collect();
+                    let mut taken: Vec<TopK> = group
+                        .iter()
+                        .map(|&i| std::mem::replace(&mut tops[i as usize], TopK::new(0, 0.0, 0)))
+                        .collect();
+                    batch_block(rows, &refs, &slots, &mut taken);
+                    for (&i, top) in group.iter().zip(taken) {
+                        tops[i as usize] = top;
+                    }
+                }
+            }
+            if !tops.is_empty() {
+                parts.lock().unwrap_or_else(|e| e.into_inner()).push(tops);
+            }
+        });
+        let mut parts = parts.into_inner().unwrap_or_else(|e| e.into_inner());
+        let mut merged: Vec<TopK> = match parts.pop() {
+            Some(first) => first,
+            None => (0..qs.len())
+                .map(|_| TopK::new(top_k, threshold, live))
+                .collect(),
+        };
+        for part in parts {
+            for (a, b) in merged.iter_mut().zip(part) {
+                a.merge(b);
+            }
+        }
+
+        // 4. answers; the short ones go back through the single-query path
+        let mut short = Vec::new();
+        for (i, top) in merged.into_iter().enumerate() {
+            if chosen[i].is_none() {
+                continue;
+            }
+            if top.len() >= top_k {
+                self.counts.approximate.fetch_add(1, Ordering::Relaxed);
+                answers[i] = Some(top.into_sorted());
+            } else {
+                short.push(i);
+            }
+        }
+        let one_thread = Par {
+            configured: 1,
+            pool: &self.pool,
+        };
+        let next = AtomicUsize::new(0);
+        let redone: Mutex<Vec<(usize, Option<Vec<Hit>>)>> = Mutex::new(Vec::new());
+        par.run(par.workers(short.len(), usize::MAX), &|_| {
+            let mut local = Vec::new();
+            loop {
+                let j = next.fetch_add(1, Ordering::Relaxed);
+                if j >= short.len() {
+                    break;
+                }
+                let i = short[j];
+                local.push((
+                    i,
+                    self.approximate_topk(cfg, ivf, &qs[i], code, threshold, top_k, one_thread),
+                ));
+            }
+            redone
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(local);
+        });
+        for (i, hits) in redone.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            answers[i] = hits;
+        }
     }
 
     /// Every match above `threshold`, best first, as a lazy iterator. With
@@ -1785,34 +2196,22 @@ impl EmbeddingStore {
             store: self,
             hits: Vec::new().into_iter(),
         };
-        let mut guard = self.scan_state();
-        let state = &mut *guard;
-        self.ensure_cache(state);
-        let cache = state.cache.as_ref().expect("cache was just built");
-        let code = match node_type {
-            None => None,
-            Some(t) => match cache.code_of.get(t) {
-                Some(&code) => Some(code),
-                None => return Ok((empty(), false)),
-            },
+        let Ok(code) = self.type_filter(node_type) else {
+            return Ok((empty(), false));
         };
-        if cache.live() == 0 {
+        if self.table.live() == 0 {
             return Ok((empty(), false));
         }
         let q = QueryVec::new(query_vector);
         let mut approximate = None;
         if let (Some(cfg), Some(scale)) = (&self.ann, scale) {
-            approximate =
-                state.approximate_ranked(cfg, self.scan_threads, &q, code, threshold, scale);
+            approximate = self.approximate_ranked(cfg, &q, code, threshold, scale);
             if approximate.is_none() {
-                state.counts.exact += 1;
+                self.counts.exact.fetch_add(1, Ordering::Relaxed);
             }
         }
         let was_approximate = approximate.is_some();
-        let cache = state.cache.as_ref().expect("cache was just built");
-        let hits = approximate.unwrap_or_else(|| {
-            exact_hits(cache, &q, code, threshold, usize::MAX, self.scan_threads)
-        });
+        let hits = approximate.unwrap_or_else(|| self.exact_hits(&q, code, threshold, usize::MAX));
         Ok((
             RankedHits {
                 store: self,
@@ -1822,26 +2221,20 @@ impl EmbeddingStore {
         ))
     }
 
-    /// Cosine score of every stored vector, keyed by `type:id`, from the scan
-    /// cache.
+    /// Cosine score of every stored vector, keyed by `type:id`.
     pub(crate) fn scan_scores(
         &self,
         query_vector: &[f32],
     ) -> Result<HashMap<String, f32>, EmbeddingError> {
         self.check_query(query_vector)?;
-        let mut guard = self.scan_state();
-        let state = &mut *guard;
-        self.ensure_cache(state);
-        let cache = state.cache.as_ref().expect("cache was just built");
         let q = QueryVec::new(query_vector);
-        let mut scores = HashMap::with_capacity(cache.live());
-        for slot in 0..cache.n {
-            if let Some(key) = &cache.keys[slot] {
-                let norm = cache.norms[slot];
-                let denom = norm * q.norm;
-                let dot = dot_f32(q.v, cache.row(slot));
-                let score = if denom == 0.0 { 0.0 } else { dot / denom };
-                scores.insert(key.to_string(), score);
+        let table = &self.table;
+        let mut scored = Vec::with_capacity(table.live());
+        score_all(table.rows(), &q, table.slots(), &mut scored);
+        let mut scores = HashMap::with_capacity(scored.len());
+        for (slot, score) in scored {
+            if let Some(meta) = table.meta(slot as usize) {
+                scores.insert(meta.key.to_string(), score);
             }
         }
         Ok(scores)
@@ -1875,7 +2268,8 @@ impl EmbeddingStore {
     ///
     /// Returns [`ann_stats`](Self::ann_stats). `force` retrains even if an
     /// index exists. Does nothing (and says so in the stats) while the store
-    /// is smaller than `min_size`.
+    /// is smaller than `min_size`. Call this off the hot path after loading a
+    /// big store: the first search that needs the index otherwise pays for it.
     ///
     /// # Errors
     ///
@@ -1886,20 +2280,13 @@ impl EmbeddingStore {
                 "this store has no approximate index; call set_ann first".to_string(),
             ));
         };
-        {
-            let mut guard = self.scan_state();
-            let state = &mut *guard;
-            self.ensure_cache(state);
-            if force {
-                state.ivf = None;
-            }
-            if state.index_ready(cfg, self.scan_threads) {
-                let cache = state.cache.as_ref().expect("cache was just built");
-                if let Some(ivf) = state.ivf.as_mut() {
-                    if !ivf.pending.is_empty() {
-                        ivf.fold(cache, self.scan_threads);
-                    }
-                }
+        if force {
+            *self.ivf.write().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+        if self.ready_index(cfg).is_some() {
+            let mut guard = self.ivf.write().unwrap_or_else(|e| e.into_inner());
+            if let Some(ivf) = guard.as_mut() {
+                ivf.fold(&self.table, self.par());
             }
         }
         Ok(self.ann_stats())
@@ -1907,8 +2294,8 @@ impl EmbeddingStore {
 
     /// What the approximate index looks like right now. Never builds anything.
     pub fn ann_stats(&self) -> AnnStats {
-        let guard = self.scan_state();
-        let ivf = guard.ivf.as_ref();
+        let guard = self.ivf_read();
+        let ivf = guard.as_ref();
         AnnStats {
             enabled: self.ann.is_some(),
             active: ivf.is_some(),
@@ -1924,7 +2311,57 @@ impl EmbeddingStore {
             build_seconds: ivf.map(|i| i.build_seconds),
             index_bytes: ivf.map_or(0, Ivf::nbytes),
             min_size: self.ann.as_ref().map(|c| c.min_size),
-            searches: guard.counts,
+            searches: self.counts.snapshot(),
+            folds: ivf.map_or(0, |i| i.folds),
+            fold_seconds: ivf.map_or(0.0, |i| i.fold_seconds),
+        }
+    }
+
+    /// Check every internal invariant (matrix shape, key index, per-model
+    /// counts, the approximate index against the matrix) and describe the first
+    /// one that fails. For tests and debugging; it walks the whole store.
+    pub fn verify_invariants(&self) -> Result<(), String> {
+        self.table.check()?;
+        let by_model: usize = self.model_counts.values().sum();
+        if by_model != self.table.live() {
+            return Err(format!(
+                "model counts add up to {by_model}, {} live rows",
+                self.table.live()
+            ));
+        }
+        let mut seen: HashMap<&str, usize> = HashMap::new();
+        for slot in self.table.live_slots() {
+            if let Some(meta) = self.table.meta(slot) {
+                *seen.entry(&meta.model).or_default() += 1;
+            }
+        }
+        for (model, count) in &self.model_counts {
+            if seen.get(model.as_str()) != Some(count) {
+                return Err(format!(
+                    "model {model:?} counted {count}, rows say {:?}",
+                    seen.get(model.as_str())
+                ));
+            }
+        }
+        if let Some(ivf) = self.ivf_read().as_ref() {
+            ivf.check(&self.table, FOLD_BATCH)?;
+        }
+        Ok(())
+    }
+
+    /// Where the store's memory goes. The vectors are held once; compare
+    /// `matrix_bytes` with `live_vector_bytes`.
+    pub fn memory_stats(&self) -> MemoryStats {
+        let t = self.table.bytes();
+        MemoryStats {
+            rows: self.table.slots(),
+            live: self.table.live(),
+            dead: self.table.dead(),
+            chunks: self.table.chunk_count(),
+            matrix_bytes: t.matrix,
+            live_vector_bytes: self.table.live() * self.table.dim * 4,
+            metadata_bytes: t.per_row + t.keys_and_text + t.key_index,
+            index_bytes: self.ivf_read().as_ref().map_or(0, Ivf::nbytes),
         }
     }
 
@@ -2009,6 +2446,70 @@ impl EmbeddingStore {
     }
 }
 
+/// Score the probed cells (and the pending rows). The rows of a cell are
+/// scattered through the matrix, so one thread is limited by how many cache
+/// lines it can have in flight, not by bandwidth: a large probe is shared out
+/// a few cells at a time. The answer does not depend on the thread count.
+#[allow(clippy::too_many_arguments)]
+fn scan_probed(
+    table: &VectorTable,
+    cells: Cells,
+    chosen: &[u32],
+    q: &QueryVec,
+    code: Option<u32>,
+    threshold: f32,
+    k: usize,
+    par: Par,
+) -> TopK {
+    const CELLS_PER_TASK: usize = 4;
+    let rows = table.rows();
+    let live = table.live();
+    let candidates: usize = chosen
+        .iter()
+        .map(|&c| cells.lists[c as usize].len())
+        .sum::<usize>()
+        + cells.pending.len();
+    let tasks = chosen.len().div_ceil(CELLS_PER_TASK);
+    let threads = if par.configured == 0 {
+        par.workers(tasks, SCAN_AUTO_THREADS)
+            .min((candidates * table.dim / PAR_MIN_CELL_FLOATS).max(1))
+    } else {
+        par.workers(tasks, SCAN_AUTO_THREADS)
+    };
+    let mut top = TopK::new(k, threshold, live);
+    if threads <= 1 {
+        scan_cells(rows, cells, chosen, true, q, code, &mut top);
+        return top;
+    }
+    let next = AtomicUsize::new(0);
+    let parts = Mutex::new(Vec::with_capacity(threads));
+    par.run(threads, &|_| {
+        let mut local = TopK::new(k, threshold, live);
+        loop {
+            let t = next.fetch_add(1, Ordering::Relaxed);
+            if t >= tasks {
+                break;
+            }
+            let lo = t * CELLS_PER_TASK;
+            let hi = (lo + CELLS_PER_TASK).min(chosen.len());
+            // the pending rows ride with the first task only
+            scan_cells(rows, cells, &chosen[lo..hi], t == 0, q, code, &mut local);
+        }
+        parts.lock().unwrap_or_else(|e| e.into_inner()).push(local);
+    });
+    for part in parts.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        top.merge(part);
+    }
+    top
+}
+
+/// Counters, the pool and the lazily built index: the search-side state an
+/// [`EmbeddingStore`] carries besides its table.
+pub(crate) type IvfSlot = RwLock<Option<Ivf>>;
+
+#[allow(dead_code, clippy::manual_is_multiple_of)]
+const _: () = assert!(CHUNK_ROWS % BLOCK_ROWS == 0 && CHUNK_ROWS % NEAR_BLOCK == 0);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2039,6 +2540,47 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn every_kernel_shape_gives_bit_identical_dot_products() {
+        // The promise behind "a batch equals the single queries exactly": a
+        // (query, row) pair is summed in the same order whatever block shape
+        // computes it.
+        fn check<const F: bool>(dim: usize) {
+            let q: Vec<Vec<f32>> = (0..4).map(|i| pseudo(dim, 10 + i)).collect();
+            let r: Vec<Vec<f32>> = (0..4).map(|i| pseudo(dim, 20 + i)).collect();
+            let one = |a: usize, j: usize| block::<1, 1, F>([&q[a]], [&r[j]])[0][0];
+            let b42 = block::<4, 2, F>([&q[0], &q[1], &q[2], &q[3]], [&r[0], &r[1]]);
+            let b14 = block::<1, 4, F>([&q[2]], [&r[0], &r[1], &r[2], &r[3]]);
+            let b24 = block::<2, 4, F>([&q[1], &q[3]], [&r[0], &r[1], &r[2], &r[3]]);
+            let b41 = block::<4, 1, F>([&q[0], &q[1], &q[2], &q[3]], [&r[3]]);
+            for a in 0..4 {
+                for j in 0..2 {
+                    assert_eq!(b42[a][j].to_bits(), one(a, j).to_bits(), "4x2 dim {dim}");
+                }
+                assert_eq!(b41[a][0].to_bits(), one(a, 3).to_bits(), "4x1 dim {dim}");
+            }
+            for j in 0..4 {
+                assert_eq!(b14[0][j].to_bits(), one(2, j).to_bits(), "1x4 dim {dim}");
+                assert_eq!(b24[0][j].to_bits(), one(1, j).to_bits(), "2x4 dim {dim}");
+                assert_eq!(b24[1][j].to_bits(), one(3, j).to_bits(), "2x4 dim {dim}");
+            }
+        }
+        for dim in [1usize, 5, 8, 9, 32, 100, 384] {
+            check::<false>(dim);
+            // the fused-multiply-add instantiation is only valid where the CPU
+            // has it; the dispatching wrapper checks
+            let wrapper_ok = {
+                let a = pseudo(dim, 1);
+                let b = pseudo(dim, 2);
+                let fused = dot_f32(&a, &b);
+                let plain = dot_impl::<false>(&a, &b);
+                (fused - plain).abs() < 1e-4
+            };
+            assert!(wrapper_ok);
+        }
+    }
+
+    #[test]
     fn the_assignment_kernel_matches_a_plain_argmax() {
         for (dim, nlist, m) in [
             (5usize, 1usize, 3usize),
@@ -2050,8 +2592,32 @@ mod tests {
             let cents = pseudo(nlist * dim, 4);
             let mut got = vec![0i32; m];
             nearest_block(&pts, dim, &cents, nlist, &mut got);
+            // the answer for a point does not depend on its neighbours
+            let mut alone = vec![0i32; m];
+            for p in 0..m {
+                nearest_block(
+                    &pts[p * dim..(p + 1) * dim],
+                    dim,
+                    &cents,
+                    nlist,
+                    &mut alone[p..p + 1],
+                );
+            }
+            assert_eq!(got, alone);
+            let pool = None;
+            let par = Par {
+                configured: 1,
+                pool: &pool,
+            };
             let mut serial = vec![0i32; m];
-            nearest_parallel(&pts, dim, &cents, nlist, &mut serial, 1);
+            nearest_parallel(
+                &|lo, len| &pts[lo * dim..(lo + len) * dim],
+                dim,
+                &cents,
+                nlist,
+                &mut serial,
+                par,
+            );
             assert_eq!(got, serial);
             for p in 0..m {
                 let x = &pts[p * dim..(p + 1) * dim];

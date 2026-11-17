@@ -48,26 +48,41 @@ extern "system" {
 /// loop, then release it. Unpinned single-thread loops varied up to 3x between processes on this hybrid CPU.
 fn pinned<T>(f: impl FnOnce() -> T) -> T {
     #[cfg(windows)]
-    unsafe {
-        let cpu: usize = std::env::var("BENCH_PIN_CPU").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
-        SetPriorityClass(GetCurrentProcess(), 0x80); // HIGH_PRIORITY_CLASS
-        SetProcessAffinityMask(GetCurrentProcess(), 1usize << cpu);
+    {
+        let cpu: usize = std::env::var("BENCH_PIN_CPU")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8);
+        let all = usize::MAX
+            >> (usize::BITS as usize
+                - std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(32));
+        // SAFETY: plain kernel32 calls on the current process.
+        unsafe {
+            SetPriorityClass(GetCurrentProcess(), 0x80); // HIGH_PRIORITY_CLASS
+            SetProcessAffinityMask(GetCurrentProcess(), 1usize << cpu);
+        }
         let r = f();
-        SetProcessAffinityMask(GetCurrentProcess(), usize::MAX >> (usize::BITS as usize - std::thread::available_parallelism().map(|n| n.get()).unwrap_or(32)));
-        return r;
+        unsafe { SetProcessAffinityMask(GetCurrentProcess(), all) };
+        r
     }
-    #[allow(unreachable_code)]
+    #[cfg(not(windows))]
     f()
 }
 fn mem() -> Value {
     #[cfg(windows)]
-    unsafe {
-        let mut p: Pmc = std::mem::zeroed();
-        p.cb = std::mem::size_of::<Pmc>() as u32;
-        K32GetProcessMemoryInfo(GetCurrentProcess(), &mut p, p.cb);
-        return json!({"rss_mb": p.working_set_size as f64 / 1048576.0, "peak_mb": p.peak_working_set_size as f64 / 1048576.0});
+    {
+        // SAFETY: Pmc matches PROCESS_MEMORY_COUNTERS and `cb` is its size.
+        let p = unsafe {
+            let mut p: Pmc = std::mem::zeroed();
+            p.cb = std::mem::size_of::<Pmc>() as u32;
+            K32GetProcessMemoryInfo(GetCurrentProcess(), &mut p, p.cb);
+            p
+        };
+        json!({"rss_mb": p.working_set_size as f64 / 1048576.0, "peak_mb": p.peak_working_set_size as f64 / 1048576.0})
     }
-    #[allow(unreachable_code)]
+    #[cfg(not(windows))]
     json!({"rss_mb": 0.0, "peak_mb": 0.0})
 }
 
@@ -83,17 +98,26 @@ fn read_f32(path: &str, start: usize, count: usize, d: usize) -> Vec<f32> {
 }
 fn read_i32(path: &str) -> Vec<i32> {
     let mut b = Vec::new();
-    File::open(path).unwrap_or_else(|e| panic!("{path}: {e}")).read_to_end(&mut b).unwrap();
-    b.chunks_exact(4).map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
+    File::open(path)
+        .unwrap_or_else(|e| panic!("{path}: {e}"))
+        .read_to_end(&mut b)
+        .unwrap();
+    b.chunks_exact(4)
+        .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect()
 }
 fn read_u8(path: &str) -> Vec<u8> {
     let mut b = Vec::new();
-    File::open(path).unwrap_or_else(|e| panic!("{path}: {e}")).read_to_end(&mut b).unwrap();
+    File::open(path)
+        .unwrap_or_else(|e| panic!("{path}: {e}"))
+        .read_to_end(&mut b)
+        .unwrap();
     b
 }
 
 struct Ctx {
     dir: String,
+    #[allow(dead_code)]
     ds: String,
     d: usize,
     n: usize,
@@ -137,12 +161,18 @@ fn recall(found: &[Vec<usize>], truth: &[Vec<i32>], k: usize) -> f64 {
     let mut hit = 0usize;
     for (f, t) in found.iter().zip(truth) {
         let want: HashSet<i32> = t.iter().take(k).cloned().collect();
-        hit += f.iter().take(k).filter(|x| want.contains(&(**x as i32))).count();
+        hit += f
+            .iter()
+            .take(k)
+            .filter(|x| want.contains(&(**x as i32)))
+            .count();
     }
     hit as f64 / (k * found.len().max(1)) as f64
 }
 fn ids(r: &[SimilarityResult]) -> Vec<usize> {
-    r.iter().map(|x| x.node_id.id.parse::<usize>().unwrap()).collect()
+    r.iter()
+        .map(|x| x.node_id.id.parse::<usize>().unwrap())
+        .collect()
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -150,13 +180,25 @@ enum Path {
     Exact,
     Ann,
 }
-fn search(s: &EmbeddingStore, q: &[f32], k: usize, p: Path, ty: Option<&str>) -> Vec<SimilarityResult> {
+fn search(
+    s: &EmbeddingStore,
+    q: &[f32],
+    k: usize,
+    p: Path,
+    ty: Option<&str>,
+) -> Vec<SimilarityResult> {
     match p {
         Path::Exact => s.similarity_search_vector_exact(q, k, ty, 0.0).unwrap(),
         Path::Ann => s.similarity_search_vector(q, k, ty, 0.0).unwrap(),
     }
 }
-fn run_loop(s: &EmbeddingStore, qs: &[Vec<f32>], k: usize, p: Path, ty: Option<&str>) -> (Vec<f64>, Vec<Vec<usize>>) {
+fn run_loop(
+    s: &EmbeddingStore,
+    qs: &[Vec<f32>],
+    k: usize,
+    p: Path,
+    ty: Option<&str>,
+) -> (Vec<f64>, Vec<Vec<usize>>) {
     let mut lat = Vec::with_capacity(qs.len());
     let mut out = Vec::with_capacity(qs.len());
     for q in qs {
@@ -168,8 +210,38 @@ fn run_loop(s: &EmbeddingStore, qs: &[Vec<f32>], k: usize, p: Path, ty: Option<&
     (lat, out)
 }
 
+/// The batched call over all the pool's threads: warm up once, then 3 timed runs of the whole query set.
+fn batch_point(s: &EmbeddingStore, c: &Ctx, truth: &[Vec<i32>], p: Path) -> Value {
+    let run = || {
+        let t = Instant::now();
+        let r = match p {
+            Path::Exact => s.similarity_search_vector_exact_batch(&c.queries, c.k, None, 0.0),
+            Path::Ann => s.similarity_search_vector_batch(&c.queries, c.k, None, 0.0),
+        }
+        .unwrap();
+        (c.queries.len() as f64 / t.elapsed().as_secs_f64(), r)
+    };
+    let _ = run();
+    let mut qps = Vec::new();
+    let mut found = Vec::new();
+    for _ in 0..3 {
+        let (q, r) = run();
+        qps.push(q);
+        found = r;
+    }
+    let found: Vec<Vec<usize>> = found.iter().map(|r| ids(r)).collect();
+    json!({"nq": c.queries.len(), "threads": s.search_pool().threads(), "qps": median(&qps), "qps_runs": qps, "recall": recall(&found, &truth[..found.len()], c.k)})
+}
+
 /// Warm up, size the query count to `budget` seconds, then 3 timed runs.
-fn point(s: &EmbeddingStore, c: &Ctx, truth: &[Vec<i32>], p: Path, ty: Option<&str>, budget: f64) -> Value {
+fn point(
+    s: &EmbeddingStore,
+    c: &Ctx,
+    truth: &[Vec<i32>],
+    p: Path,
+    ty: Option<&str>,
+    budget: f64,
+) -> Value {
     let k = c.k;
     let nqall = c.queries.len();
     let w0 = Instant::now();
@@ -213,7 +285,10 @@ fn nlist_for(n: usize) -> usize {
 }
 fn knobs(n: usize) -> Vec<usize> {
     let nl = nlist_for(n);
-    let mut v: Vec<usize> = [1, 2, 4, 8, 16, 32, 64, 128, 256].into_iter().filter(|x| *x < nl).collect();
+    let mut v: Vec<usize> = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+        .into_iter()
+        .filter(|x| *x < nl)
+        .collect();
     if n <= 200_000 {
         v.push(nl); // nprobe == nlist is the exact scan; measured separately at scale
     }
@@ -243,7 +318,10 @@ fn ingest(s: &mut EmbeddingStore, c: &Ctx, n: usize, grp: Option<&[u8]>) -> f64 
 }
 
 fn arg(args: &[String], name: &str, default: &str) -> String {
-    args.iter().position(|a| a == name).map(|i| args[i + 1].clone()).unwrap_or(default.to_string())
+    args.iter()
+        .position(|a| a == name)
+        .map(|i| args[i + 1].clone())
+        .unwrap_or(default.to_string())
 }
 
 fn main() {
@@ -253,10 +331,15 @@ fn main() {
     let n: usize = arg(&args, "--n", "100000").parse().unwrap();
     let nq: usize = arg(&args, "--queries", "1000").parse().unwrap();
     let budget: f64 = arg(&args, "--budget", "15").parse().unwrap();
-    let exps: Vec<String> = arg(&args, "--exp", "core").split(',').map(|s| s.to_string()).collect();
+    let exps: Vec<String> = arg(&args, "--exp", "core")
+        .split(',')
+        .map(|s| s.to_string())
+        .collect();
     let out_path = arg(&args, "--out", "");
     let label = arg(&args, "--label", "rust");
-    let meta: Value = serde_json::from_str(&std::fs::read_to_string(format!("{dir}/meta.json")).unwrap()).unwrap();
+    let meta: Value =
+        serde_json::from_str(&std::fs::read_to_string(format!("{dir}/meta.json")).unwrap())
+            .unwrap();
     let d = meta["d"].as_u64().unwrap() as usize;
     let qall = read_f32(&format!("{dir}/queries.f32"), 0, nq, d);
     let c = Ctx {
@@ -267,12 +350,20 @@ fn main() {
         k: 10,
         queries: qall.chunks(d).map(|x| x.to_vec()).collect(),
     };
-    let cpus = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(1);
+    let cpus = std::thread::available_parallelism()
+        .map(|x| x.get())
+        .unwrap_or(1);
     let mut runs: Vec<Value> = Vec::new();
-    println!("{label}: ds={ds} n={n} d={d} queries={nq} cpus={cpus} release={}", !cfg!(debug_assertions));
+    println!(
+        "{label}: ds={ds} n={n} d={d} queries={nq} cpus={cpus} release={}",
+        !cfg!(debug_assertions)
+    );
     let mem_base = mem();
 
-    if exps.iter().any(|e| e == "core" || e == "mutation" || e == "saveload") {
+    if exps
+        .iter()
+        .any(|e| e == "core" || e == "mutation" || e == "saveload")
+    {
         let mut store = EmbeddingStore::new(None);
         let ingest_s = ingest(&mut store, &c, n, None);
         let mem_after_ingest = mem();
@@ -281,7 +372,9 @@ fn main() {
         // ---- exact ----
         store.set_scan_threads(1);
         let t = Instant::now();
-        store.similarity_search_vector_exact(&c.queries[0], c.k, None, 0.0).unwrap();
+        store
+            .similarity_search_vector_exact(&c.queries[0], c.k, None, 0.0)
+            .unwrap();
         let first_ms = t.elapsed().as_secs_f64() * 1000.0;
         let mem_after_first = mem();
         let mut exact = json!({
@@ -292,13 +385,27 @@ fn main() {
         });
         let mut p1 = pinned(|| point(&store, &c, &truth, Path::Exact, None, budget));
         p1["knob"] = Value::Null;
-        println!("  exact 1T recall={} qps={:.1} median={:.3}ms", p1["recall"], p1["qps_1t"].as_f64().unwrap(), p1["median_ms"].as_f64().unwrap());
+        println!(
+            "  exact 1T recall={} qps={:.1} median={:.3}ms",
+            p1["recall"],
+            p1["qps_1t"].as_f64().unwrap(),
+            p1["median_ms"].as_f64().unwrap()
+        );
         exact["sweep"] = json!([p1]);
         store.set_scan_threads(0);
         let pa = point(&store, &c, &truth, Path::Exact, None, budget);
-        println!("  exact auto-threads qps={:.1} median={:.3}ms", pa["qps_1t"].as_f64().unwrap(), pa["median_ms"].as_f64().unwrap());
+        println!(
+            "  exact auto-threads qps={:.1} median={:.3}ms",
+            pa["qps_1t"].as_f64().unwrap(),
+            pa["median_ms"].as_f64().unwrap()
+        );
         exact["loop_allthreads"] = json!({"nq": pa["nq"], "threads": "auto", "qps": pa["qps_1t"], "median_ms": pa["median_ms"], "p95_ms": pa["p95_ms"], "p99_ms": pa["p99_ms"], "mean_ms": pa["mean_ms"], "qps_runs": pa["qps_1t_runs"]});
-        // concurrent clients (the store serialises searches on one lock): measured, not assumed
+        exact["batch_allthreads"] = batch_point(&store, &c, &truth, Path::Exact);
+        println!(
+            "  exact batch qps={:.1}",
+            exact["batch_allthreads"]["qps"].as_f64().unwrap()
+        );
+        // concurrent clients, each running single-threaded scans against the same store: measured, not assumed
         store.set_scan_threads(1);
         let conc = 8usize.min(cpus);
         let qs = &c.queries[..c.queries.len().min(400)];
@@ -315,13 +422,21 @@ fn main() {
         });
         let conc_qps = qs.len() as f64 / t.elapsed().as_secs_f64();
         exact["concurrent_clients"] = json!({"clients": conc, "scan_threads": 1, "qps": conc_qps});
-        println!("  exact {conc} concurrent clients (scan threads 1): {:.1} qps", conc_qps);
+        println!(
+            "  exact {conc} concurrent clients (scan threads 1): {:.1} qps",
+            conc_qps
+        );
         exact["mem_after_sweep"] = mem();
         runs.push(exact);
 
         // ---- ivf ----
         store.set_scan_threads(0);
-        store.set_ann(Some(AnnConfig { min_size: 0, ..AnnConfig::default() })).unwrap();
+        store
+            .set_ann(Some(AnnConfig {
+                min_size: 0,
+                ..AnnConfig::default()
+            }))
+            .unwrap();
         let t = Instant::now();
         let stats = store.build_ann_index(false).unwrap();
         let idx_s = t.elapsed().as_secs_f64();
@@ -346,8 +461,17 @@ fn main() {
             store.set_scan_threads(0);
             let pa = point(&store, &c, &truth, Path::Ann, None, budget.min(5.0));
             p["knob"] = json!(kn);
-            p["allthreads"] = json!({"qps": pa["qps_1t"], "median_ms": pa["median_ms"], "recall": pa["recall"]});
-            println!("  ivf nprobe={kn} recall={:.4} qps1t={:.0} median={:.3}ms allthreads_qps={:.0}", p["recall"].as_f64().unwrap(), p["qps_1t"].as_f64().unwrap(), p["median_ms"].as_f64().unwrap(), pa["qps_1t"].as_f64().unwrap());
+            p["batch_allthreads"] = batch_point(&store, &c, &truth, Path::Ann);
+            p["allthreads"] =
+                json!({"qps": pa["qps_1t"], "median_ms": pa["median_ms"], "recall": pa["recall"]});
+            println!(
+                "  ivf nprobe={kn} recall={:.4} qps1t={:.0} median={:.3}ms allthreads_qps={:.0} batch_qps={:.0}",
+                p["recall"].as_f64().unwrap(),
+                p["qps_1t"].as_f64().unwrap(),
+                p["median_ms"].as_f64().unwrap(),
+                pa["qps_1t"].as_f64().unwrap(),
+                p["batch_allthreads"]["qps"].as_f64().unwrap()
+            );
             if ref_knob.is_none() && p["recall"].as_f64().unwrap() >= 0.95 {
                 ref_knob = Some(kn);
                 ref_recall = p["recall"].clone();
@@ -368,21 +492,29 @@ fn main() {
             if std::path::Path::new(&gtm).exists() {
                 let upd: Vec<i32> = read_i32(&format!("{dir}/mut_{n}_upd.i32"));
                 let del: Vec<i32> = read_i32(&format!("{dir}/mut_{n}_del.i32"));
-                let truth_m: Vec<Vec<i32>> = read_i32(&gtm).chunks(100).map(|c| c.to_vec()).take(nq).collect();
+                let truth_m: Vec<Vec<i32>> = read_i32(&gtm)
+                    .chunks(100)
+                    .map(|c| c.to_vec())
+                    .take(nq)
+                    .collect();
                 store.set_ann_nprobe(ref_knob).unwrap();
                 store.set_scan_threads(0);
                 let mut m = json!({"ref_knob": ref_knob, "recall_before": ref_recall});
                 let ins = c.base(n, 10000);
                 let t = Instant::now();
                 for (i, v) in ins.into_iter().enumerate() {
-                    store.add(NodeId::new("doc", (n + i).to_string()), "", Some(v)).unwrap();
+                    store
+                        .add(NodeId::new("doc", (n + i).to_string()), "", Some(v))
+                        .unwrap();
                 }
                 let dt = t.elapsed().as_secs_f64();
                 m["insert_10k"] = json!({"seconds": dt, "per_s": 10000.0 / dt});
                 let newv = c.base(n + 10000, 10000);
                 let t = Instant::now();
                 for (j, v) in newv.into_iter().enumerate() {
-                    store.add(NodeId::new("doc", upd[j].to_string()), "", Some(v)).unwrap();
+                    store
+                        .add(NodeId::new("doc", upd[j].to_string()), "", Some(v))
+                        .unwrap();
                 }
                 let dt = t.elapsed().as_secs_f64();
                 m["update_10k"] = json!({"seconds": dt, "per_s": 10000.0 / dt});
@@ -394,7 +526,9 @@ fn main() {
                 m["delete_10k"] = json!({"seconds": dt, "per_s": 10000.0 / dt});
                 store.set_scan_threads(1);
                 let t = Instant::now();
-                let _ = store.similarity_search_vector(&c.queries[0], c.k, None, 0.0).unwrap();
+                let _ = store
+                    .similarity_search_vector(&c.queries[0], c.k, None, 0.0)
+                    .unwrap();
                 m["first_query_after_ms"] = json!(t.elapsed().as_secs_f64() * 1000.0);
                 let p = pinned(|| point(&store, &c, &truth_m, Path::Ann, None, budget));
                 m["recall_after"] = p["recall"].clone();
@@ -402,7 +536,13 @@ fn main() {
                 let st = store.ann_stats();
                 m["index_stats_after"] = json!({"pending": st.pending, "churn": st.churn, "trained_n": st.trained_n, "builds": st.searches.approximate});
                 m["mem_after"] = mem();
-                println!("  mutation: ins {:.2}s upd {:.2}s del {:.2}s recall_after={}", m["insert_10k"]["seconds"].as_f64().unwrap(), m["update_10k"]["seconds"].as_f64().unwrap(), m["delete_10k"]["seconds"].as_f64().unwrap(), m["recall_after"]);
+                println!(
+                    "  mutation: ins {:.2}s upd {:.2}s del {:.2}s recall_after={}",
+                    m["insert_10k"]["seconds"].as_f64().unwrap(),
+                    m["update_10k"]["seconds"].as_f64().unwrap(),
+                    m["delete_10k"]["seconds"].as_f64().unwrap(),
+                    m["recall_after"]
+                );
                 ivf["mutation"] = m;
             } else {
                 ivf["mutation"] = json!({"skipped": "dataset has no spare rows for this n"});
@@ -418,17 +558,27 @@ fn main() {
             match store.save_embeddings(&path) {
                 Ok(_) => {
                     sl["save_s"] = json!(t.elapsed().as_secs_f64());
-                    sl["disk_mb"] = json!(std::fs::metadata(&path).unwrap().len() as f64 / 1048576.0);
+                    sl["disk_mb"] =
+                        json!(std::fs::metadata(&path).unwrap().len() as f64 / 1048576.0);
                     drop(store);
                     let mut s2 = EmbeddingStore::new(None);
                     let t = Instant::now();
                     s2.load_embeddings(&path, false).unwrap();
                     sl["load_s"] = json!(t.elapsed().as_secs_f64());
-                    s2.set_ann(Some(AnnConfig { min_size: 0, nprobe: ref_knob, ..AnnConfig::default() })).unwrap();
+                    s2.set_ann(Some(AnnConfig {
+                        min_size: 0,
+                        nprobe: ref_knob,
+                        ..AnnConfig::default()
+                    }))
+                    .unwrap();
                     let t = Instant::now();
-                    s2.similarity_search_vector(&c.queries[0], c.k, None, 0.0).unwrap();
+                    s2.similarity_search_vector(&c.queries[0], c.k, None, 0.0)
+                        .unwrap();
                     sl["first_query_after_load_ms"] = json!(t.elapsed().as_secs_f64() * 1000.0);
-                    sl["time_to_ready_s"] = json!(sl["load_s"].as_f64().unwrap() + sl["first_query_after_load_ms"].as_f64().unwrap() / 1000.0);
+                    sl["time_to_ready_s"] = json!(
+                        sl["load_s"].as_f64().unwrap()
+                            + sl["first_query_after_load_ms"].as_f64().unwrap() / 1000.0
+                    );
                     sl["note"] = json!("load = JSON parse + insert; first query includes the scan-cache build and the IVF index build (the index is never persisted)");
                     let _ = std::fs::remove_file(&path);
                 }
@@ -444,14 +594,30 @@ fn main() {
         let mut store = EmbeddingStore::new(None);
         let ingest_s = ingest(&mut store, &c, n, Some(&g));
         store.set_scan_threads(1);
-        store.set_ann(Some(AnnConfig { min_size: 0, ..AnnConfig::default() })).unwrap();
+        store
+            .set_ann(Some(AnnConfig {
+                min_size: 0,
+                ..AnnConfig::default()
+            }))
+            .unwrap();
         let t = Instant::now();
         store.build_ann_index(false).unwrap();
         let idx_s = t.elapsed().as_secs_f64();
         let mut res = json!({"system": format!("{label}_ivf"), "ds": ds, "n": n, "d": d, "filter": {"build_with_metadata_s": ingest_s + idx_s, "mem": mem(), "subsets": {}}});
         let kn_all = knobs(n);
-        let pick: Vec<usize> = [1usize, kn_all.len() / 3, kn_all.len() / 2, 2 * kn_all.len() / 3, kn_all.len() - 1]
-            .iter().cloned().collect::<std::collections::BTreeSet<_>>().into_iter().map(|i| kn_all[i]).collect();
+        let pick: Vec<usize> = [
+            1usize,
+            kn_all.len() / 3,
+            kn_all.len() / 2,
+            2 * kn_all.len() / 3,
+            kn_all.len() - 1,
+        ]
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|i| kn_all[i])
+        .collect();
         for (ty, lab) in [("t10", "f10"), ("t01", "f01")] {
             let truth = c.gt(&format!("{lab}_"));
             let mut pts = Vec::new();
@@ -459,7 +625,11 @@ fn main() {
                 store.set_ann_nprobe(Some(*kn)).unwrap();
                 let mut p = pinned(|| point(&store, &c, &truth, Path::Ann, Some(ty), budget));
                 p["knob"] = json!(kn);
-                println!("  filter {lab} nprobe={kn} recall={:.4} qps={:.0}", p["recall"].as_f64().unwrap(), p["qps_1t"].as_f64().unwrap());
+                println!(
+                    "  filter {lab} nprobe={kn} recall={:.4} qps={:.0}",
+                    p["recall"].as_f64().unwrap(),
+                    p["qps_1t"].as_f64().unwrap()
+                );
                 pts.push(p);
             }
             let mut pe = pinned(|| point(&store, &c, &truth, Path::Exact, Some(ty), budget));

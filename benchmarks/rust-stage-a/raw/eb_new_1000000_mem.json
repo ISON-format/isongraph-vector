@@ -1,0 +1,15 @@
+{
+  "d": 384,
+  "label": "new",
+  "mem": {
+    "after_first_query_mb": 1621.90625,
+    "after_ingest_mb": 1621.296875,
+    "after_ivf_build_mb": 1640.859375,
+    "ingest_s": 1.1243485000000002,
+    "peak_after_build_mb": 1884.359375,
+    "peak_after_ingest_mb": 1648.5078125,
+    "raw_mb": 1464.84375
+  },
+  "n": 1000000,
+  "nprobe": 128
+}
