@@ -28,7 +28,9 @@ impl Rng {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = std::env::args().nth(1).ok_or("usage: snapshot_fixture <output-dir>")?;
+    let dir = std::env::args()
+        .nth(1)
+        .ok_or("usage: snapshot_fixture <output-dir>")?;
     std::fs::create_dir_all(&dir)?;
     let n = 40usize;
     let mut g = SemanticGraph::new("golden", Box::new(MockEncoder::new(DIM)));
@@ -38,7 +40,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rng = Rng(7);
     let types = ["doc", "note", "a:b"];
     let id_of = |i: usize| {
-        if matches!(i % 9, 0) { format!("id:with:colons:{i}") } else { format!("{i:05}") }
+        if matches!(i % 9, 0) {
+            format!("id:with:colons:{i}")
+        } else {
+            format!("{i:05}")
+        }
     };
     let mut vectors: Vec<Vec<f32>> = Vec::new();
     for i in 0..n {
@@ -51,7 +57,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         vectors.push(v.clone());
         if i == n / 2 {
-            g.set_encoder(Box::new(MockEncoder::new(DIM).with_model_name("second-model")));
+            g.set_encoder(Box::new(
+                MockEncoder::new(DIM).with_model_name("second-model"),
+            ));
         }
         let text = match i % 5 {
             0 => String::new(),
@@ -59,17 +67,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             2 => format!("unicode \u{1F600} \u{00E9}\u{4E2D} {i}"),
             _ => format!("text {i}"),
         };
-        g.embedding_store_mut().add(NodeId::new(types[i % 3], id_of(i)), &text, Some(v))?;
+        g.embedding_store_mut()
+            .add(NodeId::new(types[i % 3], id_of(i)), &text, Some(v))?;
     }
     for i in (0..n).step_by(11) {
         let v: Vec<f32> = (0..DIM).map(|_| rng.f()).collect();
-        g.embedding_store_mut().add(NodeId::new(types[i % 3], id_of(i)), "updated", Some(v))?;
+        g.embedding_store_mut()
+            .add(NodeId::new(types[i % 3], id_of(i)), "updated", Some(v))?;
     }
     for i in (3..n).step_by(7) {
-        g.embedding_store_mut().remove(&NodeId::new(types[i % 3], id_of(i)));
+        g.embedding_store_mut()
+            .remove(&NodeId::new(types[i % 3], id_of(i)));
     }
     let path = std::path::Path::new(&dir).join("golden.ison");
     g.save_with_snapshot(&path, None)?;
-    println!("wrote {} (+ .embeddings.json, .embeddings.snap)", path.display());
+    println!(
+        "wrote {} (+ .embeddings.json, .embeddings.snap)",
+        path.display()
+    );
     Ok(())
 }

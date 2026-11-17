@@ -8,13 +8,13 @@
 //! comparison is the store's JSON export, which carries every vector bit for
 //! bit (shortest round-trip float text).
 
-use isongraph_vector_rs::{
-    snapshot_path_for, LoadOptions, LoadSource, MockEncoder, SemanticGraph,
-};
+use isongraph_vector_rs::{snapshot_path_for, LoadOptions, LoadSource, MockEncoder, SemanticGraph};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let graph = args.next().ok_or("usage: snapshot_check <graph file> [dim]")?;
+    let graph = args
+        .next()
+        .ok_or("usage: snapshot_check <graph file> [dim]")?;
     let dim: usize = args.next().map(|d| d.parse()).transpose()?.unwrap_or(12);
     let enc = || Box::new(MockEncoder::new(dim));
 
@@ -32,7 +32,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let equal = g.embedding_store().to_json()? == j.embedding_store().to_json()?;
     for p in [
         twin.clone(),
-        SemanticGraph::embeddings_path_for(&twin).display().to_string(),
+        SemanticGraph::embeddings_path_for(&twin)
+            .display()
+            .to_string(),
     ] {
         let _ = std::fs::remove_file(p);
     }
