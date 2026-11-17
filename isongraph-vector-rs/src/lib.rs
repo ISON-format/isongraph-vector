@@ -38,6 +38,11 @@ mod pool;
 pub use pool::SearchPool;
 mod shared;
 pub use shared::SharedEmbeddingStore;
+mod snapshot;
+pub use snapshot::{
+    snapshot_path_for, LoadReport, LoadSource, SidecarId, SnapshotIdentity, SnapshotInfo,
+    SNAPSHOT_SUFFIX, SNAPSHOT_VERSION,
+};
 mod table;
 use table::VectorTable;
 mod digest;
@@ -635,6 +640,20 @@ impl EmbeddingStore {
     /// `SemanticGraph::load` raises). Each is also printed to stderr.
     pub fn warnings(&self) -> Vec<String> {
         self.warnings.lock().map(|w| w.clone()).unwrap_or_default()
+    }
+
+    /// Warn when the encoder version in use differs from the one recorded by
+    /// the last import (JSON or snapshot).
+    pub(crate) fn warn_on_version_skew(&self) {
+        let stored = self.last_import_meta().encoder_version.clone();
+        if let (Some(stored), Some(current)) = (stored, self.version()) {
+            if stored != current {
+                self.warn(format!(
+                    "embeddings were made by encoder version '{stored}', but the \
+                     encoder in use is version '{current}'"
+                ));
+            }
+        }
     }
 
     pub fn clear_warnings(&self) {
@@ -2681,7 +2700,31 @@ impl SemanticGraph {
         format: Option<&str>,
         embeddings: bool,
     ) -> Result<(), EmbeddingError> {
-        let path = path.as_ref();
+        self.save_impl(path.as_ref(), format, embeddings, false)
+    }
+
+    /// `save`, and also a binary snapshot of the embeddings at
+    /// `<path>.embeddings.snap` (see [`snapshot_path_for`]), written after and
+    /// in addition to the JSON sidecar, which stays the portable copy. `load`
+    /// uses the snapshot when it provably belongs to the graph and sidecar on
+    /// disk, and the JSON otherwise. If the snapshot cannot be written the
+    /// graph and sidecar are saved anyway, a stale snapshot is removed, and the
+    /// error is returned.
+    pub fn save_with_snapshot(
+        &self,
+        path: impl AsRef<Path>,
+        format: Option<&str>,
+    ) -> Result<(), EmbeddingError> {
+        self.save_impl(path.as_ref(), format, true, true)
+    }
+
+    fn save_impl(
+        &self,
+        path: &Path,
+        format: Option<&str>,
+        embeddings: bool,
+        snapshot: bool,
+    ) -> Result<(), EmbeddingError> {
         let isonl = Self::is_isonl(path, format);
         let text = if isonl {
             self.graph.to_isonl()
@@ -2693,8 +2736,26 @@ impl SemanticGraph {
         if embeddings {
             let (reread, int_ids) = digest::parse_graph_text(&text, isonl, Self::graph_name(path))?;
             let digest = graph_digest_with_int_ids(&reread, &int_ids);
+            let sidecar = Self::embeddings_path_for(path);
+            let snap = snapshot_path_for(path);
+            if !snapshot {
+                // the sidecar is about to change: a snapshot of the old one is stale
+                let _ = std::fs::remove_file(&snap);
+            }
             self.embedding_store
-                .save_embeddings_with(Self::embeddings_path_for(path), Some(&digest))?;
+                .save_embeddings_with(&sidecar, Some(&digest))?;
+            if snapshot {
+                let identity = SnapshotIdentity {
+                    graph_digest: Some(digest),
+                    sidecar: Some(SidecarId::of_file(&sidecar).map_err(|e| {
+                        EmbeddingError::Io(format!("reading {}: {e}", sidecar.display()))
+                    })?),
+                };
+                if let Err(e) = self.embedding_store.save_snapshot(&snap, &identity) {
+                    let _ = std::fs::remove_file(&snap);
+                    return Err(e);
+                }
+            }
         }
         Ok(())
     }
@@ -2719,6 +2780,30 @@ impl SemanticGraph {
         encoder: Box<dyn EmbeddingEncoder>,
         options: &LoadOptions,
     ) -> Result<Self, EmbeddingError> {
+        Self::load_with_report(path, encoder, options).map(|(graph, _)| graph)
+    }
+
+    /// `load_with`, also saying where the embeddings came from.
+    ///
+    /// If a binary snapshot (`<path>.embeddings.snap`, written by
+    /// [`save_with_snapshot`](Self::save_with_snapshot)) sits beside the
+    /// sidecar, it is used when its header names this graph's digest and the
+    /// sidecar file as it is now, and its checksum verifies; the result is
+    /// identical to loading the JSON. Otherwise the JSON sidecar is read,
+    /// exactly as before, and `LoadReport::snapshot_skipped` says why the
+    /// snapshot was not used.
+    pub fn load_with_report(
+        path: impl AsRef<Path>,
+        encoder: Box<dyn EmbeddingEncoder>,
+        options: &LoadOptions,
+    ) -> Result<(Self, LoadReport), EmbeddingError> {
+        let started = std::time::Instant::now();
+        let report = |source, snapshot_skipped, embeddings: usize| LoadReport {
+            source,
+            snapshot_skipped,
+            embeddings,
+            seconds: started.elapsed().as_secs_f64(),
+        };
         let path = path.as_ref();
         let isonl = Self::is_isonl(path, options.format.as_deref());
         let text = std::fs::read_to_string(path)
@@ -2750,11 +2835,28 @@ impl SemanticGraph {
         };
 
         if !options.embeddings {
-            return Ok(loaded);
+            return Ok((loaded, report(LoadSource::NoEmbeddings, None, 0)));
         }
         let sidecar = Self::embeddings_path_for(path);
         if !sidecar.is_file() {
-            return Ok(loaded);
+            return Ok((loaded, report(LoadSource::NoEmbeddings, None, 0)));
+        }
+
+        let snap = snapshot_path_for(path);
+        let mut snapshot_skipped = None;
+        if snap.is_file() {
+            let int_ids = digest::int_ids_of_text(&text, isonl)?;
+            let actual = graph_digest_with_int_ids(&loaded.graph, &int_ids);
+            match loaded
+                .embedding_store
+                .adopt_snapshot_for(&snap, &sidecar, &actual)
+            {
+                Ok(info) => {
+                    loaded.embedding_store.warn_on_version_skew();
+                    return Ok((loaded, report(LoadSource::Snapshot, None, info.count)));
+                }
+                Err(reason) => snapshot_skipped = Some(reason),
+            }
         }
 
         let json = std::fs::read_to_string(&sidecar)
@@ -2826,23 +2928,11 @@ impl SemanticGraph {
                     loaded.embedding_store.warn(problem);
                 }
                 loaded.embedding_store.import_embeddings(&payload, false)?;
-                let stored_version = loaded
-                    .embedding_store
-                    .last_import_meta()
-                    .encoder_version
-                    .clone();
-                let current_version = loaded.embedding_store.version();
-                if let (Some(stored), Some(current)) = (stored_version, current_version) {
-                    if stored != current {
-                        loaded.embedding_store.warn(format!(
-                            "embeddings were made by encoder version '{stored}', but the \
-                             encoder in use is version '{current}'"
-                        ));
-                    }
-                }
+                loaded.embedding_store.warn_on_version_skew();
             }
         }
-        Ok(loaded)
+        let restored = loaded.embedding_store.count();
+        Ok((loaded, report(LoadSource::Json, snapshot_skipped, restored)))
     }
 
     /// Embed all nodes in the graph, in one batched encoder call.
