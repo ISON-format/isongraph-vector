@@ -671,6 +671,12 @@ impl EmbeddingStore {
     /// top-`k` row that ranks below `k * rerank_factor` by the int8 score:
     /// measure with [`int8_recall_report`](Self::int8_recall_report).
     ///
+    /// With [`AnnMode::Hnsw`](crate::AnnMode::Hnsw) the int8 copy is **not**
+    /// used by graph search (the graph scores candidates with the f32
+    /// kernels); it only speeds the full scans HNSW falls back to (exact
+    /// override, selective filters). It still costs 0.25x the raw vectors in
+    /// memory, so leave `F32` on when HNSW is the only search you use.
+    ///
     /// # Errors
     /// `InvalidOption` for a rerank factor of 0.
     pub fn set_scan_precision(&mut self, precision: ScanPrecision) -> Result<(), EmbeddingError> {

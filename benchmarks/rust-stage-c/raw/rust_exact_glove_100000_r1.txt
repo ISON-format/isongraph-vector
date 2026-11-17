@@ -1,0 +1,13 @@
+D:\Goldmine\ISON\bench_data\rs_target_stagec\release\examples\stage_c_bench.exe --ds-dir D:\Goldmine\ISON\bench_data\prep/glove --ds glove --n 100000 --mode exact --exp core,int8 --queries 1000 --budget 3 --label rust_exact --out D:\Goldmine\ISON\ison_dev\isongraphossworking\isongraph-vector\benchmarks\rust-stage-c\raw\rust_exact_glove_100000_r1.json
+rust_exact: ds=glove n=100000 d=100 mode=exact int8=0 queries=1000 cpus=32 exps=["core", "int8"]
+  ingest 0.05s  rss 59 MB
+  int8 study: f32 1T 545.5 qps, auto 1475.9 qps, batch 25817 qps
+  rerank x1: recall vs f32 0.9832 (worst 0.80) exact_scores=true applies=true int8 0.199 ms f32 0.911 ms
+    1T 1971.4 qps (recall vs float64 truth 0.9832), auto 5383.7 qps, batch 15858 qps
+  rerank x2: recall vs f32 1.0000 (worst 1.00) exact_scores=true applies=true int8 0.178 ms f32 0.911 ms
+    1T 1947.3 qps (recall vs float64 truth 1.0000), auto 4921.4 qps, batch 13111 qps
+  rerank x4: recall vs f32 1.0000 (worst 1.00) exact_scores=true applies=true int8 0.186 ms f32 0.911 ms
+    1T 1922.2 qps (recall vs float64 truth 1.0000), auto 5281.1 qps, batch 10626 qps
+  rerank x8: recall vs f32 1.0000 (worst 1.00) exact_scores=true applies=true int8 0.219 ms f32 0.911 ms
+    1T 1851.4 qps (recall vs float64 truth 1.0000), auto 4377.0 qps, batch 9989 qps
+  exact 1T recall=1.0000 qps=548.4 median=1.755ms | auto 1668.5 qps | batch 19239 qps

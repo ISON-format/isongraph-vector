@@ -181,6 +181,19 @@ JavaScript, Rust and C++.
   unchanged. Seeds do not reproduce across ports (each uses its own generator),
   so indexes differ while recall is comparable. The standalone SQLite stores
   have no index. See `benchmarks/competitive/` for measured speed and recall.
+- **Rust: HNSW, int8 scan, binary snapshot** (all opt-in; design in
+  `isongraph-vector-rs/DESIGN.md` sections 10-12, measured in
+  `benchmarks/rust-stage-c/`). `AnnConfig::hnsw()` adds an HNSW index that
+  holds links only (about 1.2x raw memory at 1M x 384); at recall@10 0.95 its
+  single-thread speed is level with faiss HNSW and hnswlib and ahead of
+  usearch. It builds about 8-20x slower than IVF (about 150 s at 1M) and is
+  not persisted. `ScanPrecision::Int8` adds an int8 first pass with exact
+  rerank: 3-3.6x faster single-query scans at 1M, recall 1.000 against the
+  f32 scan from rerank factor 2 on real embeddings, no gain for batches, +0.25x
+  memory, and not used by HNSW graph search. `save_with_snapshot` writes a
+  binary `.snap` beside the JSON sidecar: 3x smaller and about 6x faster to
+  load at 1M (JSON stays the portable default; graph file and digest bytes are
+  unchanged; a stale or corrupt snapshot falls back to JSON).
 - **Rust engine rework** (design in `isongraph-vector-rs/DESIGN.md`, measured
   in `benchmarks/rust-stage-a/`): exact search uses AVX2/FMA kernels and
   threads; searches take `&self` on a persistent pool, with batch search
@@ -223,7 +236,7 @@ JavaScript, Rust and C++.
 - The synchronous JavaScript / TypeScript encoder interface still only serves
   prefetched texts; use the `...Async` methods to embed through a network
   encoder. `loadGraph({onMismatch: 'reembed'})` has no async form.
-- Approximate search is IVF-flat only, not HNSW. Recall on real embeddings was
+- Approximate search is IVF-flat in every port; only Rust also has HNSW. Recall on real embeddings was
   measured at 100k and 1M (`benchmarks/competitive/`); the index is not
   persisted and is rebuilt after load. JavaScript builds are slow (about 8
   minutes at 1M vectors).

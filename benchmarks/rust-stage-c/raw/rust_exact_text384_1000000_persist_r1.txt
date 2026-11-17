@@ -1,0 +1,7 @@
+D:\Goldmine\ISON\bench_data\rs_target_stagec\release\examples\stage_c_bench.exe --ds-dir D:\Goldmine\ISON\bench_data\prep/text384 --ds text384 --n 1000000 --mode exact --exp persist --queries 1000 --budget 3 --label rust_exact --out D:\Goldmine\ISON\ison_dev\isongraphossworking\isongraph-vector\benchmarks\rust-stage-c\raw\rust_exact_text384_1000000_persist_r1.json --ready ivf
+rust_exact: ds=text384 n=1000000 d=384 mode=exact int8=0 queries=1000 cpus=32 exps=["persist"]
+  save: JSON 42.86s 4534 MB | snapshot 7.68s 1489 MB (+ sidecar fingerprint 0.00s)
+  load rep 0: JSON 30.12s (first query 37.9 ms) | snapshot 4.40s (first query 34.6 ms) | answers equal ref: json=true snap=true
+  load rep 1: JSON 30.42s (first query 41.0 ms) | snapshot 4.69s (first query 37.1 ms) | answers equal ref: json=true snap=true
+  load rep 2: JSON 26.38s (first query 50.3 ms) | snapshot 4.56s (first query 43.6 ms) | answers equal ref: json=true snap=true
+  ready ivf: load 4.56s + build 17.03s + first query 31.1 ms = 21.62s

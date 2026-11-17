@@ -1,0 +1,64 @@
+{
+  "all_threads": 32,
+  "budget": 3.0,
+  "d": 384,
+  "ds": "text384",
+  "exps": [
+    "persist"
+  ],
+  "ingest_s": 1.0799625000000006,
+  "int8_rerank": 0,
+  "k": 10,
+  "mem_after_ingest": {
+    "peak_mb": 1656.76171875,
+    "rss_mb": 1629.4921875
+  },
+  "mem_baseline": {
+    "peak_mb": 7.87890625,
+    "rss_mb": 7.87890625
+  },
+  "mem_end": {
+    "peak_mb": 11505.41796875,
+    "rss_mb": 23.1171875
+  },
+  "mode": "exact",
+  "n": 1000000,
+  "persist": {
+    "json_answers_equal_original": true,
+    "json_first_query_ms": 50.2532,
+    "json_load_peak_mb": 11505.41796875,
+    "json_load_s": 30.1224564,
+    "json_load_s_runs": [
+      30.1224564,
+      30.4150109,
+      26.3797141
+    ],
+    "json_mb": 4534.09522819519,
+    "json_save_s": 42.8566,
+    "sidecar_fingerprint_s": 0.0033589,
+    "snapshot_answers_equal_original": true,
+    "snapshot_first_query_ms": 43.6024,
+    "snapshot_load_s": 4.5606966,
+    "snapshot_load_s_runs": [
+      4.395748,
+      4.6875271,
+      4.5606966
+    ],
+    "snapshot_mb": 1488.5797986984253,
+    "snapshot_save_s": 7.6825872,
+    "time_to_ready_after_snapshot_load": {
+      "ivf": {
+        "build_s": 17.03469,
+        "first_query_ms": 31.1386,
+        "load_s": 4.5588184,
+        "ready_s": 21.624647
+      }
+    }
+  },
+  "queries": 1000,
+  "raw_vectors_mb": 1464.84375,
+  "started": "SystemTime { intervals: 134393560973031643 }",
+  "status": "ok",
+  "system": "rust_exact",
+  "version": "isongraph-vector-rs HEAD (cargo release, default flags)"
+}

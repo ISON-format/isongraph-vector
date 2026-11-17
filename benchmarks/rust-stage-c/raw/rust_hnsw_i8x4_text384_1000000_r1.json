@@ -1,0 +1,136 @@
+{
+  "all_threads": 32,
+  "budget": 3.0,
+  "build": {
+    "first_query_ms": 0.6648000000000001,
+    "index_s": 144.7168199,
+    "ingest_s": 1.1461203,
+    "stats_build_seconds": 144.7156143,
+    "total_s": 145.8629402
+  },
+  "d": 384,
+  "ds": "text384",
+  "exps": [
+    "core"
+  ],
+  "first_exact_query_ms": 30.6539,
+  "index_stats": {
+    "ef_search_default": 192,
+    "graph_nodes": 1000000,
+    "index_bytes": 146214912,
+    "max_level": 5,
+    "nlist": null,
+    "trained_n": 1000000
+  },
+  "int8_rerank": 4,
+  "k": 10,
+  "knob_name": "ef_search",
+  "mem_after_build": {
+    "peak_mb": 2171.609375,
+    "rss_mb": 2163.57421875
+  },
+  "mem_after_first_exact_query": {
+    "peak_mb": 2000.55078125,
+    "rss_mb": 2000.55078125
+  },
+  "mem_after_ingest": {
+    "peak_mb": 1656.42578125,
+    "rss_mb": 1629.9375
+  },
+  "mem_after_sweep": {
+    "peak_mb": 2171.609375,
+    "rss_mb": 2163.77734375
+  },
+  "mem_baseline": {
+    "peak_mb": 7.85546875,
+    "rss_mb": 7.85546875
+  },
+  "mem_end": {
+    "peak_mb": 2171.609375,
+    "rss_mb": 2163.80078125
+  },
+  "memory_stats": {
+    "index_bytes": 146214912,
+    "matrix_bytes": 1536688128,
+    "metadata_bytes": 130484346,
+    "quant_bytes": 388366336,
+    "total_bytes": 1813387386
+  },
+  "mode": "hnsw",
+  "n": 1000000,
+  "quant_build_s": 1.1209916,
+  "quant_bytes_mb": 370.375,
+  "queries": 1000,
+  "raw_vectors_mb": 1464.84375,
+  "ref_knob": 192,
+  "ref_recall_pre": 0.9549,
+  "rss_delta_int8_mb": 368.86328125,
+  "started": "SystemTime { intervals: 134393573059240073 }",
+  "status": "ok",
+  "sweep": [
+    {
+      "batch": {
+        "nq": 1000,
+        "qps_batch": 6295.62756074651,
+        "qps_batch_max": 6463.802383462491,
+        "qps_batch_min": 6251.4534629301315,
+        "qps_batch_runs": [
+          6463.802383462491,
+          6295.62756074651,
+          6251.4534629301315
+        ],
+        "recall": 0.9549,
+        "threads": 32
+      },
+      "knob": 192,
+      "max_ms": 1.1743000000000001,
+      "mean_ms": 0.5585331333333338,
+      "median_ms": 0.5569000000000001,
+      "nq": 1000,
+      "p95_ms": 0.6959,
+      "p99_ms": 0.8284,
+      "qps_1t": 1784.152196746313,
+      "qps_1t_max": 1833.9063985177663,
+      "qps_1t_min": 1754.9247576010177,
+      "qps_1t_runs": [
+        1833.9063985177663,
+        1784.152196746313,
+        1754.9247576010177
+      ],
+      "recall": 0.9549
+    },
+    {
+      "batch": {
+        "nq": 1000,
+        "qps_batch": 4938.888661151245,
+        "qps_batch_max": 5074.787138053494,
+        "qps_batch_min": 4849.477080886368,
+        "qps_batch_runs": [
+          4849.477080886368,
+          4938.888661151245,
+          5074.787138053494
+        ],
+        "recall": 0.9685,
+        "threads": 32
+      },
+      "knob": 256,
+      "max_ms": 5.1765,
+      "mean_ms": 0.7278126666666671,
+      "median_ms": 0.713,
+      "nq": 1000,
+      "p95_ms": 0.929,
+      "p99_ms": 1.2015,
+      "qps_1t": 1371.3318415985568,
+      "qps_1t_max": 1451.3979792766486,
+      "qps_1t_min": 1306.798357093104,
+      "qps_1t_runs": [
+        1306.798357093104,
+        1371.3318415985568,
+        1451.3979792766486
+      ],
+      "recall": 0.9685
+    }
+  ],
+  "system": "rust_hnsw_i8x4",
+  "version": "isongraph-vector-rs HEAD (cargo release, default flags)"
+}

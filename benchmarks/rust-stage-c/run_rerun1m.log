@@ -1,0 +1,16 @@
+skip rust_exact_text384_1000000_r1 (done)
+skip numpy_bf_text384_1000000_r1 (done)
+skip faiss_flat_text384_1000000_r1 (done)
+== rust_hnsw_text384_1000000_r1  load total 18% pin-cpu 0% noisy=False
+   done in 228s ok=True
+skip hnswlib_text384_1000000_r1 (done)
+skip rust_exact_text384_1000000_persist_r1 (done)
+== rust_ivf_text384_1000000_r1  load total 14% pin-cpu 0% noisy=False
+   done in 78s ok=True
+skip faiss_ivfflat_text384_1000000_r1 (done)
+== faiss_hnsw_text384_1000000_r1  load total 13% pin-cpu 0% noisy=False
+   done in 216s ok=True
+skip usearch_text384_1000000_r1 (done)
+== rust_ivf_i8x4_text384_1000000_r1  load total 19% pin-cpu 0% noisy=False
+   done in 42s ok=True
+skip rust_hnsw_i8x4_text384_1000000_r1 (done)

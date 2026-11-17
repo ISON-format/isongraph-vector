@@ -1,0 +1,10 @@
+C:\Program Files\Python312\python.exe D:\Goldmine\ISON\ison_dev\isongraphossworking\isongraph-vector\benchmarks\rust-stage-c\bench_c.py --system faiss_hnsw --ds text384 --n 1000000 --exp core,mutation,saveload --queries 1000 --budget 3 --out D:\Goldmine\ISON\ison_dev\isongraphossworking\isongraph-vector\benchmarks\rust-stage-c\raw\faiss_hnsw_text384_1000000_r1.json
+  faiss_hnsw text384 1000000 knob=24 recall=0.7597 qps1t=5575 med=0.163ms batch=22390
+  faiss_hnsw text384 1000000 knob=32 recall=0.8054 qps1t=4626 med=0.196ms batch=18644
+  faiss_hnsw text384 1000000 knob=48 recall=0.8571 qps1t=3602 med=0.264ms batch=15121
+  faiss_hnsw text384 1000000 knob=64 recall=0.8906 qps1t=2893 med=0.320ms batch=11098
+  faiss_hnsw text384 1000000 knob=96 recall=0.9284 qps1t=2084 med=0.447ms batch=7843
+  faiss_hnsw text384 1000000 knob=128 recall=0.9465 qps1t=1650 med=0.559ms batch=6238
+  faiss_hnsw text384 1000000 knob=192 recall=0.9673 qps1t=1185 med=0.795ms batch=4544
+  faiss_hnsw text384 1000000 knob=256 recall=0.9774 qps1t=952 med=1.026ms batch=3368
+  faiss_hnsw text384 1000000 knob=400 recall=0.9884 qps1t=614 med=1.585ms batch=2196

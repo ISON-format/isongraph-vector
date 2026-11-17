@@ -1,0 +1,10 @@
+D:\Goldmine\ISON\bench_data\rs_target_stagec\release\examples\stage_c_bench.exe --ds-dir D:\Goldmine\ISON\bench_data\prep/text384 --ds text384 --n 100000 --mode ivf --exp core --queries 1000 --budget 3 --label rust_ivf --out D:\Goldmine\ISON\ison_dev\isongraphossworking\isongraph-vector\benchmarks\rust-stage-c\raw\rust_ivf_text384_100000_r2.json
+rust_ivf: ds=text384 n=100000 d=384 mode=ivf int8=0 queries=1000 cpus=32 exps=["core"]
+  ingest 0.10s  rss 169 MB
+  ivf build 0.49s (stats Some(0.4898997)) rss 174 MB (peak 254)
+  ivf knob=16 recall=0.7503 qps1t=5995 median=0.164ms batch=73322
+  ivf knob=32 recall=0.8401 qps1t=2871 median=0.311ms batch=65185
+  ivf knob=64 recall=0.9083 qps1t=1311 median=0.708ms batch=32849
+  ivf knob=128 recall=0.9559 qps1t=690 median=1.446ms batch=18063
+  ivf knob=256 recall=0.9840 qps1t=358 median=2.802ms batch=15159
+  ivf knob=512 recall=0.9950 qps1t=183 median=5.475ms batch=9490

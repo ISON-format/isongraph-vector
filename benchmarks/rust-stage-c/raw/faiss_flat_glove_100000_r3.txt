@@ -1,0 +1,2 @@
+C:\Program Files\Python312\python.exe D:\Goldmine\ISON\ison_dev\isongraphossworking\isongraph-vector\benchmarks\rust-stage-c\bench_c.py --system faiss_flat --ds glove --n 100000 --exp core --queries 1000 --budget 3 --out D:\Goldmine\ISON\ison_dev\isongraphossworking\isongraph-vector\benchmarks\rust-stage-c\raw\faiss_flat_glove_100000_r3.json
+  faiss_flat glove 100000 knob=None recall=1.0000 qps1t=622 med=1.561ms batch=15184
