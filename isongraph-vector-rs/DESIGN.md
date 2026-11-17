@@ -154,3 +154,238 @@ matrix product, bit-identity then holds per kernel, not across them; JS:
 searches in numpy outside the GIL; JS single-threaded, workers need
 `SharedArrayBuffer`); the pool (Rust hand-written, one `unsafe` lifetime erasure;
 others use their standard pool); hash map and heap (any).
+
+## 10. Int8 scalar-quantised scan with exact rerank (opt-in)
+
+Code: `src/quant.rs` (child module of `ann`), hooks in `ann.rs`, storage in
+`table.rs`. Off by default; `ScanPrecision::Int8 { rerank_factor }` via
+`EmbeddingStore::set_scan_precision` (default factor `DEFAULT_RERANK_FACTOR = 4`).
+With it off nothing below exists (no memory, no code path).
+
+### 10.1 The copy
+
+Beside every f32 row the table keeps `dim` int8 codes and one f32 scale, slot for
+slot, in chunks that mirror the f32 chunks (`CHUNK_ROWS` rows). It is **derived
+data**: never persisted, never in a sidecar or digest, rebuilt in one pass by
+`set_scan_precision`. Cost: `dim + 4` bytes per row = 0.25x the f32 matrix
+(+4 bytes/row).
+
+Quantisation (the same function for rows and queries, so a port must use one
+definition everywhere):
+
+```
+m     = max over i of |x_i|          (a NaN component is ignored)
+if m == 0 or m is not finite:  scale = 0, every code = 0
+else:  inv = 127 / m   (f32);   code_i = clamp(round_half_away(x_i * inv), -127, 127)
+       scale = m / 127 (f32)
+```
+Symmetric, no zero point, **-128 is never produced** (the AVX2 kernel relies on
+it). A zero scale makes the row's approximate dot 0, like its exact one.
+
+Maintenance (all inside the table, so it cannot go stale): a put overwrites or
+appends the codes with the f32 row; a delete leaves them (the NaN norm already
+drops the row); compaction moves codes and scales with the rows; `clear` empties
+them. Invariant 8 (checked by `verify_invariants`): for **every** slot, tombstones
+included, codes and scale equal `quantize(f32 row)` bit for bit.
+
+### 10.2 The search
+
+1. Quantise the query. A query with no direction (zero or non-finite norm) is
+   answered by the f32 scan.
+2. First pass over exactly the rows the f32 path would score (all rows of the
+   blocks, or the probed cells plus the pending rows), with the type filter:
+   `d = sum_i q_i * r_i` as an **integer** (exact in i32 for any realistic `dim`:
+   384 * 127 * 127 < 2^23), then
+   `approx = cosine(float(d) * row_scale * query_scale, row_norm, query_norm)`
+   where `cosine` is the section-2 function (zero denominator -> 0; a tombstone's
+   NaN norm -> NaN -> dropped by the collector). Keep the best `kc = k *
+   rerank_factor` in the section-3 heap (order: score desc, slot asc), with the
+   bar starting at `threshold - 0.05` (so quantisation noise cannot lose a row
+   that passes the exact threshold).
+3. **Exact rerank**: score those `kc` slots with the exact f32 kernel (section 2,
+   same summation order as the f32 scan), apply the exact threshold, keep the best
+   `k`. Returned scores are therefore exactly the cosines the f32 scan returns;
+   only *which* rows reach the rerank is approximate.
+4. If `kc >= rows the first pass would score` (live rows for a full scan; the
+   probed rows for a cell scan), int8 cannot skip anything: answer in f32. The
+   graph's unbounded filtered search (`k = usize::MAX`) therefore stays f32.
+
+Because step 2 is integer arithmetic (associative: lane count, tiling, kernel,
+thread count do not matter) and selection is by the total order (score, slot), the
+candidate set of a query is a function of that query and the store only. So **batch
+== single bit for bit still holds**, and the answer does not depend on the thread
+count. The exact batch tiles (block of rows) x (16 queries) and runs the same
+per-row first pass; the IVF batch is cell-major as in section 3 (each probed
+cell's int8 rows are scored once against all queries that probe it, into
+per-query `kc` heaps); a query that comes up short or whose probe holds `<= kc`
+rows is re-run on the single-query path.
+
+Kernel (Rust): AVX2 `sign(r, q)` -> `maddubs(|q|, .)` -> `madd(., 1)` -> add: 32
+products per 4 instructions; a pair sum is at most 2*127*127 < 2^15 so the 16-bit
+step cannot saturate. The `unsafe` block sits behind an `assert!` that every
+operand has `dim` bytes; a portable loop is the fallback and the specification
+(they are tested equal on every dimension 1..1000 sampled, including +-127
+extremes). A port may use any integer kernel (NEON `sdot`, VNNI): the result is
+identical by construction.
+
+### 10.3 Reporting recall
+
+`int8_recall_report(queries, k, node_type, threshold, rerank_factors)` runs the
+full scan in f32 and, per factor, in int8 + rerank, and returns the mean and worst
+per-query overlap of the two top-k sets, whether every returned score is
+bit-identical to the exact cosine of its row, whether int8 applied (`k * factor <
+live`), and median times. It measures full scans; an IVF probe adds its own
+approximation on top (measure it with `recall_check`; the int8 error is the same
+mechanism on a smaller candidate set).
+
+### 10.4 Measured (indicative; this machine was shared with another agent's work)
+
+Clustered synthetic data, 384-d, k = 10, rerank factor 4. Timings are the fastest
+of 180 searches (5 batches): medians swung 3x run to run on this machine, minimums
+were stable to ~5%.
+
+| 1M x 384 | f32 | int8 | |
+|---|---|---|---|
+| exact scan, 1 thread | 155 ms | 43 ms | 3.6x |
+| exact scan, auto threads | 31.9 ms | 11.2 ms | 2.9x |
+| IVF (nlist 4000, nprobe 200), 1 thread | 10.2 ms | 2.9 ms | 3.5x |
+| IVF, auto threads | 2.87 ms | 1.75 ms | 1.6x |
+| exact batch of 128, auto / 1 thread | 309 / 3202 ms | 240 / 2947 ms | 1.3x / 1.1x |
+| IVF batch of 128, auto / 1 thread | 75 / 502 ms | 69 / 431 ms | 1.1x / 1.2x |
+
+100k x 384: exact 1 thread 5.7 -> 1.85 ms (3.1x), auto threads 3.3 -> 0.58 ms
+(5.7x), batch 1.0-1.1x. Recall@10 against the f32 scan (128 queries): factor 1
+0.970 (1M) / 0.976 (100k), factor >= 2 **1.000**, worst single query 1.00 from
+factor 2. Memory (working set, 1M x 384): 1658 -> 2033 MiB, **+375 MiB (+23%)**;
+the copy itself is 370 MiB against a 1466 MiB matrix.
+
+Honest reading: int8 buys **single-query latency** (2-4x on exact scans, 1.6-3.5x on
+IVF cells) because a scan is memory-bandwidth bound and the copy is 4x smaller. It
+buys **nothing for batch throughput** (1.0-1.3x): the f32 batch kernel (4 queries x
+2 rows in registers) is compute-bound, and an AVX2 int8 dot does the same number of
+MACs per instruction as an f32 FMA; only VNNI (`vpdpbusd`, not assumed here) would
+change that. It costs +23% RSS at 384-d. Recommendation: keep it as an opt-in for
+latency-sensitive single-query serving of large stores; do not enable it for
+batch/offline workloads; the recall figure is for synthetic clustered data and
+must be re-measured with `int8_recall_report` on real embeddings before relying on
+factor 4 (use a larger factor if it shows < 0.99).
+
+Ports: implement 10.1 and 10.2 exactly (including the quantisation rounding rule
+and the `0.05` slack) and the invariant; kernels and threading are free.
+
+## 11. Binary snapshot (optional, beside the JSON sidecar)
+
+Code: `src/snapshot.rs`; glue in `SemanticGraph::{save_with_snapshot, load_with_report}`.
+
+Evidence for it: at 1M x 384 the JSON sidecar is 4.5 GB and takes 30-50 s to write
+and 20-30 s to read here; a snapshot of the same store is 1.5 GB and
+saves in ~3.5 s / loads in ~4.3 s. The JSON sidecar is **unchanged and remains the
+portable, authoritative format**; the snapshot is a cache of it. Graph files, the
+sidecar bytes and the graph digest are byte-identical with or without a snapshot.
+
+### 11.1 Files and protocol
+
+* Path: `<graph file>.embeddings.snap` (`.embeddings.json` is the sidecar).
+* **Save with snapshot**: write the graph file, then the JSON sidecar (both atomic,
+  as before), then the snapshot: temp file in the same directory, flush + fsync,
+  rename over the old one. A failure at any point leaves the previous file
+  untouched and removes the temp file. If the snapshot cannot be written the pair
+  is still saved, a stale `.snap` is removed, and the error is returned. A save
+  **without** snapshot deletes any existing `.snap` first (the sidecar is about to
+  change).
+* **Load**: read the graph; if a `.snap` exists, take the cheap identity checks
+  (below), and only then stream the body into a *staging* store, verify the
+  trailer checksum, and install the staging store; **any** failure (missing file,
+  bad magic/version/flags, identity mismatch, truncation, malformed body,
+  duplicate key, checksum) leaves the store untouched and falls back to the JSON
+  sidecar, exactly as without a snapshot (its own digest check and
+  `GraphMismatch` policy apply). The load reports which path ran
+  (`LoadReport { source: Snapshot | Json | NoEmbeddings, snapshot_skipped:
+  Option<reason>, embeddings, seconds }`).
+* **Identity** (all required): `graph_digest` in the header equals the digest of the
+  graph file read now (same `GRAPH_DIGEST_BASIS`; no Python-view leniency), and
+  the header's sidecar identity equals the identity of the sidecar file on disk.
+  A snapshot is never used when the sidecar is missing.
+* Sidecar identity = `len` (u64) and `fingerprint` = SHA-256 over: `len` as u64 LE,
+  the first 65,536 bytes, the last 65,536 bytes, and for i in 1..=64 the 4,096
+  bytes at offset `floor(len * i / 65)` (each clipped to the file end). Any
+  serializer rewriting the sidecar changes it; **limit**: an in-place edit that
+  keeps the length and touches no sampled byte is not detected. Tools that rewrite
+  the sidecar must delete the `.snap` (this crate's `save` does).
+
+### 11.2 Byte layout, version 1 (all integers little endian)
+
+```
+header
+  0   8   magic        "ISONVSNP"
+  8   4   version      u32 = 1            (reader rejects any other)
+  12  4   flags        u32                bit 0: sidecar identity present; other bits must be 0
+  16  4   dim          u32                must be > 0 when count > 0
+  20  4   block_rows   u32 (1..=2^20)     writer uses 1024; reader honours the file's
+  24  8   count        u64                live rows (<= 2^32-1)
+  32  .   graph_digest        opt string
+          graph_digest_basis  opt string  ("nodes-edges-json-v1" when a digest is given)
+          encoder_model       opt string
+          encoder_version     opt string
+          [if flags bit 0]  sidecar_len u64, sidecar_fingerprint 32 bytes
+          n_models  u32, then n_models x string   (model names, order of first use)
+block * ceil(count / block_rows)       R = min(block_rows, rows left)
+  R x row metadata:   type string, id string, text string, model_index u32
+  R x dim x f32       row-major, in the same row order
+trailer  32 bytes  SHA-256 of every byte before it (from offset 0)
+```
+`string` = `u32 length` + that many UTF-8 bytes. `opt string` = the same, with length
+`0xFFFFFFFF` meaning absent. Rows are in the **sidecar's order**: live rows only,
+sorted by node type then id (byte order), so loading a snapshot yields the same
+slots, tombstone-free, as loading the JSON (equal score ties resolve identically).
+`key = type ":" id`. A reader must reject: a length past the end of the file, a
+model index >= n_models, a repeated key, `count * dim * 4` larger than the file,
+bytes between the last block and the trailer or after it, a trailer mismatch.
+The reader sets `dimension` from the first row (as the JSON import does), and the
+import metadata (encoder model/version, digest, basis) from the header.
+
+Smallest example (1 row: type `t`, id `a`, text `x`, model `provided`, vector
+`[1.0, -2.0]`, no digest, no sidecar), 123 bytes:
+```
+49 53 4f 4e 56 53 4e 50  01 00 00 00  00 00 00 00      magic, version 1, flags 0
+02 00 00 00  00 04 00 00  01 00 00 00 00 00 00 00      dim 2, block_rows 1024, count 1
+ff ff ff ff x4                                          four absent strings
+01 00 00 00  08 00 00 00 "provided"                     1 model
+01 00 00 00 "t"  01 00 00 00 "a"  01 00 00 00 "x"  00 00 00 00      row metadata, model 0
+00 00 80 3f  00 00 00 c0                                1.0, -2.0
+<32-byte SHA-256 of the 91 bytes above>
+```
+(A port that has no float byte order issue reads/writes f32 as IEEE-754 LE.)
+
+### 11.3 What is deliberately not in it
+
+* **IVF state.** The index is rebuilt (lazily, or by `build_ann_index`). A rebuild is
+  deterministic for a given store and seed, but it is *not* the saved store's index:
+  the saved index depends on the slot order and fold history of the live store,
+  while a canonical-order file loads into a different slot order. Reproducing the
+  saved index's answers after a round trip cannot be proved without storing the
+  slot permutation and the pending list and re-validating them, so it is not
+  attempted: search results after load equal those of a JSON load, and an index
+  built after load equals one built after a JSON load.
+* **The int8 copy** (derived; section 10).
+* Warnings, the pool, per-store settings.
+
+### 11.4 Measured (indicative)
+
+| 384-d | rows | JSON save / size / load | snapshot save / size / load |
+|---|---|---|---|
+| 100k | 100,000 | 1.7 s / 451 MiB / 2.5 s | 0.21 s / 150 MiB / 0.34 s |
+| 1M | 1,000,000 | 49.8 s / 4513 MiB / 30.3 s | 3.55 s / 1503 MiB / 4.33 s |
+
+The snapshot is 1.03x the raw f32 matrix (1465 MiB at 1M), 3.0x smaller than the
+JSON, loads 7x faster and saves 14x faster. It is **not** mmap-class: faiss and
+hnswlib save in 0.06-0.2 s because they write one buffer; this loader reads,
+checksums (SHA-256 ~2 GB/s here, ~0.7 s of the 4.3 s), copies each row into the
+chunked matrix, computes its norm and builds the key map, which is most of the
+time. Making load mmap-fast would need a layout that is the in-memory layout
+(aligned chunks, no per-row metadata interleaved), a different trade-off than the
+portability chosen here.
+
+Ports: write `.snap` byte-for-byte as in 11.2 or skip the feature; a port that does
+not know the file simply loads the JSON. A port reading a `.snap` must apply every
+rejection rule above and fall back to the JSON on any failure.

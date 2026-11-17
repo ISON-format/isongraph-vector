@@ -779,3 +779,47 @@ fn the_sidecar_identity_sees_a_rewritten_file() {
     std::fs::write(&p, b"x").unwrap();
     SidecarId::of_file(&p).unwrap();
 }
+
+#[test]
+fn a_store_keeps_its_scan_precision_and_index_settings_across_a_snapshot_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = graph(1500, 6);
+    let snap = path_in(&dir, "s.snap");
+    g.embedding_store()
+        .save_snapshot(&snap, &SnapshotIdentity::default())
+        .unwrap();
+
+    let mut store = EmbeddingStore::new(None);
+    store.set_scan_precision(ScanPrecision::int8()).unwrap();
+    store
+        .set_ann(Some(AnnConfig {
+            nlist: Some(16),
+            nprobe: Some(4),
+            min_size: 0,
+            ..AnnConfig::default()
+        }))
+        .unwrap();
+    store
+        .add(NodeId::new("old", "row"), "t", Some(vec![1.0; DIM]))
+        .unwrap();
+    let info = store.load_snapshot(&snap).unwrap();
+    assert_eq!(info.count, g.embedding_store().count());
+    assert!(store.get(&NodeId::new("old", "row")).is_none(), "replaced");
+    assert_eq!(store.scan_precision(), ScanPrecision::int8());
+    assert!(store.quant_bytes() > 0);
+    assert!(store.ann().is_some());
+    store.verify_invariants().unwrap();
+    // and it searches like a JSON-loaded store with the same settings
+    let mut json = EmbeddingStore::new(None);
+    let side = path_in(&dir, "s.json");
+    g.embedding_store().save_embeddings(&side).unwrap();
+    json.load_embeddings(&side, true).unwrap();
+    json.set_scan_precision(ScanPrecision::int8()).unwrap();
+    json.set_ann(store.ann().cloned()).unwrap();
+    for q in queries(20) {
+        assert_eq!(
+            search_bits(&store, &q, 6, None),
+            search_bits(&json, &q, 6, None)
+        );
+    }
+}
