@@ -58,8 +58,8 @@ static void RunOne(int n, string regimeName, Options o, Action<string> say)
     say("");
     say($"* exact scan: warm median {Pct(exactMs, 0.5):F2} ms, p95 {Pct(exactMs, 0.95):F2} ms");
     say($"* index build: {stats.BuildSeconds:F2} s for nlist={stats.Nlist} (automatic nprobe={stats.Nprobe}); " +
-        $"cells {stats.IndexBytes / 1048576.0:F1} MB plus {stats.VectorBytes / 1048576.0:F0} MB for the index's " +
-        $"contiguous copy of the vectors (the store's own {(long)n * o.Dim * 4 / 1048576} MB is separate); " +
+        $"index {stats.IndexBytes / 1048576.0:F1} MB (centroids and cell lists only: it keeps no copy of the " +
+        $"vectors, the store's {(long)n * o.Dim * 4 / 1048576} MB matrix is the only one); " +
         $"managed heap {gcAfter / 1048576} MB");
     say($"* ingest {ingest:N0} vectors/s (the index is built lazily; ingest is unaffected)");
     say("");

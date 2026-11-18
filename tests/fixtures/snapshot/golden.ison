@@ -1,0 +1,8 @@
+edges.KNOWS
+source target
+:person:1 :person:2
+
+nodes.person
+id name
+"1" Alice
+"2" Bob

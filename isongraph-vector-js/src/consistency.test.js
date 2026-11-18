@@ -41,7 +41,7 @@ describe('updateNode keeps embeddings in step', () => {
     g.addNode('person', 1, { name: 'Alice' });
     const before = g.getEmbedding(['person', 1]);
     g.updateNode('person', 1, { age: 31 });
-    expect(g.getEmbedding(['person', 1])).toBe(before);
+    expect(g.getEmbedding(['person', 1])).toEqual(before);   // get() hands out a copy, so compare by value
   });
 
   it('leaves vectors alone when autoEmbed is off', () => {

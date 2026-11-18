@@ -14,18 +14,21 @@ What is deliberately not done yet, in rough priority order. Items marked
    (`isongraph-vector-rs/DESIGN.md`, `benchmarks/rust-stage-c/`): concurrent
    and batch search, one copy of the vectors, no post-write stall, opt-in HNSW
    (level with faiss HNSW / hnswlib single-thread), int8 scan, binary snapshot.
-   Still open: port the proven pieces to the other ports; persist the ANN
-   index; faster HNSW single-call inserts (1.4k/s at 1M); exact scan is at
+   One copy of the vectors, batch search and the binary snapshot are now in
+   every port (HNSW and int8 are still Rust-only). Still open: HNSW for C++ and
+   C#; persist the ANN index; faster HNSW single-call inserts (1.4k/s at 1M); exact scan is at
    parity with faiss Flat, not ahead.
-5. **Fix the slow ports.** The C++ exact scan has no scan cache and is scalar
-   (6x slower than numpy); JavaScript k-means takes about 8 minutes at 1M.
+5. **Fix the slow ports.** The C++, C# and JS exact scans are scalar and still
+   slower than numpy; JavaScript k-means takes about 8 minutes at 1M.
 6. **Per-record encoder version.** Today a version-only change warns on
    load but cannot be fixed by `reembed_stale`.
 
 ## Later
 
-- **Binary persistence** for vectors and the index, as an addition to the
-  portable JSON sidecar (which stays the default and keeps the digest).
+- **Persist the ANN index** next to the binary snapshot (the snapshot itself
+  exists in every port; the index is rebuilt after load).
+- **Snapshot format v2:** an id-kind bit per row, so ports with integer ids need
+  no graph lookup to restore them.
 - **Approximate search for the standalone SQLite stores.**
 - **Relationship-type weights** (per type rather than a per-edge property),
   and richer node predicates than a callback.

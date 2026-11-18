@@ -5,8 +5,9 @@
 //!     cross_port_graph mismatch <dir>
 //!
 //! `write` saves the shared fixture graph as <dir>/graph.ison plus its
-//! embeddings sidecar. `read` loads it with GraphMismatch::Error and writes what
-//! it found to <observation.json>. `mismatch` loads a graph whose file was
+//! embeddings sidecar and binary snapshot. `read` loads it with
+//! GraphMismatch::Error and writes what it found (and the load source, snapshot
+//! or json, with the reason a snapshot was skipped) to <observation.json>. `mismatch` loads a graph whose file was
 //! edited after the save and exits 0 only if the load fails with
 //! EmbeddingError::GraphEmbeddingMismatch.
 //!
@@ -15,8 +16,8 @@
 //! that.
 
 use isongraph_vector_rs::{
-    EmbeddingEncoder, EmbeddingError, GraphMismatch, LoadOptions, MockEncoder, NodeId,
-    PropertyValue, SemanticGraph,
+    EmbeddingEncoder, EmbeddingError, GraphMismatch, LoadOptions, LoadReport, LoadSource,
+    MockEncoder, NodeId, PropertyValue, SemanticGraph,
 };
 use serde_json::{json, Map, Value as Json};
 use std::collections::HashMap;
@@ -147,7 +148,7 @@ fn write(dir: &str) -> Res<()> {
         graph.add_edge(rel, source, target, props)?;
     }
     std::fs::create_dir_all(dir)?;
-    graph.save(graph_path(dir), None, true)?;
+    graph.save_with_snapshot(graph_path(dir), None)?;
     Ok(())
 }
 
@@ -172,7 +173,7 @@ fn json_props(props: &HashMap<String, PropertyValue>) -> Json {
     Json::Object(map)
 }
 
-fn observe(graph: &SemanticGraph, encoder: &MockEncoder) -> Json {
+fn observe(graph: &SemanticGraph, encoder: &MockEncoder, report: &LoadReport) -> Json {
     let mut node_list = Vec::new();
     let mut missing = Vec::new();
     let mut worst = 0.0f64;
@@ -238,15 +239,21 @@ fn observe(graph: &SemanticGraph, encoder: &MockEncoder) -> Json {
         "missing_embeddings": missing,
         "max_vec_diff": worst,
         "searches": searches,
+        "source": match report.source {
+            LoadSource::Snapshot => "snapshot",
+            LoadSource::Json => "json",
+            LoadSource::NoEmbeddings => "none",
+        },
+        "snapshot_skipped": report.snapshot_skipped,
     })
 }
 
-fn load(dir: &str) -> Result<SemanticGraph, EmbeddingError> {
+fn load(dir: &str) -> Result<(SemanticGraph, LoadReport), EmbeddingError> {
     let options = LoadOptions {
         on_mismatch: GraphMismatch::Error,
         ..LoadOptions::default()
     };
-    SemanticGraph::load_with(graph_path(dir), Box::new(MockEncoder::new(DIM)), &options)
+    SemanticGraph::load_with_report(graph_path(dir), Box::new(MockEncoder::new(DIM)), &options)
 }
 
 fn run() -> Res<i32> {
@@ -255,8 +262,8 @@ fn run() -> Res<i32> {
     match (arg(1), arg(2), arg(3)) {
         (Some("write"), Some(dir), None) => write(dir)?,
         (Some("read"), Some(dir), Some(out)) => {
-            let graph = load(dir)?;
-            let observation = observe(&graph, &MockEncoder::new(DIM));
+            let (graph, report) = load(dir)?;
+            let observation = observe(&graph, &MockEncoder::new(DIM), &report);
             std::fs::write(out, serde_json::to_string(&observation)?)?;
         }
         (Some("mismatch"), Some(dir), None) => {

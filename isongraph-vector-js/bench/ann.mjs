@@ -14,10 +14,12 @@
  * somewhere else - run store.recallCheck() on your own queries before relying
  * on a setting.
  *
- * Stored vectors are plain JS arrays of doubles (8 bytes per component) plus
- * the index's Float32Array copy (4 bytes), so 1M x 384 needs about 12 GB of
- * heap: run it with --max-old-space-size. A size that will not fit is skipped
- * with a message instead of crashing.
+ * The store keeps one float32 copy of each vector (4 bytes per component, in
+ * Float32Array chunks outside the JS heap; the IVF index reads those rows and
+ * adds about 8 bytes per vector), so 1M x 384 needs a little over 1.5 GB. The
+ * vectors this script generates are plain JS arrays of doubles first, which is
+ * what dominates its heap: run it with --max-old-space-size. A size that will
+ * not fit is skipped with a message instead of crashing.
  *
  * To measure the TypeScript build instead, pass --port ts (needs `npm run
  * build` in isongraph-vector-ts first); --entry <file> imports any other build.
@@ -147,7 +149,7 @@ console.log(`# exact vs IVF (${opts.port}), dim ${opts.dim}, k ${opts.k}, ${opts
 console.log(`node ${process.version}, ${cpus().length} logical CPUs, ${(totalmem() / 2 ** 30).toFixed(1)} GB RAM, heap limit ${(heapLimit / 2 ** 30).toFixed(1)} GB\n`);
 
 for (const n of opts.sizes) {
-  const need = n * opts.dim * 13 * 1.2;          // doubles + float32 copy + slack
+  const need = n * 400 * 1.2;                    // per-row JS objects (key, ref, text); the float32 rows live off the JS heap
   if (need > heapLimit * 0.9) {
     console.log(`## N = ${n.toLocaleString('en-US')}: skipped (needs about ${(need / 2 ** 30).toFixed(1)} GB of heap, limit ${(heapLimit / 2 ** 30).toFixed(1)} GB; rerun with --max-old-space-size)\n`);
     continue;

@@ -4,14 +4,19 @@
 The SQLite and payload checks (node_write.mjs, py_read.py and friends) prove the
 ports share one embeddings format. This proves the same for what
 `SemanticGraph.save` writes: a graph file plus a `<graph>.embeddings.json`
-sidecar carrying a `graph_digest` that `load` verifies.
+sidecar carrying a `graph_digest` that `load` verifies, and the optional binary
+snapshot `<graph>.embeddings.snap` (DESIGN.md section 11).
 
 Every port has a small standalone helper (graph_py.py, graph_node.mjs for the
 JavaScript and TypeScript ports, rust/, csharp/ and cpp/) that can
 
-    write    <dir>                save the fixture graph + sidecar into <dir>
+    write    <dir>                save the fixture graph + sidecar + snapshot
+                                  into <dir>
     read     <dir> <out.json>     load <dir>/graph.ison with the mismatch mode
-                                  set to ERROR and dump what it found
+                                  set to ERROR and dump what it found, plus
+                                  where the embeddings came from (the load
+                                  report: source snapshot/json/none and the
+                                  reason a snapshot was skipped)
     mismatch <dir>                load a graph edited after the save and exit 0
                                   only if the port raised its mismatch error
 
@@ -20,13 +25,21 @@ fixture, and then has every port read every port's output (a full writers x
 readers matrix). For each pair it judges the observation the reader produced:
 
   * the sidecar digest verified (the load did not raise in ERROR mode);
+  * the embeddings came from the binary snapshot (load source "snapshot"), so
+    every reader accepts the snapshot of every writer, itself included;
   * node and edge counts, every node's properties, every edge's properties;
   * every stored embedding equals the reader's own MockEncoder(text) within 1e-6;
   * a text search finds the expected node for three different queries.
 
 A second matrix tampers with one property in each written graph file (age 30
-becomes 31) and requires every reader to raise its graph/embeddings mismatch
-error rather than load the stale vectors.
+becomes 31; the snapshot is left in place) and requires every reader to raise
+its graph/embeddings mismatch error rather than load the stale vectors, from
+the snapshot or from the sidecar.
+
+A third matrix deletes the snapshot from a copy of each written directory and
+requires every reader to load it through the JSON sidecar (load source "json")
+and to see the same thing as the snapshot load: the same nodes, edges, number of
+embeddings, vectors check and search results.
 
 Allowances, each visible in the output rather than silent:
 
@@ -68,6 +81,7 @@ DROPS_NULLS = {"cs", "cpp"}
 KNOWN_SKIPS: dict = {}
 
 TOLERANCE = 1e-6
+SNAPSHOT_NAME = "graph.ison.embeddings.snap"
 
 # What every helper writes. Keep in step with graph_py.py and friends.
 BS = chr(92)
@@ -213,9 +227,13 @@ def props_problem(expected, actual, drops_nulls):
     return None
 
 
-def judge(writer, reader, obs):
+def judge(writer, reader, obs, source="snapshot"):
     """Return a list of problems with what `reader` loaded from `writer`'s files."""
     problems = []
+    if obs.get("source") != source:
+        why = obs.get("snapshot_skipped")
+        problems.append(f"embeddings came from {obs.get('source')!r}, expected {source!r}"
+                        + (f" (snapshot skipped: {why})" if why else ""))
     strict_ids = writer in TYPED_IDS and reader in TYPED_IDS
     drops_nulls = reader in DROPS_NULLS
 
@@ -274,6 +292,31 @@ def judge(writer, reader, obs):
         top = key_of(found["top"]) if found and found["top"] else None
         if top != expected:
             problems.append(f"search {query[:24]!r} found {top}, expected {expected}")
+    return problems
+
+
+def same_observation(snap, js):
+    """Problems if the JSON-path observation differs from the snapshot-path one."""
+    problems = []
+    # Iteration order is not part of the contract (Rust walks hash maps), so
+    # compare nodes and edges as sets.
+    def canon(items):
+        return sorted(json.dumps(item, sort_keys=True, ensure_ascii=False) for item in items)
+
+    for key in ("nodes", "edges", "missing_embeddings"):
+        if canon(snap[key]) != canon(js[key]):
+            problems.append(f"{key} differ between the snapshot load and the JSON load")
+    if snap["embedding_count"] != js["embedding_count"]:
+        problems.append(f"embedding count differs: snapshot {snap['embedding_count']}, "
+                        f"json {js['embedding_count']}")
+    if abs(snap["max_vec_diff"] - js["max_vec_diff"]) > TOLERANCE:
+        problems.append(f"vectors check differs: snapshot {snap['max_vec_diff']:.3g}, "
+                        f"json {js['max_vec_diff']:.3g}")
+    for a, b in zip(snap["searches"], js["searches"]):
+        if a["top"] != b["top"] or (a["score"] is not None and b["score"] is not None
+                                    and abs(a["score"] - b["score"]) > TOLERANCE):
+            problems.append(f"search {a['query'][:24]!r} differs: snapshot {a['top']} "
+                            f"{a['score']}, json {b['top']} {b['score']}")
     return problems
 
 
@@ -342,7 +385,7 @@ def execute(ports, wd):
         print("\n".join(failures), file=sys.stderr)
         return 2
 
-    written, tampered, problems = {}, {}, []
+    written, tampered, nosnap, problems = {}, {}, {}, []
     for writer in ports:
         out = wd / "graphs" / writer
         code, output = run(helpers[writer] + ["write", out], check=False)
@@ -350,33 +393,60 @@ def execute(ports, wd):
                 not (out / "graph.ison.embeddings.json").exists():
             problems.append(f"{LABEL[writer]} could not write the fixture graph (exit {code}): {output.strip()}")
             continue
+        if not (out / SNAPSHOT_NAME).exists():
+            problems.append(f"{LABEL[writer]} wrote no binary snapshot ({SNAPSHOT_NAME}) "
+                            f"although it was asked to")
+            continue
         written[writer] = out
         tampered[writer] = wd / "tampered" / writer
         tamper(out, tampered[writer])
+        nosnap[writer] = wd / "nosnap" / writer
+        shutil.copytree(out, nosnap[writer])
+        (nosnap[writer] / SNAPSHOT_NAME).unlink()
 
-    roundtrip, detect, details = {}, {}, []
+    roundtrip, detect, fallback, details = {}, {}, {}, []
     for writer in ports:
         for reader in ports:
             pair = (writer, reader)
             skip = KNOWN_SKIPS.get(pair)
             if skip:
-                roundtrip[pair] = detect[pair] = "SKIP"
+                roundtrip[pair] = detect[pair] = fallback[pair] = "SKIP"
                 details.append(f"SKIP {LABEL[writer]} -> {LABEL[reader]}: {skip}")
                 continue
             if writer not in written:
-                roundtrip[pair] = detect[pair] = "FAIL"
+                roundtrip[pair] = detect[pair] = fallback[pair] = "FAIL"
                 continue
 
             obs_path = wd / "obs" / f"{writer}_{reader}.json"
             obs_path.parent.mkdir(parents=True, exist_ok=True)
             code, output = run(helpers[reader] + ["read", written[writer], obs_path], check=False)
+            snap_obs = None
             if code != 0 or not obs_path.exists():
                 roundtrip[pair] = "FAIL"
                 details.append(f"FAIL {LABEL[writer]} -> {LABEL[reader]} (load): exit {code}: {output.strip()}")
             else:
-                found = judge(writer, reader, json.loads(obs_path.read_text(encoding="utf-8")))
+                snap_obs = json.loads(obs_path.read_text(encoding="utf-8"))
+                found = judge(writer, reader, snap_obs)
                 roundtrip[pair] = "FAIL" if found else "PASS"
                 details.extend(f"FAIL {LABEL[writer]} -> {LABEL[reader]}: {p}" for p in found)
+
+            # The same graph with the snapshot deleted: the JSON path, same answer.
+            json_path = wd / "obs" / f"{writer}_{reader}_nosnap.json"
+            code, output = run(helpers[reader] + ["read", nosnap[writer], json_path], check=False)
+            if code != 0 or not json_path.exists():
+                fallback[pair] = "FAIL"
+                details.append(f"FAIL {LABEL[writer]} -> {LABEL[reader]} (no snapshot): "
+                               f"exit {code}: {output.strip()}")
+            else:
+                json_obs = json.loads(json_path.read_text(encoding="utf-8"))
+                found = judge(writer, reader, json_obs, source="json")
+                if snap_obs is not None:
+                    found += same_observation(snap_obs, json_obs)
+                else:
+                    found.append("no snapshot observation to compare with")
+                fallback[pair] = "FAIL" if found else "PASS"
+                details.extend(f"FAIL {LABEL[writer]} -> {LABEL[reader]} (no snapshot): {p}"
+                               for p in found)
 
             code, output = run(helpers[reader] + ["mismatch", tampered[writer]], check=False)
             detect[pair] = "PASS" if code == 0 else "FAIL"
@@ -384,20 +454,25 @@ def execute(ports, wd):
                 details.append(f"FAIL {LABEL[writer]} -> {LABEL[reader]} (tampered file): {output.strip()}")
 
     print()
-    print(table("Round trip: reader loads the writer's graph + sidecar in ERROR mode and "
-                "everything matches", ports, roundtrip))
+    print(table("Round trip: reader loads the writer's graph + snapshot in ERROR mode (source "
+                "must be 'snapshot') and everything matches", ports, roundtrip))
     print()
-    print(table("Tamper: reader must RAISE its mismatch error for an edited graph file", ports, detect))
+    print(table("Tamper: reader must RAISE its mismatch error for an edited graph file "
+                "(stale snapshot present)", ports, detect))
+    print()
+    print(table("No snapshot: reader loads a copy without the .snap through the JSON sidecar "
+                "(source must be 'json') and sees the same as the snapshot load", ports, fallback))
     print()
     for line in problems + details:
         print(line)
     if problems or details:
         print()
 
-    failed = problems or any(v == "FAIL" for v in list(roundtrip.values()) + list(detect.values()))
-    cells = len(roundtrip) + len(detect)
-    passed = sum(v == "PASS" for v in list(roundtrip.values()) + list(detect.values()))
-    skipped = sum(v == "SKIP" for v in list(roundtrip.values()) + list(detect.values()))
+    results = list(roundtrip.values()) + list(detect.values()) + list(fallback.values())
+    failed = problems or any(v == "FAIL" for v in results)
+    cells = len(results)
+    passed = sum(v == "PASS" for v in results)
+    skipped = sum(v == "SKIP" for v in results)
     print(f"{'FAIL' if failed else 'PASS'}: {passed}/{cells} checks passed"
           f"{f', {skipped} skipped' if skipped else ''} in {time.time() - start:.1f}s")
     return 1 if failed else 0

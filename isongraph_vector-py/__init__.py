@@ -46,6 +46,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import struct
+import sys
 import hashlib
 import heapq
 import json
@@ -57,6 +58,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import warnings
+from array import array
 from collections import deque
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -87,8 +89,7 @@ VEC_TABLE = "vec_embeddings"
 
 # Approximate (IVF) index policy; see EmbeddingStore._ann_index.
 _ANN_MIN_SIZE = 50_000          # below this the exact scan is used
-_ANN_FOLD_MIN = 512             # fold pending rows into cells at >= this many ...
-_ANN_FOLD_FRACTION = 0.02       # ... and at least this fraction of the indexed rows
+_ANN_FOLD_BATCH = 256           # a write that leaves this many rows pending folds them into cells
 _ANN_RETRAIN_FRACTION = 0.5     # retrain once writes+deletes exceed this x trained size
 
 __version__ = "1.0.0"
@@ -219,6 +220,322 @@ def graph_digest(graph: ISONGraph) -> str:
     body = '{"directed":%s,"edges":[%s],"nodes":[%s]}' % (
         'true' if graph.directed else 'false', ','.join(edges), ','.join(nodes))
     return "sha256:" + hashlib.sha256(body.encode('utf-8')).hexdigest()
+
+
+# =============================================================================
+# Binary snapshot (optional, beside the JSON sidecar)
+# =============================================================================
+
+#: Suffix appended to a graph path to locate its binary snapshot.
+SNAPSHOT_SUFFIX = ".embeddings.snap"
+SNAPSHOT_VERSION = 1
+
+_SNAP_MAGIC = b"ISONVSNP"
+_SNAP_BLOCK_ROWS = 1024
+_SNAP_ABSENT = 0xFFFFFFFF
+_SNAP_FLAG_SIDECAR = 1
+_SNAP_TRAILER = 32
+_FP_EDGE = 64 * 1024
+_FP_PROBE = 4 * 1024
+_FP_PROBES = 64
+_U32 = struct.Struct('<I')
+_U64 = struct.Struct('<Q')
+
+
+class SnapshotError(EmbeddingError):
+    """A snapshot could not be written, or is not a valid snapshot of the right identity."""
+
+
+@dataclass
+class LoadReport:
+    """
+    Where a load's embeddings came from (see :meth:`SemanticGraph.load_with_report`).
+
+    ``source`` is ``"snapshot"`` (the binary snapshot was valid and used),
+    ``"json"`` (the JSON sidecar was read) or ``"none"`` (nothing was
+    restored: embeddings off, or no sidecar). ``snapshot_skipped`` says why a
+    snapshot that exists was not used, else None. ``embeddings`` is how many
+    rows the store holds after the load; ``seconds`` the wall time of the
+    whole load.
+    """
+    source: str
+    snapshot_skipped: Optional[str]
+    embeddings: int
+    seconds: float
+
+
+@dataclass
+class SnapshotInfo:
+    """The header of a snapshot, and its size in bytes."""
+    version: int
+    dimension: int
+    count: int
+    graph_digest: Optional[str]
+    graph_digest_basis: Optional[str]
+    encoder_model: Optional[str]
+    encoder_version: Optional[str]
+    sidecar_len: Optional[int]
+    sidecar_fingerprint: Optional[bytes]
+    bytes: int
+
+
+def snapshot_path_for(path: Union[str, FilePath]) -> FilePath:
+    """``<graph path>.embeddings.snap``."""
+    return FilePath(str(path) + SNAPSHOT_SUFFIX)
+
+
+def sidecar_identity(path: Union[str, FilePath]) -> Tuple[int, bytes]:
+    """
+    ``(length, fingerprint)`` of a sidecar file, as a snapshot records it.
+
+    The fingerprint is SHA-256 over the length (u64 LE), the first and last
+    64 KiB, and 64 probes of 4 KiB at ``floor(len * i / 65)`` (each clipped to
+    the end of the file).
+    """
+    with open(path, 'rb') as handle:
+        length = os.fstat(handle.fileno()).st_size
+        digest = hashlib.sha256()
+        digest.update(_U64.pack(length))
+
+        def take(at: int, count: int) -> None:
+            count = min(count, max(0, length - at))
+            handle.seek(at)
+            data = handle.read(count)
+            if len(data) != count:
+                raise SnapshotError(f"short read of {path}")
+            digest.update(data)
+
+        take(0, _FP_EDGE)
+        take(max(0, length - _FP_EDGE), _FP_EDGE)
+        for i in range(1, _FP_PROBES + 1):
+            take(length * i // (_FP_PROBES + 1), _FP_PROBE)
+        return length, digest.digest()
+
+
+def _atomic_write_stream(path: Union[str, FilePath], fill: Callable[[Any], Any]) -> Any:
+    """
+    Run ``fill(handle)`` against a temp file beside ``path``, flush it to disk
+    and rename it over ``path``; a failure removes the temp file and leaves
+    ``path`` as it was. Returns whatever ``fill`` returns.
+    """
+    path = FilePath(path)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        with open(tmp, 'wb') as handle:
+            value = fill(handle)
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:  # pragma: no cover - fsync unsupported on this fs
+                pass
+        os.replace(tmp, path)
+        return value
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _snap_str(text: str) -> bytes:
+    try:
+        raw = text.encode('utf-8')
+    except UnicodeEncodeError as exc:       # a lone surrogate: JSON can carry it, UTF-8 cannot
+        raise SnapshotError(f"a text cannot be stored as UTF-8: {exc}") from exc
+    return _U32.pack(len(raw)) + raw
+
+
+def _snap_opt(text: Optional[str]) -> bytes:
+    return _U32.pack(_SNAP_ABSENT) if text is None else _snap_str(text)
+
+
+class _StagedSnapshot:
+    """A verified snapshot's rows, held apart until they are installed."""
+
+    __slots__ = ('info', 'models', 'types', 'ids', 'texts', 'model_ix', 'matrix', 'vectors')
+
+    def __init__(self, info: SnapshotInfo):
+        self.info = info
+        self.models: List[str] = []
+        self.types: List[str] = []
+        self.ids: List[str] = []
+        self.texts: List[str] = []
+        self.model_ix: List[int] = []
+        self.matrix = None          # numpy: (capacity, dim) float32, first ``count`` rows used
+        self.vectors: Optional[List[Any]] = None    # no numpy: one array('f') per row
+
+
+def _read_snapshot(path: Union[str, FilePath],
+                   accept: Optional[Callable[[SnapshotInfo], None]] = None) -> _StagedSnapshot:
+    """
+    Read and fully verify the snapshot at ``path``.
+
+    ``accept`` sees the header first and raises :class:`SnapshotError` to
+    refuse the file before its body is read. Every rule of the layout is
+    checked (lengths, model indexes, repeated keys, leftover bytes, the
+    trailing checksum); any failure raises :class:`SnapshotError` and nothing
+    has been installed anywhere.
+    """
+    import mmap
+
+    def bad(message: str) -> SnapshotError:
+        return SnapshotError(message)
+
+    try:
+        handle = open(path, 'rb')
+    except OSError as exc:
+        raise bad(f"cannot open the snapshot {path}: {exc}") from exc
+    mapped = None
+    try:
+        size = os.fstat(handle.fileno()).st_size
+        if size < _SNAP_TRAILER + len(_SNAP_MAGIC):
+            raise bad("file too short")
+        try:
+            mapped = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)
+            buf = mapped
+        except (OSError, ValueError):                # pragma: no cover - mmap unavailable
+            buf = handle.read()
+        end = size - _SNAP_TRAILER                   # first byte of the trailer
+        pos = 0
+
+        def need(count: int) -> None:
+            if count < 0 or pos + count > end:
+                raise bad("truncated")
+
+        def u32() -> int:
+            nonlocal pos
+            need(4)
+            value = _U32.unpack_from(buf, pos)[0]
+            pos += 4
+            return value
+
+        def u64() -> int:
+            nonlocal pos
+            need(8)
+            value = _U64.unpack_from(buf, pos)[0]
+            pos += 8
+            return value
+
+        def string(optional: bool) -> Optional[str]:
+            nonlocal pos
+            length = u32()
+            if length == _SNAP_ABSENT:
+                if optional:
+                    return None
+                raise bad("a required string is marked absent")
+            if length > end - pos:
+                raise bad("a string is longer than the file")
+            raw = buf[pos:pos + length]
+            pos += length
+            try:
+                return raw.decode('utf-8')
+            except UnicodeDecodeError:
+                raise bad("a string is not UTF-8") from None
+
+        if buf[0:8] != _SNAP_MAGIC:
+            raise bad("not a snapshot (bad magic)")
+        pos = 8
+        version = u32()
+        if version != SNAPSHOT_VERSION:
+            raise bad(f"unsupported snapshot version {version} (this build reads {SNAPSHOT_VERSION})")
+        flags = u32()
+        if flags & ~_SNAP_FLAG_SIDECAR:
+            raise bad(f"unknown flags {flags:#x}")
+        dim = u32()
+        block_rows = u32()
+        count = u64()
+        if block_rows == 0 or block_rows > 1 << 20:
+            raise bad(f"implausible block size {block_rows}")
+        if count > 0xFFFFFFFF or (count > 0 and dim == 0):
+            raise bad(f"implausible shape {count} x {dim}")
+        if count * dim * 4 > end - pos:
+            raise bad("fewer bytes than the rows need")
+        graph_digest_text = string(True)
+        basis = string(True)
+        encoder_model = string(True)
+        encoder_version = string(True)
+        side_len = side_print = None
+        if flags & _SNAP_FLAG_SIDECAR:
+            side_len = u64()
+            need(32)
+            side_print = bytes(buf[pos:pos + 32])
+            pos += 32
+        model_count = u32()
+        if model_count > (end - pos) // 4:
+            raise bad("more models than the file can hold")
+        models = [string(False) for _ in range(model_count)]
+        info = SnapshotInfo(
+            version=version, dimension=dim, count=count, graph_digest=graph_digest_text,
+            graph_digest_basis=basis, encoder_model=encoder_model,
+            encoder_version=encoder_version, sidecar_len=side_len,
+            sidecar_fingerprint=side_print, bytes=size)
+        if accept is not None:
+            accept(info)
+
+        stage = _StagedSnapshot(info)
+        stage.models = models
+        capacity = count + count // 32 + 16
+        if _np is not None:
+            stage.matrix = _np.empty((capacity, dim), dtype=_np.float32) if count else None
+        else:
+            stage.vectors = []
+        seen = set()
+        left = count
+        filled = 0
+        while left > 0:
+            rows = min(left, block_rows)
+            for _ in range(rows):
+                ty = string(False)
+                ident = string(False)
+                text = string(False)
+                model = u32()
+                if model >= len(models):
+                    raise bad("a row names a model that is not listed")
+                key = ty + ":" + ident
+                if key in seen:
+                    raise bad(f"the key {key} appears twice")
+                seen.add(key)
+                stage.types.append(sys.intern(ty))
+                stage.ids.append(ident)
+                stage.texts.append(text)
+                stage.model_ix.append(model)
+            nbytes = rows * dim * 4
+            need(nbytes)
+            if _np is not None:
+                block = _np.frombuffer(buf, dtype='<f4', count=rows * dim, offset=pos)
+                stage.matrix[filled:filled + rows] = block.reshape(rows, dim)
+                del block                                  # release the mapping
+            else:
+                for r in range(rows):
+                    vec = array('f')
+                    vec.frombytes(buf[pos + r * dim * 4:pos + (r + 1) * dim * 4])
+                    if sys.byteorder == 'big':     # pragma: no cover - LE hosts only in CI
+                        vec.byteswap()
+                    stage.vectors.append(vec)
+            pos += nbytes
+            filled += rows
+            left -= rows
+        if pos != end:
+            raise bad("bytes left over after the last block")
+        digest = hashlib.sha256()
+        step = 1 << 24
+        view = memoryview(buf)
+        try:
+            for start in range(0, end, step):
+                digest.update(view[start:min(end, start + step)])
+        finally:
+            view.release()
+        if digest.digest() != bytes(buf[end:end + _SNAP_TRAILER]):
+            raise bad("checksum mismatch")
+        return stage
+    finally:
+        if mapped is not None:
+            try:
+                mapped.close()
+            except BufferError:                       # pragma: no cover - a view outlived us
+                pass
+        handle.close()
 
 
 # =============================================================================
@@ -660,27 +977,32 @@ class SimilarityResult:
 
 class _ScanCache:
     """
-    Decoded, incrementally maintained snapshot of the whole table.
+    The one in-memory copy of every stored vector, plus what a scan needs.
 
-    Every search reads every row (brute force), so decoding blobs and, with
-    numpy, stacking them into one matrix pays for itself immediately on the
-    second query: the per-query cost drops from a Python loop over N x d
-    floats to a single matrix-vector product.
-
-    With numpy the snapshot is one C-contiguous float32 matrix with spare row
-    capacity, the vector norms, a type code per row and a liveness flag. Writes
-    patch it in place instead of invalidating it: an insert appends a row, an
-    update overwrites one, a delete tombstones one (compacted once a quarter
-    of the rows are dead). Rows stay in insertion order, which is the order
-    the table's rowids give, so ties break exactly as a rebuild would.
+    Every search reads every row (brute force), so the vectors live in one
+    place laid out for that: with numpy a single C-contiguous float32 matrix
+    with spare row capacity, the vector norms, a type code per row and a
+    liveness flag. Writes patch it in place instead of rebuilding it: an
+    insert appends a row, an update overwrites one, a delete tombstones one
+    (compacted once a quarter of the rows are dead). Rows stay in insertion
+    order, which is the order the table's rowids give, so ties break exactly as
+    a rebuild would.
 
     ``n`` counts used rows including tombstones, ``dead`` the tombstones.
-    Without numpy (or with ragged vector lengths) ``matrix`` is None and
-    ``vectors``/``types`` hold plain lists; that form is rebuilt, not patched.
+    Without numpy (or with ragged vector lengths) ``matrix`` is None and the
+    rows are plain Python data: ``vectors`` holds one compact ``array('f')`` per
+    row (None for a tombstone), ``pnorms`` the matching double-precision
+    norms. Either form is patched in place.
+
+    For an in-memory store this object *is* the table (see
+    :meth:`EmbeddingStore._table_mode`): ``models`` then holds each row's model
+    name too. For a file-backed store SQLite is the durable copy and this is
+    decoded from it on first use.
     """
 
     __slots__ = ('refs', 'types', 'texts', 'vectors', 'matrix', 'norms',
-                 'n', 'dead', 'alive', 'codes', 'code_of', 'pos', 'ivf')
+                 'n', 'dead', 'alive', 'codes', 'code_of', 'pos', 'ivf',
+                 'models', 'pnorms')
 
     def __init__(self, refs, types, texts, vectors, matrix, norms):
         self.refs = refs
@@ -696,6 +1018,8 @@ class _ScanCache:
         self.code_of = None
         self.pos = None
         self.ivf = None          # optional approximate index (see _IVFIndex)
+        self.models = None       # per-row model name (in-memory stores only)
+        self.pnorms = None       # per-row norm, list form only
 
 
 def _is_number(value: Any) -> bool:
@@ -728,8 +1052,12 @@ class _IVFIndex:
     * a **new** or **updated** row is *pending*: it has no cell (``assign``
       is -1) and every query scores the pending rows exactly, so a write is
       visible immediately and costs the index nothing;
-    * pending rows are folded into their nearest cell in one matrix product
-      once there are enough of them (see ``EmbeddingStore._ann_index``);
+    * pending rows are folded into their nearest cell in one matrix product as
+      soon as ``_ANN_FOLD_BATCH`` of them have piled up, by the write that
+      reaches that number, so a search never waits for a fold; a fold of rows
+      that were never listed before splices them into the cell lists (one pass
+      over ``order``), and only a fold that includes an updated or slot-reusing
+      row regroups everything;
     * a **delete** just clears the row's cell (the cache has already
       tombstoned it); stale entries in ``order`` are skipped at query time;
     * the cache's compaction remaps row numbers, and :meth:`compact` carries
@@ -742,7 +1070,7 @@ class _IVFIndex:
     """
 
     __slots__ = ('centroids', 'nlist', 'assign', 'order', 'offsets',
-                 'pending', 'churn', 'trained_n', 'build_seconds')
+                 'pending', 'churn', 'trained_n', 'build_seconds', 'listed')
 
     def __init__(self, centroids, assign, trained_n, build_seconds):
         self.centroids = centroids
@@ -750,6 +1078,7 @@ class _IVFIndex:
         self.assign = assign                  # int32 per row slot, -1 = not in a cell
         self.order = None
         self.offsets = None
+        self.listed = None                    # bool per slot: has an entry in ``order``
         self.pending = set()                  # live rows with no cell yet
         self.churn = 0
         self.trained_n = trained_n
@@ -825,15 +1154,39 @@ class _IVFIndex:
         self.order = rows[_np.argsort(picked, kind='stable')].astype(_np.int32)
         counts = _np.bincount(picked, minlength=self.nlist)
         self.offsets = _np.concatenate(([0], _np.cumsum(counts)))
+        if self.listed is None or self.listed.shape[0] != self.assign.shape[0]:
+            self.listed = _np.zeros(self.assign.shape[0], dtype=bool)
+        else:
+            self.listed[:] = False
+        self.listed[self.order] = True
 
     def fold(self, cache) -> None:
-        """Give every pending row its nearest cell and regroup."""
-        if self.pending:
-            ids = _np.fromiter(sorted(self.pending), dtype=_np.int64, count=len(self.pending))
-            self.assign[ids] = self._nearest(
-                self._unit(cache.matrix[ids], cache.norms[ids]), self.centroids)
-            self.pending.clear()
-        self.relist(cache.n)
+        """Give every pending row its nearest cell.
+
+        Rows that have no entry in ``order`` yet (new rows, the normal case)
+        are spliced into their cells' runs in one pass; if any pending row
+        still has a stale entry from an earlier life (an update, a reused
+        slot), everything is regrouped so no row is ever listed twice.
+        """
+        if not self.pending:
+            if self.order is None:
+                self.relist(cache.n)
+            return
+        ids = _np.fromiter(sorted(self.pending), dtype=_np.int64, count=len(self.pending))
+        cells = self._nearest(
+            self._unit(cache.matrix[ids], cache.norms[ids]), self.centroids)
+        self.assign[ids] = cells
+        self.pending.clear()
+        if self.order is None or self.listed[ids].any():
+            self.relist(cache.n)
+            return
+        by_cell = _np.lexsort((ids, cells))
+        ids, cells = ids[by_cell], cells[by_cell]
+        # each new row goes at the end of its cell's run (rows ascend within a run)
+        self.order = _np.insert(self.order, self.offsets[cells + 1], ids.astype(_np.int32))
+        counts = _np.bincount(cells, minlength=self.nlist)
+        self.offsets = self.offsets + _np.concatenate(([0], _np.cumsum(counts)))
+        self.listed[ids] = True
 
     # -- incremental upkeep ---------------------------------------------------
 
@@ -842,6 +1195,10 @@ class _IVFIndex:
             grown = _np.full(max(capacity, i + 1), -1, dtype=_np.int32)
             grown[:self.assign.shape[0]] = self.assign
             self.assign = grown
+            listed = _np.zeros(grown.shape[0], dtype=bool)
+            if self.listed is not None:
+                listed[:self.listed.shape[0]] = self.listed
+            self.listed = listed
         self.assign[i] = -1
         self.pending.add(i)
         self.churn += 1
@@ -865,7 +1222,7 @@ class _IVFIndex:
     def nbytes(self) -> int:
         total = self.centroids.nbytes + self.assign.nbytes
         if self.order is not None:
-            total += self.order.nbytes + self.offsets.nbytes
+            total += self.order.nbytes + self.offsets.nbytes + self.listed.nbytes
         return total
 
 
@@ -894,7 +1251,14 @@ class RecallReport:
 
 class EmbeddingStore:
     """
-    SQLite-backed embedding storage with similarity search.
+    Embedding storage with similarity search; SQLite-backed when it has to be.
+
+    Every vector lives in one place in memory: the scan cache's float32 matrix
+    (a plain per-row ``array('f')`` without numpy). A store opened on a file
+    (``db_path``) or with ``sqlite_vec=True`` also writes each row to SQLite,
+    which is the durable copy (and vec0's index); a store on ``":memory:"``,
+    the default, has nothing to persist and keeps its rows only in the cache,
+    without a SQLite table at all.
 
     Brute-force cosine similarity, vectorized through numpy when it is
     installed and falling back to a pure-Python loop when it is not. Search
@@ -1020,13 +1384,30 @@ class EmbeddingStore:
         self._cache: Optional[_ScanCache] = None
         self._sqlite_vec = sqlite_vec
         self._vec_ready = False
-        with self._lock:
-            self._get_conn()
-        if self._dimension is None:
-            self._adopt_stored_dimension()
-        if self._sqlite_vec and self._dimension is not None:
+        #: Whether SQLite holds the rows. A store that is neither file-backed
+        #: nor sqlite-vec has nothing to persist, so its only copy of the data
+        #: is the :class:`_ScanCache` (see :meth:`_table_mode`).
+        self._sql = bool(sqlite_vec) or not self._is_memory_path(self.db_path)
+        #: Rescore the bounded exact search with the canonical kernel (see
+        #: :meth:`_finish_exact`). False restores the raw BLAS scores.
+        self._rescore = True
+        self._model_names: Dict[str, str] = {}
+        if self._sql:
             with self._lock:
-                self._ensure_vec_table(self._dimension)
+                self._get_conn()
+            if self._dimension is None:
+                self._adopt_stored_dimension()
+            if self._sqlite_vec and self._dimension is not None:
+                with self._lock:
+                    self._ensure_vec_table(self._dimension)
+        else:
+            self._models_cache = {}
+
+    @staticmethod
+    def _is_memory_path(db_path: str) -> bool:
+        """Whether ``db_path`` names a private in-memory SQLite database."""
+        return (db_path in ("", ":memory:") or db_path.startswith("file::memory:")
+                or "mode=memory" in db_path)
 
     @property
     def sqlite_vec(self) -> bool:
@@ -1051,6 +1432,31 @@ class EmbeddingStore:
         self._ann_nprobe = value
 
     @property
+    def canonical_scores(self) -> bool:
+        """
+        Whether bounded exact searches return canonical scores (default True).
+
+        BLAS sums a row's products in an order that depends on where the row
+        sits in the matrix and on the shape of the call, so the same vector can
+        score a few float32 ulps differently after a compaction, or in a batch.
+        With ``canonical_scores`` on, an exact top-k search (and
+        :meth:`similarity_search_batch`) uses BLAS only to find the candidate
+        rows and scores those with a kernel whose result for a (row, query) pair
+        depends on nothing else, so every score is reproducible and a batch
+        answer is bit-identical to the one-query answer. Turn it off for the raw
+        BLAS scores of earlier releases (batches then answer query by query).
+        The approximate index ranks the rows it probed the same way, so a score
+        it returns is the very number an exact search gives that row.
+        :meth:`score_map` and the lazily ranked stream behind ``node_filter``
+        searches always return raw BLAS scores.
+        """
+        return self._rescore
+
+    @canonical_scores.setter
+    def canonical_scores(self, value: bool) -> None:
+        self._rescore = bool(value)
+
+    @property
     def version(self) -> Optional[str]:
         """Encoder/model version recorded in the sidecar, or None if unknown."""
         if self._version is not None:
@@ -1066,10 +1472,20 @@ class EmbeddingStore:
 
         Writes patch the caches in place (see :class:`_ScanCache`); this is
         the fallback for the ones that cannot, and for a write that failed
-        part-way and left the derived state unknown.
+        part-way and left the derived state unknown. An in-memory store has
+        nothing to rebuild the scan cache from, so only the model counts are
+        dropped there (a write validates and converts the vector before it
+        changes anything, so a failure leaves the cache whole).
         """
-        self._cache = None
-        self._models_cache = None
+        if self._sql:
+            self._cache = None
+            self._models_cache = None
+        else:
+            self._models_cache = None
+
+    def _table_mode(self) -> bool:
+        """True when the scan cache is the only copy of the rows (no SQLite)."""
+        return not self._sql
 
     def _models_adjust(self, old: Optional[str], new: Optional[str]) -> None:
         """Move one row between model buckets in the cached ``models()`` counts."""
@@ -1310,10 +1726,19 @@ class EmbeddingStore:
         """
         with self._lock:
             if self._models_cache is None:
-                rows = self._get_conn().execute(
-                    "SELECT model, COUNT(*) AS n FROM embeddings GROUP BY model"
-                ).fetchall()
-                self._models_cache = {row['model']: row['n'] for row in rows}
+                if self._sql:
+                    rows = self._get_conn().execute(
+                        "SELECT model, COUNT(*) AS n FROM embeddings GROUP BY model"
+                    ).fetchall()
+                    self._models_cache = {row['model']: row['n'] for row in rows}
+                else:
+                    counts: Dict[str, int] = {}
+                    cache = self._cache
+                    if cache is not None:
+                        for ref, model in zip(cache.refs, cache.models):
+                            if ref is not None:
+                                counts[model] = counts.get(model, 0) + 1
+                    self._models_cache = counts
             return dict(self._models_cache)
 
     def _current_model(self) -> Optional[str]:
@@ -1368,6 +1793,24 @@ class EmbeddingStore:
             except (AttributeError, TypeError):
                 dimension = None
         with self._lock:
+            if not self._sql:
+                cache = self._cache
+                out = []
+                if cache is None:
+                    return out
+                # every row of an in-memory store has the store's one width
+                width = self._dimension
+                for ref, row_model in zip(cache.refs, cache.models):
+                    if ref is None:
+                        continue
+                    by_model = (
+                        model is not None and row_model != model
+                        and (include_unknown or row_model not in UNKNOWN_MODELS)
+                    )
+                    by_dim = dimension is not None and width != dimension
+                    if by_model or by_dim:
+                        out.append(ref)
+                return out
             rows = self._get_conn().execute("""
                 SELECT node_type, node_id, node_id_type, model, LENGTH(vector) AS n
                 FROM embeddings ORDER BY rowid
@@ -1397,13 +1840,15 @@ class EmbeddingStore:
 
     def _write_row(
         self,
-        conn: sqlite3.Connection,
+        conn: Optional[sqlite3.Connection],
         node_ref: NodeRef,
         vector: Sequence[float],
         text: str,
         model: str,
-        node_id_type: Optional[str] = None
-    ) -> str:
+        node_id_type: Optional[str] = None,
+        blob: Optional[bytes] = None,
+        want_id: bool = True
+    ) -> Optional[str]:
         """
         Insert or update one embedding, keeping the vec0 index in step.
 
@@ -1413,10 +1858,21 @@ class EmbeddingStore:
         of (node_type, node_id), so a conflict on one implies a conflict on the
         other and this single conflict target catches both.
 
+        An in-memory store (``conn`` is None) has no table: the row goes straight
+        into the scan cache, after the vector has been converted, so a bad
+        vector fails before anything changes.
+
         Caller holds the lock and commits.
         """
+        if blob is None:
+            blob = self._vector_to_bytes(vector)
+        if conn is None:
+            id_type = node_id_type or self._node_id_type(node_ref[1])
+            old_model = self._cache_put(node_ref, id_type, blob, text, model)
+            if self._models_cache is not None:
+                self._models_adjust(old_model, model)
+            return self._embedding_id(node_ref) if want_id else None
         emb_id = self._embedding_id(node_ref)
-        blob = self._vector_to_bytes(vector)
         old_model = None
         if self._models_cache is not None:
             previous = conn.execute(
@@ -1455,7 +1911,7 @@ class EmbeddingStore:
 
         # Patch what is derived from the table rather than dropping it.
         self._models_adjust(old_model, model)
-        self._cache_put(node_ref, node_id_type or self._node_id_type(node_ref[1]), blob, text)
+        self._cache_put(node_ref, node_id_type or self._node_id_type(node_ref[1]), blob, text, model)
         return emb_id
 
     def add(
@@ -1484,10 +1940,11 @@ class EmbeddingStore:
                 vector = self._encode(text)
             self._check_dimension(vector, "vector")
 
-            conn = self._get_conn()
+            conn = self._get_conn() if self._sql else None
             try:
                 emb_id = self._write_row(conn, node_ref, vector, text, self._model_name())
-                conn.commit()
+                if conn is not None:
+                    conn.commit()
             except BaseException:
                 self._invalidate()
                 raise
@@ -1533,11 +1990,13 @@ class EmbeddingStore:
             for ref, text, vector in items:
                 self._check_dimension(vector, "vector")
 
-            conn = self._get_conn()
+            conn = self._get_conn() if self._sql else None
             try:
+                self._cache_reserve(len(items))
                 for ref, text, vector in items:
-                    self._write_row(conn, ref, vector, text, model)
-                conn.commit()
+                    self._write_row(conn, ref, vector, text, model, want_id=False)
+                if conn is not None:
+                    conn.commit()
             except BaseException:
                 self._invalidate()
                 raise
@@ -1550,6 +2009,12 @@ class EmbeddingStore:
     def remove(self, node_ref: NodeRef) -> bool:
         """Remove embedding for a node."""
         with self._lock:
+            if not self._sql:
+                old_model = self._cache_drop(node_ref)
+                if old_model is None:
+                    return False
+                self._models_adjust(old_model, None)
+                return True
             conn = self._get_conn()
             try:
                 row = conn.execute(
@@ -1583,12 +2048,14 @@ class EmbeddingStore:
                 vectors of the wrong length even when empty.
         """
         with self._lock:
-            conn = self._get_conn()
-            conn.execute("DELETE FROM embeddings")
-            if self._sqlite_vec and self._vec_ready:
-                conn.execute(f"DELETE FROM {VEC_TABLE}")
-            conn.commit()
-            self._invalidate()
+            if self._sql:
+                conn = self._get_conn()
+                conn.execute("DELETE FROM embeddings")
+                if self._sqlite_vec and self._vec_ready:
+                    conn.execute(f"DELETE FROM {VEC_TABLE}")
+                conn.commit()
+            self._cache = None
+            self._models_cache = None if self._sql else {}
             if reset_dimension:
                 self._reset_dimension()
 
@@ -1597,6 +2064,18 @@ class EmbeddingStore:
     def get(self, node_ref: NodeRef) -> Optional[EmbeddingRecord]:
         """Get embedding for a node."""
         with self._lock:
+            if not self._sql:
+                cache = self._cache
+                i = None if cache is None else cache.pos.get((str(node_ref[0]), str(node_ref[1])))
+                if i is None:
+                    return None
+                if cache.matrix is not None:
+                    vector = cache.matrix[i].tolist()
+                else:
+                    vector = cache.vectors[i].tolist()
+                return EmbeddingRecord(
+                    id=self._embedding_id(node_ref), node_ref=cache.refs[i], vector=vector,
+                    text=cache.texts[i], model=cache.models[i])
             row = self._get_conn().execute("""
                 SELECT id, node_type, node_id, node_id_type, vector, text, model
                 FROM embeddings
@@ -1618,6 +2097,8 @@ class EmbeddingStore:
     def count(self) -> int:
         """Count total embeddings."""
         with self._lock:
+            if not self._sql:
+                return 0 if self._cache is None else self._cache.n - self._cache.dead
             return self._get_conn().execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
 
     # -- incremental scan cache -------------------------------------------
@@ -1625,8 +2106,13 @@ class EmbeddingStore:
     _CACHE_CHUNK = 8192
 
     def _ensure_cache(self) -> _ScanCache:
-        """Build (or reuse) the decoded snapshot every search reads. Locked."""
+        """The scan cache: decoded from SQLite on first use, or (for an
+        in-memory store, where it is the table itself) created empty. Locked."""
         if self._cache is not None:
+            return self._cache
+
+        if not self._sql:
+            self._cache = self._new_cache(self._dimension)
             return self._cache
 
         cursor = self._get_conn().cursor()
@@ -1643,8 +2129,44 @@ class EmbeddingStore:
         self._cache = cache
         return cache
 
+    def _new_cache(self, width: Optional[int], capacity: int = 0) -> _ScanCache:
+        """An empty cache: numpy form when numpy is importable and the vector
+        width is known, otherwise the list form (which adopts numpy at its first
+        row, see :meth:`_cache_put`)."""
+        if _np is not None and width:
+            capacity = max(1024, capacity)
+            cache = _ScanCache([], None, [], None,
+                               _np.empty((capacity, width), dtype=_np.float32),
+                               _np.zeros(capacity, dtype=_np.float32))
+            cache.alive = _np.zeros(capacity, dtype=bool)
+            cache.codes = _np.zeros(capacity, dtype=_np.int32)
+            cache.code_of = {}
+        else:
+            cache = _ScanCache([], [], [], [], None, None)
+            cache.pnorms = []
+        cache.pos = {}
+        if not self._sql:
+            cache.models = []
+        return cache
+
+    def _cache_reserve(self, extra: int) -> None:
+        """Room for ``extra`` more rows in one allocation (a bulk write knows
+        its size, so the matrix grows once instead of step by step)."""
+        if extra <= 0 or _np is None:
+            return
+        cache = self._cache
+        if cache is None or (cache.matrix is None and cache.n == 0):
+            if not self._sql and self._dimension:
+                self._cache = self._new_cache(self._dimension, extra)
+            return
+        if cache.matrix is None:
+            return
+        need = cache.n + extra
+        if need > cache.matrix.shape[0]:
+            self._cache_grow(cache, need)
+
     def _build_numpy_cache(self, cursor, total: int) -> Optional[_ScanCache]:
-        """Stream the table into a spare-capacity float32 matrix.
+        """Stream the table into a float32 matrix with a little spare room.
 
         Returns None when the stored vectors are not all one length (the
         caller then falls back to the list form, which tolerates that).
@@ -1656,7 +2178,7 @@ class EmbeddingStore:
         if width == 0 or width % 4:
             return None
         dim = width // 4
-        capacity = total + total // 8 + 16
+        capacity = total + total // 32 + 16
         matrix = _np.empty((capacity, dim), dtype=_np.float32)
         norms = _np.zeros(capacity, dtype=_np.float32)
         codes = _np.zeros(capacity, dtype=_np.int32)
@@ -1681,6 +2203,7 @@ class EmbeddingStore:
                 if t not in code_of:
                     code_of[t] = len(code_of)
             codes[filled:filled + m] = [code_of[t] for t in types]
+            types = [sys.intern(t) for t in types]       # one str per type, not one per row
             keys = list(zip(types, ids))
             if 'int' in id_types:
                 refs.extend([(t, self._restore_node_id(i, k))
@@ -1701,15 +2224,23 @@ class EmbeddingStore:
     def _build_list_cache(self, rows) -> _ScanCache:
         """Pure-Python form: no numpy, or vectors of mixed length."""
         refs = [(r[0], self._restore_node_id(r[1], r[2])) for r in rows]
-        return _ScanCache(
-            refs, [r[0] for r in rows], [r[4] for r in rows],
-            [self._bytes_to_vector(r[3]) for r in rows], None, None)
+        vectors = []
+        for r in rows:
+            vec = array('f')
+            vec.frombytes(r[3])
+            vectors.append(vec)
+        cache = _ScanCache(
+            refs, [r[0] for r in rows], [r[4] for r in rows], vectors, None, None)
+        cache.pnorms = [sum(b * b for b in vec) ** 0.5 for vec in vectors]
+        cache.pos = {(r[0], str(r[1])): j for j, r in enumerate(refs)}
+        return cache
 
     @staticmethod
-    def _cache_grow(cache: _ScanCache) -> None:
-        """Make room for more rows: grow capacity by a quarter (min 1024)."""
+    def _cache_grow(cache: _ScanCache, at_least: int = 0) -> None:
+        """Make room for more rows: grow capacity by a quarter (min 1024),
+        or to ``at_least`` rows when a bulk write asked for more."""
         capacity, dim = cache.matrix.shape
-        new_capacity = capacity + max(1024, capacity // 4)
+        new_capacity = max(capacity + max(1024, capacity // 4), at_least)
         n = cache.n
         matrix = _np.empty((new_capacity, dim), dtype=_np.float32)
         matrix[:n] = cache.matrix[:n]
@@ -1721,21 +2252,61 @@ class EmbeddingStore:
         alive[:n] = cache.alive[:n]
         cache.matrix, cache.norms, cache.codes, cache.alive = matrix, norms, codes, alive
 
-    def _cache_put(self, node_ref: NodeRef, id_type: str, blob: bytes, text: str) -> None:
-        """Mirror one upserted row into the cache. Caller holds the lock."""
+    def _cache_put(self, node_ref: NodeRef, id_type: str, blob: bytes, text: str,
+                   model: Optional[str] = None) -> Optional[str]:
+        """Mirror one upserted row into the cache. Caller holds the lock.
+
+        For an in-memory store this *is* the write, and the return value is the
+        model the row carried before (None if it is new).
+        """
         cache = self._cache
-        if cache is None:
-            return
-        matrix = cache.matrix
-        if matrix is None or len(blob) != matrix.shape[1] * 4:
+        table = not self._sql
+        width = len(blob) // 4
+        if table:
+            if cache is None:
+                cache = self._cache = self._new_cache(width)
+            elif cache.matrix is None and cache.n == 0 and _np is not None:
+                cache = self._cache = self._new_cache(width)       # first row: adopt numpy
+            elif cache.matrix is not None and width != cache.matrix.shape[1]:
+                raise DimensionMismatchError(
+                    f"vector has {width} dimensions, store holds {cache.matrix.shape[1]}")
+        elif cache is None:
+            return None
+        elif cache.matrix is None or width != cache.matrix.shape[1]:
             self._cache = None             # list form / new width: rebuild lazily
-            return
-        node_type = str(node_ref[0])
+            return None
+        node_type = sys.intern(str(node_ref[0]))
         id_text = str(node_ref[1])
         key = (node_type, id_text)
         ref = key if id_type != 'int' else (node_type, int(id_text))
-        row = _np.frombuffer(blob, dtype=_np.float32)
+        if model is not None:
+            model = self._model_names.setdefault(model, model)      # one str per model
         i = cache.pos.get(key)
+        old_model = None
+        if cache.matrix is None:                                    # list form (in-memory only)
+            vec = array('f')
+            vec.frombytes(blob)
+            pnorm = sum(b * b for b in vec) ** 0.5
+            if i is None:
+                i = cache.n
+                cache.n = i + 1
+                cache.refs.append(ref)
+                cache.types.append(node_type)
+                cache.texts.append(text)
+                cache.vectors.append(vec)
+                cache.pnorms.append(pnorm)
+                cache.models.append(model)
+                cache.pos[key] = i
+            else:
+                old_model = cache.models[i]
+                cache.refs[i] = ref
+                cache.texts[i] = text
+                cache.vectors[i] = vec
+                cache.pnorms[i] = pnorm
+                cache.models[i] = model
+            return old_model
+        matrix = cache.matrix
+        row = _np.frombuffer(blob, dtype=_np.float32)
         if i is None:
             if cache.n >= matrix.shape[0]:
                 self._cache_grow(cache)
@@ -1744,6 +2315,8 @@ class EmbeddingStore:
             cache.n = i + 1
             cache.refs.append(ref)
             cache.texts.append(text)
+            if table:
+                cache.models.append(model)
             cache.pos[key] = i
             code = cache.code_of.get(node_type)
             if code is None:
@@ -1751,43 +2324,78 @@ class EmbeddingStore:
             cache.codes[i] = code
             cache.alive[i] = True
         else:                              # overwrite in place: keeps its position
+            if table:
+                old_model = cache.models[i]
+                cache.models[i] = model
             cache.refs[i] = ref
             cache.texts[i] = text
         matrix[i] = row
         cache.norms[i] = _np.linalg.norm(row.reshape(1, -1), axis=1)[0]
-        if cache.ivf is not None:
-            cache.ivf.note_put(i, matrix.shape[0])
+        ivf = cache.ivf
+        if ivf is not None:
+            ivf.note_put(i, matrix.shape[0])
+            if len(ivf.pending) >= _ANN_FOLD_BATCH:
+                ivf.fold(cache)            # the write that fills the batch pays for the fold
+        return old_model
 
-    def _cache_drop(self, node_ref: NodeRef) -> None:
-        """Mirror one deleted row into the cache. Caller holds the lock."""
+    def _cache_drop(self, node_ref: NodeRef) -> Optional[str]:
+        """Mirror one deleted row into the cache. Caller holds the lock.
+
+        Returns the model the row carried (in-memory stores), else None.
+        """
         cache = self._cache
         if cache is None:
-            return
-        if cache.matrix is None:
-            self._cache = None
-            return
+            return None
         i = cache.pos.pop((str(node_ref[0]), str(node_ref[1])), None)
         if i is None:
-            return
-        cache.matrix[i] = 0.0
-        cache.norms[i] = 0.0
-        cache.alive[i] = False
+            return None
+        old_model = cache.models[i] if cache.models is not None else None
+        if cache.matrix is not None:
+            cache.matrix[i] = 0.0
+            cache.norms[i] = 0.0
+            cache.alive[i] = False
+        else:
+            cache.vectors[i] = None
+            cache.types[i] = None
+            cache.pnorms[i] = 0.0
         cache.refs[i] = None
         cache.texts[i] = None
+        if cache.models is not None:
+            cache.models[i] = None
         cache.dead += 1
         if cache.ivf is not None:
             cache.ivf.note_drop(i)
-        while cache.n and not cache.alive[cache.n - 1]:    # trailing tombstones
+        while cache.n and cache.refs[cache.n - 1] is None:    # trailing tombstones
             cache.n -= 1
             cache.refs.pop()
             cache.texts.pop()
+            if cache.matrix is None:
+                cache.vectors.pop()
+                cache.types.pop()
+                cache.pnorms.pop()
+            if cache.models is not None:
+                cache.models.pop()
             cache.dead -= 1
         if cache.dead > 32 and cache.dead * 4 > cache.n:
             self._cache_compact(cache)
+        return old_model
 
     @staticmethod
     def _cache_compact(cache: _ScanCache) -> None:
         """Squeeze tombstones out, keeping the live rows in their order."""
+        if cache.matrix is None:
+            keep = [i for i in range(cache.n) if cache.refs[i] is not None]
+            cache.refs = [cache.refs[i] for i in keep]
+            cache.texts = [cache.texts[i] for i in keep]
+            cache.vectors = [cache.vectors[i] for i in keep]
+            cache.types = [cache.types[i] for i in keep]
+            cache.pnorms = [cache.pnorms[i] for i in keep]
+            if cache.models is not None:
+                cache.models = [cache.models[i] for i in keep]
+            cache.pos = {(r[0], str(r[1])): j for j, r in enumerate(cache.refs)}
+            cache.n = len(keep)
+            cache.dead = 0
+            return
         live = _np.flatnonzero(cache.alive[:cache.n])
         step = 16384
         for start in range(0, live.size, step):
@@ -1805,6 +2413,8 @@ class EmbeddingStore:
         order = live.tolist()
         cache.refs = [cache.refs[i] for i in order]
         cache.texts = [cache.texts[i] for i in order]
+        if cache.models is not None:
+            cache.models = [cache.models[i] for i in order]
         cache.pos = {(r[0], str(r[1])): j for j, r in enumerate(cache.refs)}
         cache.n = kept
         cache.dead = 0
@@ -1867,6 +2477,12 @@ class EmbeddingStore:
     def _np_search(self, cache, query_vector, top_k, node_type, threshold):
         if top_k is not None and top_k <= 0:
             return []
+        if self._rescore:
+            if cache.n - cache.dead == 0:
+                return []
+            q32, qnorm = self._query_parts(query_vector)
+            approx = self._np_scores(cache, query_vector)
+            return self._finish_exact(cache, q32, qnorm, approx, top_k, node_type, threshold)
         scores = self._np_candidates(cache, query_vector, node_type, threshold)
         if scores is None:
             return []
@@ -1874,6 +2490,200 @@ class EmbeddingStore:
         refs, texts = cache.refs, cache.texts
         return [SimilarityResult(node_ref=refs[i], score=s, text=texts[i])
                 for i, s in zip(best.tolist(), scores[best].tolist())]
+
+    # -- canonical rescoring: one definition of a score, for one query or many --
+    #
+    # BLAS does not give a row the same float32 result in every call: a
+    # matrix-vector product, a matrix-matrix product, the same product over a
+    # block or a gathered subset all sum a row's products in different orders
+    # (measured: a block of rows differs from the same rows inside the full
+    # product in the last bit for a fraction of a percent of them). So the
+    # bounded exact search does not return BLAS scores. It uses the product
+    # (one query: matrix @ vector; a batch: matrix @ matrices) only to find a
+    # candidate set that provably contains the true top k, then scores those
+    # candidates with a kernel whose result for a (row, query) pair depends on
+    # nothing else: float32 products, summed pairwise along the row. Single
+    # and batch searches finish through the same code, so a batch answer is
+    # bit-identical to the one-query answer.
+
+    @staticmethod
+    def _query_parts(query_vector):
+        q32 = _np.asarray(query_vector, dtype=_np.float32)
+        return q32, float(_np.linalg.norm(q32))
+
+    @staticmethod
+    def _canonical_scores(cache, q32, qnorm, rows):
+        """Cosine of ``rows`` (row numbers) against ``q32``, order-independent.
+
+        Same formula as :meth:`_np_scores` (zero denominator scores 0), but the
+        dot product is ``sum(row * q)`` over float32 products with numpy's
+        pairwise summation, which does not depend on which other rows are in
+        the call. Processed in blocks of about 8 MB.
+        """
+        out = _np.zeros(rows.size, dtype=_np.float32)
+        if qnorm == 0.0 or rows.size == 0:
+            return out
+        step = max(64, (1 << 21) // cache.matrix.shape[1])
+        with _np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+            for start in range(0, rows.size, step):
+                sel = rows[start:start + step]
+                block = cache.matrix[sel]              # a gathered copy
+                block *= q32
+                dots = block.sum(axis=1)
+                denom = cache.norms[sel] * qnorm
+                _np.divide(dots, denom, out=out[start:start + step], where=denom > 0)
+        return out
+
+    @staticmethod
+    def _score_margin(cache) -> float:
+        """Bound on ``|BLAS cosine - canonical cosine|`` for one row.
+
+        Each dot product is off by at most ``gamma_d * |row| * |query|`` with
+        ``gamma_d = d * 2**-24`` whatever the summation order, so two kernels
+        differ by at most twice that in cosine units; padded for the float32
+        norms and the division.
+        """
+        return 2.1 * cache.matrix.shape[1] * 2.0 ** -24 + 5e-7
+
+    def _finish_exact(self, cache, q32, qnorm, approx, top_k, node_type, threshold, rows=None):
+        """Top ``top_k`` by canonical score, given BLAS scores to narrow the field.
+
+        ``approx`` is a float32 array of cosines computed however was
+        convenient, one per used row of the cache, or (with ``rows``, an
+        ascending array of row numbers) one per listed row, -inf for a row that
+        was excluded already. Let ``e`` be :meth:`_score_margin` and ``A`` the
+        k-th best approximate score among the rows that pass the filters (with
+        the threshold relaxed by ``e``): every row of the true top k has an
+        approximate score of at least ``A - 2e``, so rescoring exactly the rows
+        above that line and ranking them gives the true top k whichever kernel
+        produced ``approx``. If fewer than k of them pass the exact threshold
+        the candidate set was too tight (a threshold close to the scores) and
+        every filtered row is rescored instead.
+        """
+        n = approx.shape[0]
+        e = self._score_margin(cache)
+        # compared in float32 with the bound rounded down: a superset of the rows
+        # whose canonical score passes the (exact, float64) threshold below
+        floor = _np.nextafter(_np.float32(threshold - e), _np.float32(-_np.inf))
+        valid = approx >= floor
+        if rows is None:
+            if cache.dead:
+                valid &= cache.alive[:n]
+            if node_type is not None:
+                code = cache.code_of.get(node_type)
+                if code is None:
+                    return []
+                valid &= cache.codes[:n] == code
+        else:
+            valid &= approx > -_np.inf
+        passing = _np.flatnonzero(valid)
+        nv = passing.size
+        if nv == 0:
+            return []
+        k = nv if (top_k is None or top_k >= nv) else top_k
+        if k == nv:
+            cand = passing
+        else:
+            # partition only the rows that pass: a partition over the whole array,
+            # with the rejected rows set to -inf, is several times slower
+            values = approx[passing]
+            kth = float(_np.partition(values, nv - k)[nv - k])
+            cutoff = _np.nextafter(_np.float32(kth - 2 * e), _np.float32(-_np.inf))
+            cand = passing[values >= cutoff]
+        cand_rows = cand if rows is None else rows[cand]
+        scores = self._canonical_scores(cache, q32, qnorm, cand_rows)
+        ok = scores.astype(_np.float64) >= threshold
+        if k != nv and int(_np.count_nonzero(ok)) < k:
+            cand_rows = passing if rows is None else rows[passing]      # threshold hugs the scores
+            scores = self._canonical_scores(cache, q32, qnorm, cand_rows)
+            ok = scores.astype(_np.float64) >= threshold
+        cand_rows = cand_rows[ok]
+        scores = scores[ok]
+        if cand_rows.size == 0:
+            return []
+        order = _np.argsort(-scores, kind='stable')           # ties keep row order
+        if top_k is not None:
+            order = order[:top_k]
+        refs, texts = cache.refs, cache.texts
+        return [SimilarityResult(node_ref=refs[i], score=sc, text=texts[i])
+                for i, sc in zip(cand_rows[order].tolist(), scores[order].tolist())]
+
+    #: Rows of float32 scores one matrix-matrix product may produce at a time.
+    _BATCH_SCORE_BYTES = 1 << 26
+
+    def similarity_search_batch(
+        self,
+        queries: Sequence[Union[str, Sequence[float]]],
+        top_k: Optional[int] = 10,
+        node_type: Optional[str] = None,
+        threshold: float = 0.0,
+        exact: bool = False
+    ) -> List[List[SimilarityResult]]:
+        """
+        Answer many queries at once; entry ``i`` of the result is exactly what
+        ``similarity_search(queries[i], top_k, node_type, threshold, exact)``
+        returns (same nodes, same order, bit-identical scores).
+
+        With numpy, a bounded ``top_k`` and an exact scan (no ``ann`` index in
+        play, no sqlite-vec) the queries go through the stored matrix together:
+        one matrix-matrix product per group of queries instead of one
+        matrix-vector product each, which reads the matrix once per group and
+        is several times faster per query on a big store. The product only
+        picks candidates; the returned scores come from the canonical kernel
+        (see :meth:`_finish_exact`), the same one a single search finishes
+        with. Every other configuration answers the queries one after the
+        other, which is the same answer by definition.
+
+        Text queries are encoded one at a time with ``encoder.encode`` (not
+        ``encode_batch``) so that each gets the very vector a single search
+        would give it.
+
+        Args:
+            queries: Texts and/or vectors
+            top_k: Results per query (None returns every match; that and
+                   ``top_k <= 0`` take the one-at-a-time path)
+            node_type: Filter by node type (optional)
+            threshold: Minimum similarity score
+            exact: Skip the approximate index (as in :meth:`similarity_search`)
+
+        Returns:
+            One list of SimilarityResult per query, in query order
+        """
+        items = list(queries)
+        if not items:
+            return []
+        with self._lock:
+            vectors = [self._resolve_query(q) for q in items]
+            batched = (
+                self._rescore and _np is not None and top_k is not None and top_k > 0
+                and not (self._sqlite_vec)
+                and (self._ann is None or exact)
+            )
+            cache = self._ensure_cache() if batched else None
+            if cache is None or cache.matrix is None:
+                return [self.similarity_search(v, top_k, node_type, threshold, exact)
+                        for v in vectors]
+            if self._ann is not None:
+                self._ann_counts["exact"] += len(vectors)
+            if cache.n - cache.dead == 0:
+                return [[] for _ in vectors]
+            n = cache.n
+            group = max(1, min(64, self._BATCH_SCORE_BYTES // (4 * n)))
+            matrix_t = cache.matrix[:n].T
+            results: List[List[SimilarityResult]] = []
+            for start in range(0, len(vectors), group):
+                parts = [self._query_parts(v) for v in vectors[start:start + group]]
+                block = _np.stack([q32 for q32, _ in parts])
+                dots = block @ matrix_t                            # (group, n)
+                for row, (q32, qnorm) in zip(dots, parts):
+                    approx = _np.zeros(n, dtype=_np.float32)
+                    if qnorm != 0.0:
+                        denom = cache.norms[:n] * qnorm
+                        with _np.errstate(divide='ignore', invalid='ignore'):
+                            _np.divide(row, denom, out=approx, where=denom > 0)
+                    results.append(self._finish_exact(
+                        cache, q32, qnorm, approx, top_k, node_type, threshold))
+            return results
 
     def _score_all(
         self,
@@ -1901,10 +2711,18 @@ class EmbeddingStore:
                     for i, ref in enumerate(cache.refs)
                     if ref is not None and (code is None or codes[i] == code)]
 
-        scores = [self._cosine_similarity(query_vector, v) for v in cache.vectors]
-        return [(ref, float(scores[i]), cache.texts[i])
-                for i, ref in enumerate(cache.refs)
-                if node_type is None or cache.types[i] == node_type]
+        query_norm = sum(a * a for a in query_vector) ** 0.5
+        out = []
+        for i, ref in enumerate(cache.refs):
+            if ref is None or (node_type is not None and cache.types[i] != node_type):
+                continue
+            norm = cache.pnorms[i]
+            if query_norm == 0 or norm == 0:
+                score = 0.0
+            else:
+                score = sum(a * b for a, b in zip(query_vector, cache.vectors[i])) / (query_norm * norm)
+            out.append((ref, float(score), cache.texts[i]))
+        return out
 
     def _ranked(
         self,
@@ -1973,9 +2791,9 @@ class EmbeddingStore:
         Policy:
           * built lazily by the first search (never persisted), k-means on a
             sample of up to 40 x nlist live vectors, then every row assigned;
-          * new and updated rows are scored exactly until at least
-            ``max(512, 2%)`` of the indexed rows are pending, then folded
-            into their nearest cell;
+          * new and updated rows are scored exactly until ``_ANN_FOLD_BATCH``
+            (256) of them are pending, then the write that reaches that number
+            folds them into their nearest cell (so no search waits for a fold);
           * deletes tombstone (nothing to do but skip them);
           * once writes + deletes since training exceed 50% of the trained
             size, the index is retrained from the current data - with an
@@ -1996,7 +2814,7 @@ class EmbeddingStore:
             nlist = self._ann_nlist or self._ann_auto_nlist(live)
             ivf = cache.ivf = _IVFIndex.build(cache, nlist, self._ann_seed)
             self._ann_counts["builds"] += 1
-        elif len(ivf.pending) >= max(_ANN_FOLD_MIN, _ANN_FOLD_FRACTION * ivf.trained_n):
+        elif len(ivf.pending) >= _ANN_FOLD_BATCH:
             ivf.fold(cache)
         return ivf
 
@@ -2084,18 +2902,30 @@ class EmbeddingStore:
             lists = self._ann_lists(ivf, scale)
             if lists is None:
                 return None
-            got = self._ann_scores(cache, ivf, query_vector, node_type, threshold, lists)
+            relax = self._score_margin(cache) if self._rescore else 0.0
+            got = self._ann_scores(cache, ivf, query_vector, node_type, threshold - relax, lists)
             if got is None:
                 return None
             rows, scores = got
-            if int(_np.count_nonzero(scores > -_np.inf)) >= top_k:
-                best = self._rank(scores, top_k)
-                refs, texts = cache.refs, cache.texts
+            if self._rescore:
+                # the probed rows are ranked with the exact search's kernel, so a
+                # returned score is the very number an exact search gives that row
+                q32, qnorm = self._query_parts(query_vector)
+                found = (self._finish_exact(cache, q32, qnorm, scores, top_k, None, threshold, rows)
+                         if rows.size else [])
+                enough = len(found) >= top_k
+            else:
+                enough = int(_np.count_nonzero(scores > -_np.inf)) >= top_k
+                if enough:
+                    best = self._rank(scores, top_k)
+                    refs, texts = cache.refs, cache.texts
+                    found = [SimilarityResult(node_ref=refs[r], score=sc, text=texts[r])
+                             for r, sc in zip(rows[best].tolist(), scores[best].tolist())]
+            if enough:
                 self._ann_counts["approximate"] += 1
                 if scale > 1:
                     self._ann_counts["widened"] += 1
-                return [SimilarityResult(node_ref=refs[r], score=sc, text=texts[r])
-                        for r, sc in zip(rows[best].tolist(), scores[best].tolist())]
+                return found
             scale *= 4
 
     def _ranked_ann(self, query, node_type, threshold, hint, scale):
@@ -2407,19 +3237,22 @@ class EmbeddingStore:
         ``graph_digest_basis``. Absent values are omitted, not written as null.
         """
         with self._lock:
-            rows = self._get_conn().execute("""
-                SELECT node_type, node_id, node_id_type, vector, text, model
-                FROM embeddings ORDER BY rowid
-            """).fetchall()
+            if not self._sql:
+                embeddings = self._table_embeddings()
+            else:
+                rows = self._get_conn().execute("""
+                    SELECT node_type, node_id, node_id_type, vector, text, model
+                    FROM embeddings ORDER BY rowid
+                """).fetchall()
 
-            embeddings = [{
-                "type": row['node_type'],
-                "id": self._restore_node_id(row['node_id'], row['node_id_type']),
-                "id_type": row['node_id_type'],
-                "text": row['text'],
-                "model": row['model'],
-                "vector": self._bytes_to_vector(row['vector']),
-            } for row in rows]
+                embeddings = [{
+                    "type": row['node_type'],
+                    "id": self._restore_node_id(row['node_id'], row['node_id_type']),
+                    "id_type": row['node_id_type'],
+                    "text": row['text'],
+                    "model": row['model'],
+                    "vector": self._bytes_to_vector(row['vector']),
+                } for row in rows]
 
             payload: Dict[str, Any] = {
                 "format": EMBEDDING_FORMAT,
@@ -2437,6 +3270,33 @@ class EmbeddingStore:
                 payload["graph_digest"] = graph_digest
                 payload["graph_digest_basis"] = GRAPH_DIGEST_BASIS
             return payload
+
+    def _table_embeddings(self) -> List[Dict[str, Any]]:
+        """The live rows of an in-memory store as sidecar entries, in row order."""
+        cache = self._cache
+        out: List[Dict[str, Any]] = []
+        if cache is None:
+            return out
+        step = 4096
+        for start in range(0, cache.n, step):
+            stop = min(cache.n, start + step)
+            if cache.matrix is not None:
+                vectors = cache.matrix[start:stop].tolist()
+            else:
+                vectors = [None if v is None else v.tolist() for v in cache.vectors[start:stop]]
+            for i, vector in zip(range(start, stop), vectors):
+                ref = cache.refs[i]
+                if ref is None:
+                    continue
+                out.append({
+                    "type": ref[0],
+                    "id": ref[1],
+                    "id_type": 'int' if isinstance(ref[1], int) else 'str',
+                    "text": cache.texts[i],
+                    "model": cache.models[i],
+                    "vector": vector,
+                })
+        return out
 
     def import_embeddings(self, payload: Dict[str, Any], replace: bool = False) -> int:
         """
@@ -2473,9 +3333,10 @@ class EmbeddingStore:
                 self._dimension = payload.get("dimension")
 
             written = 0
-            conn = self._get_conn()
+            conn = self._get_conn() if self._sql else None
+            items = payload.get("embeddings", [])
             try:
-                for item in payload.get("embeddings", []):
+                for item in items:
                     node_id = item["id"]
                     if item.get("id_type") == 'int' and not isinstance(node_id, int):
                         node_id = int(node_id)
@@ -2485,10 +3346,14 @@ class EmbeddingStore:
                     self._write_row(
                         conn, ref, vector,
                         item.get("text", ""), item.get("model", "unknown"),
-                        node_id_type=item.get("id_type") or self._node_id_type(node_id)
+                        node_id_type=item.get("id_type") or self._node_id_type(node_id),
+                        want_id=False
                     )
                     written += 1
-                conn.commit()
+                    if written == 1:
+                        self._cache_reserve(len(items) - 1)
+                if conn is not None:
+                    conn.commit()
             except BaseException:
                 self._invalidate()
                 raise
@@ -2515,6 +3380,328 @@ class EmbeddingStore:
         payload = json.loads(FilePath(path).read_text(encoding='utf-8'))
         return self.import_embeddings(payload, replace=replace)
 
+    # -- binary snapshot ------------------------------------------------
+
+    def _snapshot_models(self) -> Tuple[int, List[str]]:
+        """``(live row count, model names in order of first use)``. Locked."""
+        order: Dict[str, int] = {}
+        count = 0
+        if not self._sql:
+            cache = self._cache
+            if cache is not None:
+                for ref, model in zip(cache.refs, cache.models):
+                    if ref is not None:
+                        count += 1
+                        if model not in order:
+                            order[model] = len(order)
+        else:
+            for (model,) in self._get_conn().execute(
+                    "SELECT model FROM embeddings ORDER BY rowid"):
+                count += 1
+                if model not in order:
+                    order[model] = len(order)
+        return count, list(order)
+
+    def _snapshot_blocks(self, rows_per_block: int):
+        """Live rows in table order as ``(metadata, vector bytes)`` blocks.
+
+        ``metadata`` is a list of ``(type, id text, text, model, is_int_id)``;
+        the vector bytes are little-endian IEEE-754 float32, row after row.
+        Locked by the caller.
+        """
+        if not self._sql:
+            cache = self._cache
+            if cache is None:
+                return
+            live = [i for i in range(cache.n) if cache.refs[i] is not None]
+            for start in range(0, len(live), rows_per_block):
+                chunk = live[start:start + rows_per_block]
+                meta = [(cache.refs[i][0], str(cache.refs[i][1]), cache.texts[i],
+                         cache.models[i], isinstance(cache.refs[i][1], int)) for i in chunk]
+                if cache.matrix is not None:
+                    data = _np.ascontiguousarray(cache.matrix[chunk], dtype='<f4').tobytes()
+                else:
+                    parts = []
+                    for i in chunk:
+                        vec = cache.vectors[i]
+                        if sys.byteorder == 'big':     # pragma: no cover - LE hosts only in CI
+                            vec = array('f', vec)
+                            vec.byteswap()
+                        parts.append(vec.tobytes())
+                    data = b"".join(parts)
+                yield meta, data
+            return
+        cursor = self._get_conn().cursor()
+        cursor.row_factory = None
+        cursor.execute("SELECT node_type, node_id, node_id_type, vector, text, model "
+                       "FROM embeddings ORDER BY rowid")
+        width = None
+        while True:
+            rows = cursor.fetchmany(rows_per_block)
+            if not rows:
+                return
+            meta = [(r[0], r[1], r[4], r[5], r[2] == 'int') for r in rows]
+            blobs = [r[3] for r in rows]
+            width = len(blobs[0]) if width is None else width
+            if any(len(b) != width for b in blobs):
+                raise SnapshotError("the stored vectors are not all one length")
+            if _np is not None:
+                data = _np.frombuffer(b"".join(blobs), dtype=_np.float32).astype('<f4').tobytes()
+            else:
+                parts = []
+                for b in blobs:
+                    vec = array('f')
+                    vec.frombytes(b)
+                    if sys.byteorder == 'big':         # pragma: no cover - LE hosts only in CI
+                        vec.byteswap()
+                    parts.append(vec.tobytes())
+                data = b"".join(parts)
+            yield meta, data
+
+    def save_snapshot(
+        self,
+        path: Union[str, FilePath],
+        graph_digest: Optional[str] = None,
+        sidecar: Optional[Union[str, FilePath]] = None,
+        int_ids: Optional[Any] = None
+    ) -> SnapshotInfo:
+        """
+        Write a binary snapshot of every live embedding to ``path``, atomically.
+
+        The snapshot is a cache of the JSON sidecar (the portable, authoritative
+        format): the same rows in the same order, as little-endian binary, so a
+        load is a read and a copy instead of a parse. The file is written to a
+        temp file, flushed and renamed over ``path``; a failure leaves the
+        previous file untouched. :meth:`SemanticGraph.save` calls this with the
+        graph digest and the sidecar it just wrote.
+
+        Args:
+            path: Snapshot file
+            graph_digest: :func:`graph_digest` of the graph this belongs to
+            sidecar: The JSON sidecar written for the same save; its length and
+                     fingerprint are recorded, and a load refuses the snapshot
+                     once that file has changed
+            int_ids: How a loader will tell integer ids from string ids (a
+                     snapshot stores every id as text): a container of
+                     ``(type, id text)`` pairs that are integers, or a
+                     ``callable(type, id_text) -> bool``. When given, a row
+                     whose id kind that rule would get wrong makes the call
+                     raise :class:`SnapshotError` instead of writing a snapshot
+                     that loads differently from the JSON sidecar.
+
+        Returns:
+            The header that was written (and the file size)
+        """
+        def is_int(ty: str, ident: str) -> bool:
+            if int_ids is None:
+                return False
+            return bool(int_ids(ty, ident)) if callable(int_ids) else (ty, ident) in int_ids
+
+        with self._lock:
+            count, models = self._snapshot_models()
+            dim = self._dimension or 0
+            identity = sidecar_identity(sidecar) if sidecar is not None else None
+            basis = GRAPH_DIGEST_BASIS if graph_digest is not None else None
+            encoder_model = self._current_model()
+            encoder_version = str(self.version) if self.version is not None else None
+            head = bytearray(_SNAP_MAGIC)
+            head += _U32.pack(SNAPSHOT_VERSION)
+            head += _U32.pack(_SNAP_FLAG_SIDECAR if identity is not None else 0)
+            head += _U32.pack(dim)
+            head += _U32.pack(_SNAP_BLOCK_ROWS)
+            head += _U64.pack(count)
+            head += _snap_opt(graph_digest) + _snap_opt(basis)
+            head += _snap_opt(encoder_model) + _snap_opt(encoder_version)
+            if identity is not None:
+                head += _U64.pack(identity[0]) + identity[1]
+            head += _U32.pack(len(models))
+            for model in models:
+                head += _snap_str(model)
+            model_ix = {m: i for i, m in enumerate(models)}
+
+            def fill(handle: Any) -> int:
+                digest = hashlib.sha256()
+                written = 0
+
+                def emit(data: bytes) -> None:
+                    nonlocal written
+                    handle.write(data)
+                    digest.update(data)
+                    written += len(data)
+
+                emit(bytes(head))
+                rows = 0
+                for meta, data in self._snapshot_blocks(_SNAP_BLOCK_ROWS):
+                    parts = []
+                    for ty, ident, text, model, row_is_int in meta:
+                        if int_ids is not None and row_is_int != is_int(ty, ident):
+                            raise SnapshotError(
+                                f"the id {ident!r} of a {ty!r} embedding is "
+                                f"{'an integer' if row_is_int else 'a string'}, which a "
+                                f"snapshot (it stores ids as text) cannot say")
+                        parts.append(_snap_str(ty) + _snap_str(ident) + _snap_str(text)
+                                     + _U32.pack(model_ix[model]))
+                    emit(b"".join(parts))
+                    emit(data)
+                    rows += len(meta)
+                if rows != count:                                  # pragma: no cover
+                    raise SnapshotError("the store changed while it was written")
+                handle.write(digest.digest())
+                return written + _SNAP_TRAILER
+
+            size = _atomic_write_stream(path, fill)
+            return SnapshotInfo(
+                version=SNAPSHOT_VERSION, dimension=dim, count=count,
+                graph_digest=graph_digest, graph_digest_basis=basis,
+                encoder_model=encoder_model, encoder_version=encoder_version,
+                sidecar_len=identity[0] if identity else None,
+                sidecar_fingerprint=identity[1] if identity else None, bytes=size)
+
+    def load_snapshot(
+        self,
+        path: Union[str, FilePath],
+        replace: bool = False,
+        int_ids: Optional[Any] = None
+    ) -> SnapshotInfo:
+        """
+        Read a snapshot written by :meth:`save_snapshot` (or by another port).
+
+        The whole file is read and verified (structure, every length, repeated
+        keys, the trailing SHA-256) before the store is touched; any problem
+        raises :class:`SnapshotError` and leaves the store as it was. Does not
+        check which graph or sidecar the snapshot belongs to: use
+        :meth:`SemanticGraph.load` for that.
+
+        A snapshot stores ids as text, so ``int_ids`` says which of them are
+        integers (a container of ``(type, id text)`` pairs or a
+        ``callable(type, id_text) -> bool``); by default none are.
+
+        Args:
+            path: Snapshot file
+            replace: Drop the existing embeddings first (otherwise the
+                     snapshot's rows are added, overwriting equal keys, as
+                     :meth:`load_embeddings` does)
+            int_ids: See above
+
+        Returns:
+            The snapshot's header
+        """
+        with self._lock:
+            stage = _read_snapshot(path)
+            self._adopt_staged(stage, int_ids, replace)
+            return stage.info
+
+    def _adopt_snapshot_for(self, path, sidecar, graph_digest_value, int_ids) -> SnapshotInfo:
+        """Use the snapshot at ``path`` for the graph whose digest is
+        ``graph_digest_value`` and whose JSON sidecar is ``sidecar``, if it
+        provably belongs to them. :class:`SnapshotError` (its message is the
+        reason) leaves the store untouched."""
+        try:
+            current = sidecar_identity(sidecar)
+        except (OSError, SnapshotError) as exc:
+            raise SnapshotError(f"cannot read the sidecar {sidecar}: {exc}") from exc
+
+        def accept(info: SnapshotInfo) -> None:
+            if (info.graph_digest != graph_digest_value
+                    or info.graph_digest_basis != GRAPH_DIGEST_BASIS):
+                raise SnapshotError("it was saved for a different graph (digest differs)")
+            if info.sidecar_len is None:
+                raise SnapshotError("it records no sidecar identity")
+            if (info.sidecar_len, info.sidecar_fingerprint) != current:
+                raise SnapshotError(
+                    "the JSON sidecar changed since the snapshot was written (stale snapshot)")
+
+        with self._lock:
+            stage = _read_snapshot(path, accept)
+            self._adopt_staged(stage, int_ids, False)
+            return stage.info
+
+    def _adopt_staged(self, stage: _StagedSnapshot, int_ids: Optional[Any], replace: bool) -> None:
+        """Install a verified snapshot's rows. Locked."""
+        info = stage.info
+        if info.count and not replace and self._dimension not in (None, info.dimension):
+            raise SnapshotError(
+                f"the snapshot holds {info.dimension}-dimensional vectors, "
+                f"the store {self._dimension}")
+
+        def is_int(ty: str, ident: str) -> bool:
+            if int_ids is None:
+                return False
+            return bool(int_ids(ty, ident)) if callable(int_ids) else (ty, ident) in int_ids
+
+        if replace:
+            self.clear()
+            self._dimension = info.dimension or None
+        meta = {key: value for key, value in (
+            ("encoder_model", info.encoder_model), ("encoder_version", info.encoder_version),
+            ("graph_digest", info.graph_digest), ("graph_digest_basis", info.graph_digest_basis))
+            if value is not None}
+        count = info.count
+        if not self._sql and self.count() == 0 and count:
+            self._install_table(stage, is_int)
+        elif count:
+            conn = self._get_conn() if self._sql else None
+            try:
+                for k in range(count):
+                    if stage.matrix is not None:
+                        row = stage.matrix[k]
+                        blob = row.tobytes()
+                    else:
+                        row = stage.vectors[k]
+                        blob = row.tobytes()
+                    self._check_dimension(row, "snapshot vector")
+                    ident = stage.ids[k]
+                    id_type = 'int' if is_int(stage.types[k], ident) else 'str'
+                    ref = (stage.types[k], int(ident) if id_type == 'int' else ident)
+                    self._write_row(conn, ref, row, stage.texts[k],
+                                    stage.models[stage.model_ix[k]], node_id_type=id_type,
+                                    blob=blob, want_id=False)
+                if conn is not None:
+                    conn.commit()
+            except BaseException:
+                self._invalidate()
+                raise
+        self.last_import_meta = meta
+
+    def _install_table(self, stage: _StagedSnapshot, is_int: Callable[[str, str], bool]) -> None:
+        """Move a staged snapshot into an empty in-memory store without copying
+        the vectors again. Locked."""
+        info = stage.info
+        count, dim = info.count, info.dimension
+        types, ids = stage.types, stage.ids
+        names = [self._model_names.setdefault(m, m) for m in stage.models]
+        models = [names[i] for i in stage.model_ix]
+        refs = [(t, int(i)) if is_int(t, i) else (t, i) for t, i in zip(types, ids)]
+        if stage.matrix is not None:
+            capacity = stage.matrix.shape[0]
+            norms = _np.zeros(capacity, dtype=_np.float32)
+            step = 16384
+            for start in range(0, count, step):
+                stop = min(count, start + step)
+                norms[start:stop] = _np.linalg.norm(stage.matrix[start:stop], axis=1)
+            code_of: Dict[str, int] = {}
+            for t in types:
+                if t not in code_of:
+                    code_of[t] = len(code_of)
+            codes = _np.zeros(capacity, dtype=_np.int32)
+            codes[:count] = [code_of[t] for t in types]
+            alive = _np.zeros(capacity, dtype=bool)
+            alive[:count] = True
+            cache = _ScanCache(refs, None, list(stage.texts), None, stage.matrix, norms)
+            cache.alive, cache.codes, cache.code_of = alive, codes, code_of
+        else:
+            vectors = stage.vectors
+            cache = _ScanCache(refs, list(types), list(stage.texts), vectors, None, None)
+            cache.pnorms = [sum(b * b for b in vec) ** 0.5 for vec in vectors]
+        cache.pos = {(t, i): k for k, (t, i) in enumerate(zip(types, ids))}
+        cache.models = models
+        counts: Dict[str, int] = {}
+        for m in models:
+            counts[m] = counts.get(m, 0) + 1
+        self._cache = cache
+        self._models_cache = counts
+        self._dimension = dim
+
     # -- lifecycle ------------------------------------------------------
 
     def close(self) -> None:
@@ -2523,6 +3710,8 @@ class EmbeddingStore:
             if self._conn:
                 self._conn.close()
                 self._conn = None
+            self._cache = None             # an in-memory store ends with its rows
+            self._models_cache = None if self._sql else {}
             self._invalidate()
 
     def __enter__(self) -> 'EmbeddingStore':
@@ -2643,6 +3832,9 @@ class SemanticGraph(ISONGraph):
 
         self.auto_embed = auto_embed
         self.embed_fields = embed_fields or ['name', 'description', 'content', 'text']
+        #: How the embeddings of the last :meth:`load` were restored (None for
+        #: a graph that was not loaded); see :class:`LoadReport`.
+        self.load_report: Optional[LoadReport] = None
 
     # -- encoder --------------------------------------------------------
 
@@ -3600,7 +4792,8 @@ class SemanticGraph(ISONGraph):
         self,
         path: Union[str, FilePath],
         format: str = "auto",
-        embeddings: bool = True
+        embeddings: bool = True,
+        snapshot: bool = False
     ) -> None:
         """
         Save graph to file, and its embeddings alongside it.
@@ -3622,10 +4815,26 @@ class SemanticGraph(ISONGraph):
         With ``embeddings=False`` an existing sidecar is left in place (and
         will fail the digest check on load, as it no longer matches).
 
+        With ``snapshot=True`` a binary snapshot of the embeddings is written as
+        well, at ``<path>.embeddings.snap`` (after the sidecar, atomically). The
+        JSON sidecar stays the portable, authoritative copy and is byte-for-byte
+        what it would be without the snapshot; :meth:`load` takes the snapshot
+        when it provably belongs to the graph and the sidecar on disk (and its
+        checksum verifies) and reads the JSON otherwise. It loads several times
+        faster and is a third of the size. A save *without* ``snapshot`` deletes
+        any existing snapshot first, since the sidecar is about to change. If the
+        snapshot cannot be written (``SnapshotError``, ``OSError``) the graph and
+        sidecar are saved anyway, a stale snapshot is removed, and the error is
+        raised. A snapshot stores ids as text, so it is written only when every
+        embedding's id is an integer exactly when the graph has an integer node of
+        that type and number (the rule :meth:`load` uses to restore them);
+        otherwise ``SnapshotError``.
+
         Args:
             path: Graph file path
             format: File format
             embeddings: Write the sidecar (set False for graph-only saves)
+            snapshot: Also write the binary snapshot (needs ``embeddings``)
         """
         path = FilePath(path)
         if format == "auto":
@@ -3637,8 +4846,34 @@ class SemanticGraph(ISONGraph):
         if embeddings:
             reread = (ISONGraph.from_isonl(text, path.stem) if format == "isonl"
                       else ISONGraph.from_ison(text, path.stem))
-            self.embedding_store.save_embeddings(
-                self.embeddings_path_for(path), graph_digest=graph_digest(reread))
+            digest = graph_digest(reread)
+            sidecar = self.embeddings_path_for(path)
+            snap = snapshot_path_for(path)
+            if not snapshot:
+                # the sidecar is about to change: a snapshot of the old one is stale
+                try:
+                    snap.unlink()
+                except OSError:
+                    pass
+            self.embedding_store.save_embeddings(sidecar, graph_digest=digest)
+            if snapshot:
+                try:
+                    self.embedding_store.save_snapshot(
+                        snap, graph_digest=digest, sidecar=sidecar,
+                        int_ids=self._int_id_texts(reread))
+                except BaseException:
+                    try:
+                        snap.unlink()
+                    except OSError:
+                        pass
+                    raise
+
+    @staticmethod
+    def _int_id_texts(graph: ISONGraph) -> set:
+        """``(type, id text)`` of every integer-id node: how a snapshot's text
+        ids are turned back into the integers they were."""
+        return {(n.ref[0], str(n.ref[1])) for n in graph.nodes()
+                if isinstance(n.ref[1], int) and not isinstance(n.ref[1], bool)}
 
     @classmethod
     def load(
@@ -3698,6 +4933,16 @@ class SemanticGraph(ISONGraph):
                      never saved; it is rebuilt from the loaded vectors on
                      the first search.
 
+        A binary snapshot beside the sidecar (``<path>.embeddings.snap``, written
+        by ``save(..., snapshot=True)`` or by the Rust crate) is used instead of
+        the sidecar when its header names this graph's digest and the sidecar
+        file as it is on disk, and the whole file verifies; the store is then
+        the same as a JSON load would give. Anything else wrong with it (stale,
+        truncated, corrupt, another version, a repeated key) is ignored: the
+        JSON sidecar is read exactly as without a snapshot. ``load_report`` on
+        the result (or :meth:`load_with_report`) says which path ran and why a
+        snapshot that exists was not used.
+
         Returns:
             SemanticGraph instance
 
@@ -3706,6 +4951,7 @@ class SemanticGraph(ISONGraph):
                 ``on_mismatch="error"``
             ValueError: ``on_mismatch`` is not one of the three modes
         """
+        started = time.perf_counter()
         if on_mismatch not in ("error", "warn", "reembed"):
             raise ValueError(
                 f"on_mismatch must be 'error', 'warn' or 'reembed', got {on_mismatch!r}")
@@ -3753,9 +4999,25 @@ class SemanticGraph(ISONGraph):
                 graph.add_edge(edge.rel_type, edge.source, edge.target,
                                **edge.properties)
 
+        source = "none"
+        skipped: Optional[str] = None
+        restored = 0
         if embeddings:
             sidecar = cls.embeddings_path_for(path)
             if sidecar.is_file():
+                source = "json"
+                snap = snapshot_path_for(path)
+                if snap.is_file():
+                    try:
+                        info = graph.embedding_store._adopt_snapshot_for(
+                            snap, sidecar, graph_digest(base), cls._int_id_texts(base))
+                    except Exception as exc:       # a snapshot is a cache: any failure falls back
+                        skipped = str(exc) if isinstance(exc, SnapshotError)                             else f"{type(exc).__name__}: {exc}"
+                    else:
+                        cls._warn_version_skew(graph)
+                        graph.load_report = LoadReport(
+                            "snapshot", None, info.count, time.perf_counter() - started)
+                        return graph
                 try:
                     payload = json.loads(sidecar.read_text(encoding='utf-8'))
                 except ValueError as exc:
@@ -3787,16 +5049,28 @@ class SemanticGraph(ISONGraph):
                     if problem is not None:
                         warnings.warn(problem, UserWarning, stacklevel=2)
                     graph.embedding_store.import_embeddings(payload)
-                    stored_version = graph.embedding_store.last_import_meta.get("encoder_version")
-                    current_version = graph.embedding_store.version
-                    if (stored_version is not None and current_version is not None
-                            and str(stored_version) != str(current_version)):
-                        warnings.warn(
-                            f"embeddings were made by encoder version {stored_version!r}, "
-                            f"but the encoder in use is version {current_version!r}",
-                            UserWarning, stacklevel=2)
+                    cls._warn_version_skew(graph)
+                restored = graph.embedding_store.count()
 
+        graph.load_report = LoadReport(source, skipped, restored, time.perf_counter() - started)
         return graph
+
+    @staticmethod
+    def _warn_version_skew(graph: 'SemanticGraph') -> None:
+        stored_version = graph.embedding_store.last_import_meta.get("encoder_version")
+        current_version = graph.embedding_store.version
+        if (stored_version is not None and current_version is not None
+                and str(stored_version) != str(current_version)):
+            warnings.warn(
+                f"embeddings were made by encoder version {stored_version!r}, "
+                f"but the encoder in use is version {current_version!r}",
+                UserWarning, stacklevel=3)
+
+    @classmethod
+    def load_with_report(cls, path: Union[str, FilePath], **kwargs: Any) -> Tuple['SemanticGraph', LoadReport]:
+        """:meth:`load` (same arguments), also returning the :class:`LoadReport`."""
+        graph = cls.load(path, **kwargs)
+        return graph, graph.load_report
 
     def close(self) -> None:
         """Release the embedding database connection."""
@@ -3825,7 +5099,11 @@ __all__ = [
     'EMBEDDING_SIDECAR_SUFFIX',
     'GRAPH_DIGEST_BASIS',
     'UNKNOWN_MODELS',
+    'SNAPSHOT_SUFFIX',
+    'SNAPSHOT_VERSION',
     'graph_digest',
+    'snapshot_path_for',
+    'sidecar_identity',
 
     # Errors
     'EmbeddingError',
@@ -3833,6 +5111,7 @@ __all__ = [
     'NoEncoderError',
     'ModelMismatchError',
     'GraphEmbeddingMismatchError',
+    'SnapshotError',
 
     # Encoders
     'EmbeddingEncoder',
@@ -3843,6 +5122,8 @@ __all__ = [
     'EmbeddingStore',
     'EmbeddingRecord',
     'SimilarityResult',
+    'LoadReport',
+    'SnapshotInfo',
 
     # Graph
     'SemanticGraph',

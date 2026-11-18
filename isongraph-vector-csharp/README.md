@@ -357,9 +357,11 @@ so a selective filter costs time, not results.
 The index is built lazily by the first search, never saved (nothing about it is
 in a graph file or sidecar, and the digest is unchanged), and kept current:
 added and updated vectors are visible at once and folded into cells in batches,
-removed ones never come back, and heavy churn retrains it. It holds its own
-contiguous copy of the vectors, so budget about one extra copy of them. Writes and
-searches share the store's lock, as everywhere else in the store. It is not
+removed ones never come back, and heavy churn retrains it. It owns no vectors: it
+refers to the rows of the store's single chunked table (an IVF-indexed store is
+about 1.2-1.5x the raw vectors, was 2.8x). Searches share a reader lock and run
+concurrently; writes are exclusive; `SimilaritySearchBatch` runs queries in
+parallel and returns exactly what one query at a time would. It is not
 available on `SqliteEmbeddingStore`.
 
 Measured on synthetic clustered 384-d vectors (32 cores, .NET 8, top-10, warm medians):

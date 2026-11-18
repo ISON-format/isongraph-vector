@@ -195,7 +195,8 @@ public class AnnTests
         Assert.True(stats.Active);
         Assert.Equal(64, stats.Nlist);
         Assert.Equal(4000, stats.TrainedN);
-        Assert.True(stats.IndexBytes > 0 && stats.VectorBytes > 0);
+        Assert.True(stats.IndexBytes > 0);
+        Assert.Equal(0, stats.VectorBytes);                              // the index keeps no copy of any vector
         Assert.True(stats.Searches.Approximate >= 60);
         Assert.Equal(1, stats.Searches.Builds);
     }
@@ -381,10 +382,11 @@ public class AnnTests
         long builds = store.GetAnnStats().Searches.Builds;
         var extra = gen.Draw(700);
         for (int i = 0; i < 700; i++) store.Add(Ref(i, "late"), "", extra[i]);
-        Assert.Equal(700, store.GetAnnStats().Pending);
-        store.SimilaritySearchVector(extra[0], 5);                       // >= 512 pending: folded
+        // every 256th write folds the pending rows into their cells (at write time, not at search time)
+        Assert.Equal(700 % IvfIndex.FoldBatch, store.GetAnnStats().Pending);
+        store.SimilaritySearchVector(extra[0], 5);
         var stats = store.GetAnnStats();
-        Assert.Equal(0, stats.Pending);
+        Assert.True(stats.Pending < IvfIndex.FoldBatch);
         Assert.Equal(builds, stats.Searches.Builds);
 
         var more = gen.Draw(1200);

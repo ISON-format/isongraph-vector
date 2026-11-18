@@ -384,7 +384,21 @@ internal static class AtomicFile
     /// the target. UTF-8 without a BOM, and no line-ending translation, so a
     /// file's bytes do not depend on the OS that wrote it.
     /// </summary>
-    public static void WriteText(string path, string text)
+    public static void WriteText(string path, string text) =>
+        Write(path, stream =>
+        {
+            var bytes = new UTF8Encoding(false).GetBytes(text);
+            stream.Write(bytes, 0, bytes.Length);
+        });
+
+    /// <summary>
+    /// Run <paramref name="fill"/> against a temp file beside
+    /// <paramref name="path"/>, flush it to disk and move it over the target: a
+    /// reader sees the old file or the new one, never a partial one, and a
+    /// failure (an exception from <paramref name="fill"/> included) removes the
+    /// temp file and leaves the target as it was.
+    /// </summary>
+    public static void Write(string path, Action<Stream> fill)
     {
         var full = System.IO.Path.GetFullPath(path);
         var dir = System.IO.Path.GetDirectoryName(full) ?? ".";
@@ -392,10 +406,9 @@ internal static class AtomicFile
             $".{System.IO.Path.GetFileName(full)}.{Environment.ProcessId}.{Guid.NewGuid().ToString("N")[..8]}.tmp");
         try
         {
-            using (var stream = new FileStream(tmp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            using (var stream = new FileStream(tmp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1 << 20))
             {
-                var bytes = new UTF8Encoding(false).GetBytes(text);
-                stream.Write(bytes, 0, bytes.Length);
+                fill(stream);
                 stream.Flush(flushToDisk: true);
             }
             File.Move(tmp, full, overwrite: true);

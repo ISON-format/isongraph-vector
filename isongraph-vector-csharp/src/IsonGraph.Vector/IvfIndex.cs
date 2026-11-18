@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Diagnostics;
 using System.Numerics;
 using NVec = System.Numerics.Vector;
@@ -6,226 +7,78 @@ using System.Runtime.InteropServices;
 namespace IsonGraph.Vector;
 
 /// <summary>
-/// Inverted-file ("IVF-flat") index over a contiguous copy of a store's vectors.
+/// Inverted-file ("IVF-flat") index over a <see cref="VectorTable"/>.
 ///
 /// Spherical k-means partitions the rows into <c>Nlist</c> cells by direction,
-/// which is what cosine similarity compares. A query scores the <c>lists</c>
-/// cells whose centroids are nearest and only the rows inside them, with the
-/// same cosine formula the exact scan uses.
+/// which is what cosine similarity compares. A query scores the cells whose
+/// centroids are nearest and only the rows inside them, with the same cosine
+/// the exact scan uses (the same kernel, so the same bits).
 ///
-/// Storage is struct-of-arrays: one <c>float[]</c> matrix (row stride padded
-/// to a whole number of SIMD lanes, so the dot product has no scalar tail),
-/// the row norms, a type code per row and the owning record. The cells are a
-/// per-row cell number (<c>_assign</c>, -1 = none) plus the rows grouped by
-/// cell (<c>_order</c>/<c>_offsets</c>).
+/// The index owns no vectors: the table holds the one copy of every row, and
+/// the index holds only the centroids and, per slot, which cell it is in:
+///   * <c>_assign[slot]</c>: its cell, <see cref="Pending"/>, or <see cref="NoCell"/>;
+///   * <c>_pos[slot]</c>: its position in that cell's list (or the pending
+///     list), so a row leaves its list in O(1) by swapping the last one in;
+///   * <c>_lists[cell]</c>: exactly the live folded rows of a cell, no stale entries.
 ///
-/// It follows the store it belongs to instead of being rebuilt on every write:
-///   * a new or updated row is "pending": it has no cell, and every query
-///     scores the pending rows exactly, so a write is visible immediately;
-///   * pending rows are folded into their nearest cell in one pass once there
-///     are enough of them (the store decides when);
-///   * a delete clears the row's cell; stale entries in <c>_order</c> are
-///     skipped at query time (a row is only taken from the cell it is assigned to);
-///   * compaction (when a quarter of the slots are dead) remaps row numbers and
-///     carries the cells across without retraining;
-///   * <c>Churn</c> counts every write and delete since the centroids were
-///     trained; the store retrains when it passes a fraction of the trained size.
+/// It follows the store instead of being rebuilt on every write: a new or
+/// updated row is "pending" and every query scores the pending rows exactly,
+/// so a write is visible at once; the write that makes <see cref="FoldBatch"/>
+/// pending rows folds them into their nearest cells. A delete detaches the row.
+/// Compaction renumbers slots and the index follows without retraining.
+/// <c>Churn</c> counts writes and deletes since training; past a fraction of
+/// the trained size the store retrains.
 ///
-/// Not thread-safe: the owning store calls it only under its lock. Queries
-/// reuse scratch buffers owned by the index, so a query allocates nothing
-/// per scanned row (only its result objects).
+/// Mutating members are called only under the store's write lock; searches
+/// read the index under the read lock and touch no shared mutable state
+/// (all scratch is per call), so any number run at once.
 /// </summary>
 internal sealed class IvfIndex
 {
-    // -- rows -------------------------------------------------------------------
-    private readonly int _dim;
-    private readonly int _stride;                       // dim rounded up to the SIMD width
-    private float[] _matrix;
-    private float[] _norms;
-    private int[] _codes;
-    private bool[] _alive;
-    private EmbeddingRecord?[] _recs;
-    private int[] _assign;
-    private int _n;                                     // slots in use, tombstones included
-    private int _dead;
-    private readonly Dictionary<string, int> _pos = new();      // record id -> slot
-    private readonly Dictionary<string, int> _codeOf = new();   // node type -> code
+    /// <summary>Pending rows that trigger a fold (DESIGN.md section 8).</summary>
+    public const int FoldBatch = 256;
 
-    // -- cells ------------------------------------------------------------------
-    private float[] _centroids = Array.Empty<float>();
-    private int[] _order = Array.Empty<int>();
-    private int[] _offsets = Array.Empty<int>();
-    private readonly HashSet<int> _pending = new();
+    private const int NoCell = -1;
+    private const int Pending = -2;
+
+    private readonly int _dim;
+    private readonly int _stride;                       // dim rounded up to the SIMD width (centroids only)
+    private float[] _centroids = Array.Empty<float>();  // nlist x stride
+    private int[] _assign = Array.Empty<int>();
+    private int[] _pos = Array.Empty<int>();
+    private int[][] _lists = Array.Empty<int[]>();
+    private int[] _listLen = Array.Empty<int>();
+    private int[] _pend = new int[FoldBatch + 16];
+    private int _pendLen;
 
     public int Nlist { get; private set; }
     public long Churn { get; private set; }
     public int TrainedN { get; private set; }
     public double BuildSeconds { get; private set; }
-    public int PendingCount => _pending.Count;
-    public int LiveCount => _n - _dead;
-    public long VectorBytes => ((long)_matrix.Length + _norms.Length) * sizeof(float);
-    public long IndexBytes =>
-        ((long)_centroids.Length + _assign.Length + _order.Length + _offsets.Length) * sizeof(int);
+    public int PendingCount => _pendLen;
+    public bool Stale => Churn > 0.5 * TrainedN;
 
-    // -- scratch (single-threaded, under the store lock) ------------------------
-    private float[] _q;
-    private float[] _cKey = Array.Empty<float>();
-    private int[] _cId = Array.Empty<int>();
-    private int[] _candRows = new int[256];
-    private float[] _candScores = new float[256];
-    private int _candCount;
-    private int[] _topRows = new int[16];
-    private float[] _topScores = new float[16];
+    /// <summary>The index keeps no copy of any vector: the table's rows are the only ones.</summary>
+    public long VectorBytes => 0;
 
-    private IvfIndex(int dim, int capacity)
+    public long IndexBytes
+    {
+        get
+        {
+            long bytes = ((long)_centroids.Length + _assign.Length + _pos.Length + _listLen.Length + _pend.Length) * sizeof(int);
+            foreach (var l in _lists) bytes += (long)l.Length * sizeof(int);
+            return bytes;
+        }
+    }
+
+    private IvfIndex(int dim)
     {
         _dim = dim;
         int lanes = Vector<float>.Count;
         _stride = (dim + lanes - 1) / lanes * lanes;
-        long cells = (long)capacity * _stride;
-        if (cells > Array.MaxLength)
-            throw new EmbeddingException(
-                $"approximate index would need {cells} floats ({capacity} vectors x {_stride}); " +
-                "the contiguous copy is limited to about 2 billion values");
-        _matrix = new float[cells];
-        _norms = new float[capacity];
-        _codes = new int[capacity];
-        _alive = new bool[capacity];
-        _recs = new EmbeddingRecord?[capacity];
-        _assign = new int[capacity];
-        Array.Fill(_assign, -1);
-        _q = new float[_stride];
     }
 
-    /// <summary>Copy <paramref name="records"/> into a fresh, untrained index. Call <see cref="Train"/> next.</summary>
-    public static IvfIndex FromRecords(IEnumerable<EmbeddingRecord> records, int dim, int count)
-    {
-        var index = new IvfIndex(dim, count + count / 8 + 16);
-        foreach (var record in records) index.Append(record);
-        return index;
-    }
-
-    // -- writes -----------------------------------------------------------------
-
-    private int CodeFor(string nodeType)
-    {
-        if (!_codeOf.TryGetValue(nodeType, out int code))
-            _codeOf[nodeType] = code = _codeOf.Count;
-        return code;
-    }
-
-    private void Grow()
-    {
-        int capacity = Math.Max(_alive.Length + _alive.Length / 2, _alive.Length + 64);
-        if ((long)capacity * _stride > Array.MaxLength)
-            capacity = Array.MaxLength / _stride;
-        if (capacity <= _alive.Length)
-            throw new EmbeddingException("approximate index is full (contiguous copy limited to about 2 billion values)");
-        int old = _alive.Length;
-        Array.Resize(ref _matrix, capacity * _stride);
-        Array.Resize(ref _norms, capacity);
-        Array.Resize(ref _codes, capacity);
-        Array.Resize(ref _alive, capacity);
-        Array.Resize(ref _recs, capacity);
-        Array.Resize(ref _assign, capacity);
-        Array.Fill(_assign, -1, old, capacity - old);
-    }
-
-    private int Append(EmbeddingRecord record)
-    {
-        if (_n >= _alive.Length) Grow();
-        int i = _n++;
-        _pos[record.Id] = i;
-        _alive[i] = true;
-        Store(i, record);
-        return i;
-    }
-
-    private void Store(int i, EmbeddingRecord record)
-    {
-        var dst = new Span<float>(_matrix, i * _stride, _stride);
-        record.Vector.AsSpan(0, _dim).CopyTo(dst);
-        dst.Slice(_dim).Clear();
-        _norms[i] = MathF.Sqrt(Dot(dst, dst));
-        _codes[i] = CodeFor(record.NodeRef.Type);
-        _recs[i] = record;
-    }
-
-    /// <summary>A new or replaced vector: visible to the next query, folded into a cell later.</summary>
-    public void Put(EmbeddingRecord record)
-    {
-        if (_pos.TryGetValue(record.Id, out int i))
-            Store(i, record);                       // overwrite in place: keeps its position
-        else
-            i = Append(record);
-        _assign[i] = -1;
-        _pending.Add(i);
-        Churn++;
-    }
-
-    /// <summary>A deleted vector: the slot becomes a tombstone no query will read.</summary>
-    public void Drop(string id)
-    {
-        if (!_pos.Remove(id, out int i)) return;
-        _norms[i] = 0f;
-        _alive[i] = false;
-        _recs[i] = null;
-        _assign[i] = -1;
-        _pending.Remove(i);
-        _dead++;
-        Churn++;
-        while (_n > 0 && !_alive[_n - 1])           // trailing tombstones just shorten the table
-        {
-            _n--;
-            _dead--;
-        }
-        if (_dead > 32 && _dead * 4 > _n) Compact();
-    }
-
-    /// <summary>Squeeze tombstones out, keeping the live rows in order, and carry the cells across.</summary>
-    private void Compact()
-    {
-        var remap = new int[_n];
-        int kept = 0;
-        for (int i = 0; i < _n; i++)
-        {
-            if (!_alive[i]) { remap[i] = -1; continue; }
-            remap[i] = kept;
-            if (kept != i)                          // destination never overtakes the source
-            {
-                Array.Copy(_matrix, i * _stride, _matrix, kept * _stride, _stride);
-                _norms[kept] = _norms[i];
-                _codes[kept] = _codes[i];
-                _recs[kept] = _recs[i];
-                _assign[kept] = _assign[i];
-            }
-            kept++;
-        }
-        if (_pending.Count > 0)
-        {
-            var moved = new List<int>(_pending.Count);
-            foreach (int old in _pending) moved.Add(remap[old]);
-            _pending.Clear();
-            foreach (int row in moved) _pending.Add(row);
-        }
-        for (int i = kept; i < _n; i++)
-        {
-            _recs[i] = null;
-            _alive[i] = false;
-            _assign[i] = -1;
-            _norms[i] = 0f;
-        }
-        for (int i = 0; i < kept; i++)
-        {
-            _alive[i] = true;
-            _pos[_recs[i]!.Id] = i;
-        }
-        _n = kept;
-        _dead = 0;
-        Relist();
-    }
-
-    // -- training ---------------------------------------------------------------
+    // -- building ---------------------------------------------------------------
 
     private struct SplitMix64
     {
@@ -246,18 +99,27 @@ internal sealed class IvfIndex
     }
 
     /// <summary>
-    /// Train centroids on a sample, then assign every live row. Deterministic
-    /// for a given data set, <paramref name="nlist"/>, <paramref name="seed"/>
-    /// and SIMD width (the assignment passes run in parallel but every row's
-    /// answer is independent of the others, and the centroid sums are
-    /// accumulated in a fixed order).
+    /// Train centroids on a sample of the table's live rows, then assign every
+    /// live row. Deterministic for a given data set, <paramref name="nlist"/>,
+    /// <paramref name="seed"/> and SIMD width (the assignment passes run in
+    /// parallel but every row's answer is independent of the others, and the
+    /// centroid sums are accumulated in a fixed order).
     /// </summary>
-    public void Train(int nlist, int seed, int iters = 8)
+    public static IvfIndex Build(VectorTable t, int nlist, int seed, int iters = 8)
     {
         var started = Stopwatch.GetTimestamp();
-        var live = new int[LiveCount];
-        for (int i = 0, j = 0; i < _n; i++)
-            if (_alive[i]) live[j++] = i;
+        var ivf = new IvfIndex(t.Dim);
+        ivf.Train(t, nlist, seed, iters);
+        ivf.BuildSeconds = Stopwatch.GetElapsedTime(started).TotalSeconds;
+        return ivf;
+    }
+
+    private void Train(VectorTable t, int nlist, int seed, int iters)
+    {
+        int n = t.Slots;
+        var live = new int[t.Live];
+        for (int i = 0, j = 0; i < n; i++)
+            if (t.IsLive(i)) live[j++] = i;
         int total = live.Length;
         nlist = Math.Max(1, Math.Min(nlist, total));
         var rng = new SplitMix64(seed);
@@ -279,145 +141,265 @@ internal sealed class IvfIndex
             Array.Sort(sample);
         }
 
-        // Unit-length sample rows (a zero row stays zero).
-        var x = new float[(long)sampleN * _stride];
-        for (int r = 0; r < sampleN; r++)
-        {
-            int row = sample[r];
-            float norm = _norms[row];
-            float scale = norm > 0f ? 1f / norm : 0f;
-            var src = new ReadOnlySpan<float>(_matrix, row * _stride, _stride);
-            var dst = new Span<float>(x, r * _stride, _stride);
-            for (int d = 0; d < _stride; d++) dst[d] = src[d] * scale;
-        }
+        // The sample is never copied out of the table: a unit-length, SIMD-padded copy of one row
+        // (a zero row stays zero) is produced on demand, so training allocates no sample matrix.
+        int stride = _stride;
 
         // Initial centroids: nlist distinct sample rows.
-        var cent = new float[(long)nlist * _stride];
+        var cent = new float[(long)nlist * stride];
         var pick = new int[sampleN];
         for (int i = 0; i < sampleN; i++) pick[i] = i;
         for (int c = 0; c < nlist; c++)
         {
             int j = c + rng.NextInt(sampleN - c);
             (pick[c], pick[j]) = (pick[j], pick[c]);
-            Array.Copy(x, pick[c] * _stride, cent, c * _stride, _stride);
+            UnitRow(t, sample[pick[c]], new Span<float>(cent, c * stride, stride));
         }
 
         var cell = new int[sampleN];
         var counts = new int[nlist];
-        var sums = new double[(long)nlist * _stride];
+        var sums = new double[(long)nlist * stride];
+        var unit = new float[stride];
         for (int it = 0; it < iters; it++)
         {
-            AssignNearest(x, null, sampleN, cent, nlist, cell);
+            AssignRows(t, sample, sampleN, cent, nlist, cell, BlockRows, unitRows: true);
             Array.Clear(counts);
             Array.Clear(sums);
             for (int r = 0; r < sampleN; r++)       // sequential: a fixed summation order
             {
                 int c = cell[r];
                 counts[c]++;
-                var src = new ReadOnlySpan<float>(x, r * _stride, _stride);
-                var acc = new Span<double>(sums, c * _stride, _stride);
-                for (int d = 0; d < _stride; d++) acc[d] += src[d];
+                UnitRow(t, sample[r], unit);
+                var acc = new Span<double>(sums, c * stride, stride);
+                for (int d = 0; d < stride; d++) acc[d] += unit[d];
             }
             for (int c = 0; c < nlist; c++)
             {
-                var dst = new Span<float>(cent, c * _stride, _stride);
-                var acc = new ReadOnlySpan<double>(sums, c * _stride, _stride);
-                for (int d = 0; d < _stride; d++) dst[d] = (float)acc[d];
+                var dst = new Span<float>(cent, c * stride, stride);
+                var acc = new ReadOnlySpan<double>(sums, c * stride, stride);
+                for (int d = 0; d < stride; d++) dst[d] = (float)acc[d];
                 float length = MathF.Sqrt(Dot(dst, dst));
                 if (counts[c] == 0 || length == 0f)  // re-seed a dead centroid on a random point
                 {
-                    Array.Copy(x, rng.NextInt(sampleN) * _stride, cent, c * _stride, _stride);
+                    UnitRow(t, sample[rng.NextInt(sampleN)], dst);
                     length = MathF.Sqrt(Dot(dst, dst));
                 }
                 if (length > 0f)
-                    for (int d = 0; d < _stride; d++) dst[d] /= length;
+                    for (int d = 0; d < stride; d++) dst[d] /= length;
             }
         }
 
         _centroids = cent;
         Nlist = nlist;
-        _cKey = new float[nlist];
-        _cId = new int[nlist];
-
-        // Every row, in the order of the table. (Raw rows rank centroids the same
-        // as unit rows: scaling by a positive norm does not change the argmax.)
-        AssignNearest(_matrix, null, _n, cent, nlist, _assign);
-        for (int i = 0; i < _n; i++)
-            if (!_alive[i]) _assign[i] = -1;
-        _pending.Clear();
+        _assign = new int[Math.Max(n, 16)];
+        _pos = new int[_assign.Length];
+        Array.Fill(_assign, NoCell);
+        AssignRows(t, null, n, cent, nlist, _assign, BlockRows, unitRows: false);
+        for (int i = 0; i < n; i++)
+            if (!t.IsLive(i)) _assign[i] = NoCell;
+        _pendLen = 0;
         Churn = 0;
         TrainedN = total;
-        Relist();
-        BuildSeconds = Stopwatch.GetElapsedTime(started).TotalSeconds;
+        Relist(n);
     }
 
-    /// <summary>Regroup the rows by cell (a stable counting sort of <c>_assign</c>).</summary>
-    private void Relist()
+    /// <summary>Rebuild every cell list from <c>_assign</c> (slot order within a cell) and the positions.</summary>
+    private void Relist(int n)
     {
-        if (_offsets.Length != Nlist + 1) _offsets = new int[Nlist + 1];
-        else Array.Clear(_offsets);
-        int assigned = 0;
-        for (int i = 0; i < _n; i++)
+        var counts = new int[Nlist];
+        for (int i = 0; i < n; i++)
         {
             int c = _assign[i];
-            if (c >= 0) { _offsets[c + 1]++; assigned++; }
+            if (c >= 0) counts[c]++;
         }
-        for (int c = 0; c < Nlist; c++) _offsets[c + 1] += _offsets[c];
-        if (_order.Length < assigned) _order = new int[assigned + assigned / 8 + 16];
-        var cursor = new int[Nlist];
-        Array.Copy(_offsets, cursor, Nlist);
-        for (int i = 0; i < _n; i++)
+        _lists = new int[Nlist][];
+        _listLen = new int[Nlist];
+        for (int c = 0; c < Nlist; c++) _lists[c] = new int[counts[c] + counts[c] / 8 + 4];
+        for (int i = 0; i < n; i++)
         {
             int c = _assign[i];
-            if (c >= 0) _order[cursor[c]++] = i;
+            if (c < 0) continue;
+            _pos[i] = _listLen[c];
+            _lists[c][_listLen[c]++] = i;
         }
     }
 
-    /// <summary>Give every pending row its nearest cell and regroup.</summary>
-    public void Fold()
+    // -- following the store ----------------------------------------------------
+
+    private void Detach(int slot)
     {
-        if (_pending.Count == 0) return;
-        var ids = new int[_pending.Count];
-        _pending.CopyTo(ids);
-        Array.Sort(ids);
-        var cells = new int[ids.Length];
-        AssignNearest(_matrix, ids, ids.Length, _centroids, Nlist, cells);
-        for (int i = 0; i < ids.Length; i++) _assign[ids[i]] = cells[i];
-        _pending.Clear();
-        Relist();
+        if ((uint)slot >= (uint)_assign.Length) return;
+        int cell = _assign[slot];
+        if (cell == NoCell) return;
+        int at = _pos[slot];
+        int[] list;
+        int last;
+        if (cell == Pending) { list = _pend; last = --_pendLen; }
+        else { list = _lists[cell]; last = --_listLen[cell]; }
+        if (at != last)
+        {
+            int moved = list[last];
+            list[at] = moved;
+            _pos[moved] = at;
+        }
+        _assign[slot] = NoCell;
+    }
+
+    /// <summary>
+    /// A row was written (new, or its vector replaced): it waits in the pending
+    /// list. Returns true when the list is long enough that the caller should
+    /// <see cref="Fold"/> now.
+    /// </summary>
+    public bool NotePut(int slot)
+    {
+        if (slot >= _assign.Length)
+        {
+            int cap = Math.Max(_assign.Length * 2, slot + 1);
+            int old = _assign.Length;
+            Array.Resize(ref _assign, cap);
+            Array.Resize(ref _pos, cap);
+            Array.Fill(_assign, NoCell, old, cap - old);
+        }
+        Detach(slot);
+        if (_pendLen == _pend.Length) Array.Resize(ref _pend, _pend.Length * 2);
+        _assign[slot] = Pending;
+        _pos[slot] = _pendLen;
+        _pend[_pendLen++] = slot;
+        Churn++;
+        return _pendLen >= FoldBatch;
+    }
+
+    public void NoteDrop(int slot)
+    {
+        Detach(slot);
+        Churn++;
+    }
+
+    /// <summary>Give every pending row its nearest cell.</summary>
+    public void Fold(VectorTable t)
+    {
+        if (_pendLen == 0) return;
+        var slots = new int[_pendLen];
+        Array.Copy(_pend, slots, _pendLen);
+        var cells = new int[slots.Length];
+        AssignRows(t, slots, slots.Length, _centroids, Nlist, cells, FoldBlockRows, unitRows: false);
+        _pendLen = 0;
+        for (int i = 0; i < slots.Length; i++)
+        {
+            int slot = slots[i], c = cells[i];
+            if (_listLen[c] == _lists[c].Length) Array.Resize(ref _lists[c], _lists[c].Length * 2 + 4);
+            _assign[slot] = c;
+            _pos[slot] = _listLen[c];
+            _lists[c][_listLen[c]++] = slot;
+        }
+    }
+
+    /// <summary>Follow the table's compaction: <paramref name="remap"/>[old] is the new slot, or -1 for a dead one.</summary>
+    public void Compact(int[] remap, int newSlots)
+    {
+        var assign = new int[Math.Max(newSlots, 16)];
+        Array.Fill(assign, NoCell);
+        for (int old = 0; old < remap.Length; old++)
+        {
+            int s = remap[old];
+            if (s >= 0 && old < _assign.Length) assign[s] = _assign[old];
+        }
+        var pending = new int[Math.Max(_pend.Length, FoldBatch + 16)];
+        int p = 0;
+        for (int i = 0; i < _pendLen; i++)
+        {
+            int s = remap[_pend[i]];
+            if (s >= 0) pending[p++] = s;
+        }
+        _assign = assign;
+        _pos = new int[assign.Length];
+        Relist(newSlots);
+        _pend = pending;
+        _pendLen = p;
+        for (int i = 0; i < p; i++) _pos[pending[i]] = i;
+    }
+
+    /// <summary>Every invariant of DESIGN.md section 7 that concerns the index; null when they hold.</summary>
+    public string? Verify(VectorTable t)
+    {
+        if (_assign.Length < t.Slots) return $"index covers {_assign.Length} rows, table has {t.Slots}";
+        if (_pendLen >= FoldBatch) return $"{_pendLen} rows pending, the cap is {FoldBatch}";
+        int seen = 0;
+        for (int c = 0; c < Nlist; c++)
+            for (int at = 0; at < _listLen[c]; at++)
+            {
+                int s = _lists[c][at];
+                if (_assign[s] != c || _pos[s] != at) return $"slot {s} listed in cell {c} at {at} but assigned {_assign[s]} at {_pos[s]}";
+                if (!t.IsLive(s)) return $"dead slot {s} still in cell {c}";
+                seen++;
+            }
+        for (int at = 0; at < _pendLen; at++)
+        {
+            int s = _pend[at];
+            if (_assign[s] != Pending || _pos[s] != at || !t.IsLive(s)) return $"pending slot {s} is inconsistent";
+            seen++;
+        }
+        if (seen != t.Live) return $"{seen} rows indexed, {t.Live} live";
+        for (int s = 0; s < t.Slots; s++)
+            if (!t.IsLive(s) && _assign[s] != NoCell) return $"dead slot {s} is assigned";
+        return null;
     }
 
     // -- nearest-centroid kernel ------------------------------------------------
 
     private const int BlockRows = 256;
+    private const int FoldBlockRows = 32;
     private const int CentroidTile = 64;
 
+    [ThreadStatic] private static float[]? t_block;
+
     /// <summary>
-    /// For <paramref name="count"/> rows (consecutive from 0, or the rows named
-    /// by <paramref name="ids"/>) of <paramref name="data"/>, the index of the
-    /// centroid with the largest dot product (the lowest index wins a tie).
-    /// <paramref name="output"/> is indexed like the rows, or by the row itself
-    /// when <paramref name="ids"/> is null.
+    /// A row of the table as the k-means kernel wants it: zero-padded to the
+    /// SIMD width and, when <paramref name="unit"/>, scaled to unit length (a
+    /// zero row stays zero).
     /// </summary>
-    private void AssignNearest(float[] data, int[]? ids, int count, float[] cent, int nlist, int[] output)
+    private void UnitRow(VectorTable t, int slot, Span<float> dst, bool unit = true)
+    {
+        t.Row(slot).CopyTo(dst);
+        dst.Slice(_dim).Clear();
+        if (!unit) return;
+        float norm = MathF.Sqrt(Dot(dst, dst));
+        float scale = norm > 0f ? 1f / norm : 0f;
+        for (int d = 0; d < _dim; d++) dst[d] *= scale;
+    }
+
+    /// <summary>
+    /// For <paramref name="count"/> table rows (slots 0.. or the named
+    /// <paramref name="slots"/>), the nearest centroid. <paramref name="output"/>
+    /// is indexed like the rows (by slot when <paramref name="slots"/> is null).
+    /// Each block of rows is copied into a zero-padded buffer first, so the
+    /// kernel and its results are the ones the padded layout always had.
+    /// </summary>
+    private void AssignRows(VectorTable t, int[]? slots, int count, float[] cent, int nlist, int[] output, int blockRows, bool unitRows)
     {
         if (count == 0) return;
         int stride = _stride;
-        int blocks = (count + BlockRows - 1) / BlockRows;
-        if (blocks == 1)
+        int blocks = (count + blockRows - 1) / blockRows;
+        void One(int b)
         {
-            NearestBlock(data, ids, 0, count, cent, nlist, stride, output);
-            return;
+            int start = b * blockRows;
+            int len = Math.Min(blockRows, count - start);
+            var buf = t_block;
+            if (buf is null || buf.Length < len * stride) t_block = buf = new float[Math.Max(len, BlockRows) * stride];
+            for (int i = 0; i < len; i++)
+            {
+                int slot = slots is null ? start + i : slots[start + i];
+                UnitRow(t, slot, new Span<float>(buf, i * stride, stride), unitRows);
+            }
+            NearestBlock(buf, null, 0, len, cent, nlist, stride, output, start);
         }
-        Parallel.For(0, blocks, b =>
-        {
-            int start = b * BlockRows;
-            NearestBlock(data, ids, start, Math.Min(BlockRows, count - start), cent, nlist, stride, output);
-        });
+        if (blocks == 1) One(0);
+        else Parallel.For(0, blocks, One);
     }
 
     private static void NearestBlock(
-        float[] data, int[]? ids, int start, int count, float[] cent, int nlist, int stride, int[] output)
+        float[] data, int[]? ids, int start, int count, float[] cent, int nlist, int stride, int[] output,
+        int outputStart = -1)
     {
         Span<float> best = stackalloc float[BlockRows];
         Span<int> bestIdx = stackalloc int[BlockRows];
@@ -444,8 +426,9 @@ internal sealed class IvfIndex
                 }
             }
         }
+        int o = outputStart >= 0 ? outputStart : start;
         for (int i = 0; i < count; i++)
-            output[start + i] = bestIdx[i];
+            output[o + i] = bestIdx[i];
     }
 
     /// <summary>Four rows against centroids [from, to): two centroids per step, eight independent accumulators.</summary>
@@ -504,7 +487,7 @@ internal sealed class IvfIndex
         if (score > best[g]) { best[g] = score; bestIdx[g] = c; }
     }
 
-    /// <summary>Dot product of two equal-length, lane-padded spans.</summary>
+    /// <summary>Dot product of two equal-length, lane-padded spans (centroid ranking and k-means only).</summary>
     private static float Dot(ReadOnlySpan<float> a, ReadOnlySpan<float> b)
     {
         var va = MemoryMarshal.Cast<float, Vector<float>>(a);
@@ -526,146 +509,45 @@ internal sealed class IvfIndex
     // -- query ------------------------------------------------------------------
 
     /// <summary>
-    /// Score the rows in the <paramref name="lists"/> cells nearest the query,
-    /// plus every pending row, into the candidate buffers (rows that pass the
-    /// type filter and <paramref name="threshold"/>). Returns false for a zero
-    /// query, which has no direction to rank cells by. Allocates nothing per row.
+    /// Feed the rows of the <paramref name="lists"/> cells nearest the query,
+    /// plus every pending row, to <paramref name="visitor"/> (rows of the type
+    /// <paramref name="code"/>, or all when it is negative). Allocates only
+    /// its own scratch, so concurrent calls are safe. The caller has checked
+    /// the query has a direction (a non-zero norm).
     /// </summary>
-    public bool Scan(float[] query, string? nodeType, float threshold, int lists, out int passing)
+    public void Scan<TV>(VectorTable t, float[] query, int code, int lists, ref TV visitor)
+        where TV : struct, IRowVisitor
     {
-        passing = 0;
-        _candCount = 0;
-        query.AsSpan(0, _dim).CopyTo(_q);
-        float qnorm = MathF.Sqrt(Dot(_q, _q));
-        if (qnorm == 0f) return false;
-        int code = -1;
-        if (nodeType is not null && !_codeOf.TryGetValue(nodeType, out code))
-            return true;                                // no row has this type
-
-        int stride = _stride;
-        int nlist = Nlist;
-        var centroids = _centroids;
-        for (int c = 0; c < nlist; c++)
+        int nlist = Nlist, stride = _stride;
+        // the query, padded the way the centroids are
+        var qpad = ArrayPool<float>.Shared.Rent(stride);
+        var keys = ArrayPool<ulong>.Shared.Rent(nlist);
+        try
         {
-            _cKey[c] = -Dot(_q, new ReadOnlySpan<float>(centroids, c * stride, stride));
-            _cId[c] = c;
-        }
-        if (lists < nlist)
-            MemoryExtensions.Sort(_cKey.AsSpan(0, nlist), _cId.AsSpan(0, nlist));
-        else
-            lists = nlist;
-
-        var matrix = _matrix;
-        var norms = _norms;
-        var codes = _codes;
-        var assign = _assign;
-        var order = _order;
-        var offsets = _offsets;
-        for (int l = 0; l < lists; l++)
-        {
-            int cell = _cId[l];
-            for (int p = offsets[cell], end = offsets[cell + 1]; p < end; p++)
+            Array.Clear(qpad, 0, stride);
+            Array.Copy(query, qpad, _dim);
+            var q = new ReadOnlySpan<float>(qpad, 0, stride);
+            for (int c = 0; c < nlist; c++)
             {
-                int row = order[p];
-                if (assign[row] != cell) continue;      // deleted or updated since the last regroup
-                if (code >= 0 && codes[row] != code) continue;
-                Consider(row, qnorm, threshold);
+                float s = Dot(q, new ReadOnlySpan<float>(_centroids, c * stride, stride));
+                int bits = BitConverter.SingleToInt32Bits(s);
+                uint ordered = bits < 0 ? ~(uint)bits : (uint)bits | 0x80000000u;   // ascending = ascending score
+                keys[c] = ((ulong)~ordered << 32) | (uint)c;                         // best score first, then lowest cell
             }
-        }
-        foreach (int row in _pending)
-        {
-            if (code >= 0 && codes[row] != code) continue;
-            Consider(row, qnorm, threshold);
-        }
-        passing = _candCount;
-        return true;
-    }
+            if (lists < nlist) Array.Sort(keys, 0, nlist);
+            else lists = nlist;
 
-    private void Consider(int row, float qnorm, float threshold)
-    {
-        float dot = Dot(_q, new ReadOnlySpan<float>(_matrix, row * _stride, _stride));
-        float denom = _norms[row] * qnorm;
-        float score = denom > 0f ? dot / denom : 0f;
-        if (!(score >= threshold)) return;
-        if (_candCount == _candRows.Length)
-        {
-            Array.Resize(ref _candRows, _candCount * 2);
-            Array.Resize(ref _candScores, _candCount * 2);
-        }
-        _candRows[_candCount] = row;
-        _candScores[_candCount++] = score;
-    }
-
-    private static bool Better(float s1, int r1, float s2, int r2) => s1 > s2 || (s1 == s2 && r1 < r2);
-
-    /// <summary>
-    /// The best <paramref name="k"/> of the last <see cref="Scan"/>, best first;
-    /// equal scores keep row (insertion) order, as in the exact scan.
-    /// </summary>
-    public List<SimilarityResult> TopK(int k)
-    {
-        if (_topRows.Length < k)
-        {
-            _topRows = new int[k];
-            _topScores = new float[k];
-        }
-        var topRows = _topRows;
-        var topScores = _topScores;
-        int m = 0;
-        for (int i = 0; i < _candCount; i++)
-        {
-            float s = _candScores[i];
-            int r = _candRows[i];
-            if (m == k && !Better(s, r, topScores[k - 1], topRows[k - 1])) continue;
-            int pos = m < k ? m++ : k - 1;
-            while (pos > 0 && Better(s, r, topScores[pos - 1], topRows[pos - 1]))
+            for (int l = 0; l < lists; l++)
             {
-                topScores[pos] = topScores[pos - 1];
-                topRows[pos] = topRows[pos - 1];
-                pos--;
+                int cell = (int)(keys[l] & 0xFFFFFFFFu);
+                RowScan.Slots(t, query, code, _lists[cell], 0, _listLen[cell], ref visitor);
             }
-            topScores[pos] = s;
-            topRows[pos] = r;
+            RowScan.Slots(t, query, code, _pend, 0, _pendLen, ref visitor);
         }
-        var results = new List<SimilarityResult>(m);
-        for (int i = 0; i < m; i++)
+        finally
         {
-            var rec = _recs[topRows[i]]!;
-            results.Add(new SimilarityResult(rec.NodeRef, topScores[i], rec.Text));
+            ArrayPool<float>.Shared.Return(qpad);
+            ArrayPool<ulong>.Shared.Return(keys);
         }
-        return results;
-    }
-
-    /// <summary>
-    /// Every candidate of the last <see cref="Scan"/>, best first, as a
-    /// snapshot that stays valid however the index changes afterwards.
-    /// </summary>
-    public IEnumerable<SimilarityResult> RankedSnapshot()
-    {
-        int m = _candCount;
-        var keys = new ulong[m];
-        for (int i = 0; i < m; i++)
-        {
-            int bits = BitConverter.SingleToInt32Bits(_candScores[i]);
-            uint ordered = bits < 0 ? ~(uint)bits : (uint)bits | 0x80000000u;   // ascending = ascending score
-            keys[i] = ((ulong)~ordered << 32) | (uint)_candRows[i];               // best score, then lowest row, first
-        }
-        Array.Sort(keys);
-        var recs = new EmbeddingRecord[m];
-        var scores = new float[m];
-        for (int i = 0; i < m; i++)
-        {
-            uint ordered = ~(uint)(keys[i] >> 32);
-            int bits = (ordered & 0x80000000u) != 0 ? (int)(ordered & 0x7FFFFFFFu) : (int)~ordered;
-            scores[i] = BitConverter.Int32BitsToSingle(bits);
-            recs[i] = _recs[(int)(keys[i] & 0xFFFFFFFFu)]!;
-        }
-        return Enumerate(recs, scores);
-    }
-
-    private static IEnumerable<SimilarityResult> Enumerate(EmbeddingRecord[] recs, float[] scores)
-    {
-        for (int i = 0; i < recs.Length; i++)
-            yield return new SimilarityResult(recs[i].NodeRef, scores[i], recs[i].Text);
     }
 }

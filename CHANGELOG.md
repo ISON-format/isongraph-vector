@@ -208,6 +208,51 @@ JavaScript, Rust and C++.
   Costs: single-thread exact scan is 0-13% slower, ingest is slower, and
   updates at 1M are 2-3x slower because index upkeep moved from the first
   search to the write.
+- **Python, C#, TypeScript, JavaScript and C++: one copy of every vector,
+  batch search, binary snapshot** (the Rust design of `DESIGN.md` sections 1, 5
+  and 11 carried over; measured per port below). Each store now keeps every
+  vector once in a chunked (or contiguous) float32 table and records refer to
+  its rows, so the second copy that the index or the scan cache used to hold is
+  gone, and pending rows fold into the IVF index at write time (JavaScript /
+  TypeScript keep their search-time fold: a fold inside a write would block it
+  for seconds). Memory at 100k x 384 (raw 146 MB, steady RSS above baseline,
+  3 runs, shared laptop): Python 437 -> 211 MB, TypeScript / JavaScript 435 ->
+  197 MB (590 -> 203 MB with the index), C# IVF store 409 -> 215 MB, C++ IVF
+  store 329 -> 167 MB; at 1M x 384 (one run each) the new figures are 1.12-1.25x
+  raw (Python 1.25x, TypeScript 1.21x, C# 1.15x exact / 1.18x with IVF, C++
+  1.12x with IVF; JavaScript was not measured at 1M);
+  the old 3.3-7.0 GB figures are in `benchmarks/competitive/`. New:
+  `similarity_search_batch` (Python: one matrix-matrix product; 8x one-at-a-time
+  at 100k), `SimilaritySearchBatch` (C#), `similaritySearchBatch` (C++),
+  parallel across queries and bit-identical to single-query search in C# and
+  C++; searches are safe to run concurrently in C# and C++. The optional
+  `.embeddings.snap` file (`save(snapshot=True)` / `Save(..., snapshot: true)` /
+  `saveGraph(..., {snapshot: true})`, byte layout in Rust `DESIGN.md` section
+  11) is written and read by all six ports, is 3-5x smaller and roughly
+  13-45x faster to save and load (C#, C++, Python) than the JSON sidecar at 100k x 384, and is the only
+  way to persist a 100k-row store in JavaScript (the JSON export exceeds V8's
+  string limit). A snapshot is used only when it provably belongs to the graph
+  and sidecar on disk, otherwise the JSON is read; graph files, sidecar bytes
+  and digests are unchanged. Cross-port: a snapshot written by any port loads
+  in every other port (`scripts/cross_port/graph_files.py`).
+  **Breaking, per port:** `get` / `get_embedding` return a copy of the vector
+  in C#, C++ (`std::optional<EmbeddingRecord>`), TypeScript and JavaScript;
+  `AnnStats.vectorBytes` / `cacheBytes` are 0 (the index owns no vectors);
+  pending rows fold below 256 at write time (Python, C#, C++);
+  TypeScript / JavaScript store vectors as float32 (inputs that are not
+  float32-exact read back rounded: `0.1` -> `0.10000000149011612`; scores
+  changed by at most 1.3e-8 in a 1,500-vector check); C# `Add` copies the
+  caller's array; Python in-memory stores no longer have a SQLite table; equal
+  scores order by arrival in C# and C++. **Python exact top-k scores are now
+  canonical:** BLAS narrows the field and the rows near the k-th score are
+  rescored with one kernel, so batch equals single bit for bit; scores can
+  differ from the previous release in the last float32 bit and near-ties can
+  reorder (`store.canonical_scores = False` restores the old behaviour).
+  Costs: single-query IVF is within noise in Python and C++, about 9% slower in
+  TypeScript / JavaScript and 8-25% slower in C# (its scalar kernel keeps C#'s
+  own summation order, so C# scores can still differ from Rust's in the last
+  bits, as before); C++ IVF writes cost about 5 us more because of the
+  fold.
 - **Async encoders in TypeScript / JavaScript** - `AsyncEncoder` and
   `...Async` methods (`addNodeAsync`, `updateNodeAsync`, `embedAllNodesAsync`,
   `reembedStaleAsync`, `similaritySearchAsync`, `semanticMultiHopAsync`, ...)
@@ -242,15 +287,16 @@ JavaScript, Rust and C++.
   minutes at 1M vectors).
 - **Not a vector-database replacement.** Against faiss, hnswlib and usearch
   the ports are 2-4x slower per query at 100k and about 14x slower at 1M text
-  vectors at equal recall; only Rust has batched and concurrent search (the other ports serialise on one lock); vectors
-  persist as JSON only; and memory is 2-4x higher (Rust is now 1.1x raw; the other ports still store vectors twice). Graph-aware retrieval
+  vectors at equal recall; only Rust, C# and C++ have concurrent search and Python has batch search (TypeScript and JavaScript are single-threaded); the ANN index is
+  never persisted and the binary snapshot is opt-in (JSON is the portable default); and memory is 1.12-1.25x raw at 1M in the four ports measured, against 1.6-1.9 GB for faiss / hnswlib at 1M x 384 (re-run `benchmarks/competitive/` before quoting the
+  ratios: they predate the rework). Graph-aware retrieval
   beating plain vector search on multi-hop questions is the supported claim,
   and it depends on the graph carrying real structure
   (`benchmarks/multihop/README.md`).
 - Fast filtered search was only measured for node-type filters, and only Rust
   is fast there (Python's filtered search is no faster than its unfiltered
-  scan). The C++ exact scan is scalar and about 6x slower than numpy; the C#
-  and JS exact scans are also slower than numpy.
+  scan). The C++, C# and JS exact scans are scalar and still slower than numpy
+  (about 2x faster than before this change in C++ and C#, 1.6x in JS).
 - The digest cannot tell `1` from `1.0` in JavaScript / TypeScript, and
   integers beyond 64 bits are not supported in C# / C++ / Rust. Where a graph
   contains such values the loader warns instead of raising a false mismatch.

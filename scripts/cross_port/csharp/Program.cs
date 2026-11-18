@@ -5,8 +5,9 @@
 //     CrossPortGraph mismatch <dir>
 //
 // `write` saves the shared fixture graph as <dir>/graph.ison plus its
-// embeddings sidecar. `read` loads it with GraphMismatchMode.Error and writes
-// what it found to <observation.json>. `mismatch` loads a graph whose file was
+// embeddings sidecar and binary snapshot. `read` loads it with
+// GraphMismatchMode.Error and writes what it found (and the load source,
+// snapshot or json, with the reason a snapshot was skipped) to <observation.json>. `mismatch` loads a graph whose file was
 // edited after the save and exits 0 only if the load throws
 // GraphEmbeddingMismatchException.
 //
@@ -50,7 +51,7 @@ void Write(string dir)
     foreach (var (rel, source, target, props) in Edges)
         graph.AddEdge(rel, source, target, props);
     Directory.CreateDirectory(dir);
-    graph.Save(GraphPath(dir));
+    graph.Save(GraphPath(dir), snapshot: true);
 }
 
 void WriteValue(Utf8JsonWriter w, object? value)
@@ -90,7 +91,7 @@ void WriteRef(Utf8JsonWriter w, NodeRef r)
 void Read(string dir, string output)
 {
     var encoder = new MockEncoder(Dim);
-    var graph = SemanticGraph.Load(GraphPath(dir), encoder, onMismatch: GraphMismatchMode.Error);
+    var (graph, report) = SemanticGraph.LoadWithReport(GraphPath(dir), encoder, onMismatch: GraphMismatchMode.Error);
 
     using var stream = new MemoryStream();
     using (var w = new Utf8JsonWriter(stream))
@@ -155,6 +156,14 @@ void Read(string dir, string output)
             w.WriteEndObject();
         }
         w.WriteEndArray();
+        w.WriteString("source", report.Source switch
+        {
+            LoadSource.Snapshot => "snapshot",
+            LoadSource.Json => "json",
+            _ => "none",
+        });
+        w.WritePropertyName("snapshot_skipped");
+        if (report.SnapshotSkipped is null) w.WriteNullValue(); else w.WriteStringValue(report.SnapshotSkipped);
         w.WriteEndObject();
     }
     File.WriteAllBytes(output, stream.ToArray());

@@ -5,8 +5,9 @@
 //     cross_port_graph mismatch <dir>
 //
 // `write` saves the shared fixture graph as <dir>/graph.ison plus its
-// embeddings sidecar. `read` loads it with GraphMismatchMode::Error and writes
-// what it found to <observation.json>. `mismatch` loads a graph whose file was
+// embeddings sidecar and binary snapshot. `read` loads it with
+// GraphMismatchMode::Error and writes what it found (and the load source,
+// snapshot or json, with the reason a snapshot was skipped) to <observation.json>. `mismatch` loads a graph whose file was
 // edited after the save and exits 0 only if the load throws
 // GraphEmbeddingMismatchError.
 //
@@ -140,18 +141,21 @@ void write(const std::string& dir) {
         graph.addEdge(e.rel, e.source, e.target, e.props);
     }
     std::filesystem::create_directories(dir);
-    graph.save(graphPath(dir));
+    graph.save(graphPath(dir), "auto", true, true);
 }
 
-SemanticGraph load(const std::string& dir, const std::shared_ptr<MockEncoder>& encoder) {
+SemanticGraph load(const std::string& dir, const std::shared_ptr<MockEncoder>& encoder,
+                   LoadReport* report = nullptr) {
     return SemanticGraph::load(graphPath(dir), encoder, "auto", true, true,
                                {"name", "description", "content", "text"},
-                               GraphMismatchMode::Error);
+                               GraphMismatchMode::Error, std::nullopt,
+                               ModelMismatchMode::Warn, std::nullopt, report);
 }
 
 void read(const std::string& dir, const std::string& output) {
     auto encoder = std::make_shared<MockEncoder>(DIM);
-    SemanticGraph graph = load(dir, encoder);
+    LoadReport report;
+    SemanticGraph graph = load(dir, encoder, &report);
 
     std::string out = "{\"port\":\"cpp\",\"nodes\":[";
     std::vector<NodeRef> missing;
@@ -162,8 +166,8 @@ void read(const std::string& dir, const std::string& output) {
         first = false;
         out += "{\"type\":" + jstr(node.type) + ",\"id\":" + jstr(node.id) +
                ",\"props\":" + jprops(node.properties) + "}";
-        const EmbeddingRecord* record = graph.getEmbedding(NodeRef(node.type, node.id));
-        if (record == nullptr) {
+        const std::optional<EmbeddingRecord> record = graph.getEmbedding(NodeRef(node.type, node.id));
+        if (!record) {
             missing.push_back(NodeRef(node.type, node.id));
             return;
         }
@@ -198,7 +202,13 @@ void read(const std::string& dir, const std::string& output) {
                (hits.empty() ? std::string("null") : jref(hits[0].node_ref)) + ",\"score\":" +
                (hits.empty() ? std::string("null") : jnum(hits[0].score)) + "}";
     }
-    out += "]}";
+    out += "],\"source\":";
+    out += report.source == LoadSource::Snapshot ? "\"snapshot\""
+           : report.source == LoadSource::Json   ? "\"json\""
+                                                 : "\"none\"";
+    out += ",\"snapshot_skipped\":" +
+           (report.snapshotSkipped ? jstr(*report.snapshotSkipped) : std::string("null"));
+    out += "}";
 
     std::ofstream file(output, std::ios::binary);
     file << out;

@@ -591,6 +591,8 @@ export function selectTopK(results, k) {
 // =============================================================================
 // Approximate (IVF) search
 // =============================================================================
+/** An exact search for at most this many results keeps them in a small sorted buffer; a larger k collects every hit first. */
+const EXACT_TOPK_BUFFER = 256;
 /** Stores below this many vectors answer exactly even with `ann` on. */
 const ANN_MIN_SIZE = 50000;
 /** New or updated rows are scored exactly until this many (or this fraction of the trained size) are pending. */
@@ -814,107 +816,198 @@ class CentroidSearch {
         return best;
     }
 }
+/** Rows per matrix chunk (= one scan block). Chunks never move once allocated, so growth never copies stored rows. */
+const CHUNK_ROWS = 1024;
+const CHUNK_SHIFT = 10;
+const CHUNK_MASK = CHUNK_ROWS - 1;
+/** Rows the first chunk starts with; it doubles until it holds CHUNK_ROWS, later chunks are allocated whole. */
+const FIRST_CHUNK_ROWS = 16;
+/** True when this host stores a Float32Array in little-endian byte order (the snapshot's byte order). */
+export function hostIsLittleEndian() {
+    return new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
+}
+const HOST_LITTLE_ENDIAN = hostIsLittleEndian();
 /**
- * Float32Array snapshot of the store's vectors, kept in step with its writes.
+ * The store's single copy of every vector, plus the per-row facts around it.
  *
- * One contiguous matrix with spare row capacity, the vector norms, a type code
- * per row and a liveness flag. A write patches it in place: an insert appends
- * a row, an update overwrites one, a delete tombstones one (squeezed out once
- * a quarter of the rows are dead). Rows stay in insertion order, which is the
- * order the store's Map iterates, so ties break exactly as the exact scan's do.
- * Built lazily by the first approximate search, never persisted.
+ * A record *is a slot number*; nothing else owns the floats (see the Rust
+ * crate's DESIGN.md, section 1). The rows live in `Float32Array` chunks of
+ * {@link CHUNK_ROWS} rows each, `dim` floats per row, row-major; `norms`,
+ * `codes` and `modelIx` are parallel columns, and `keys`/`refs`/`texts` hold the
+ * strings. Slots are in arrival order, which is the order the store used to
+ * iterate its records in, so ties still break the way they always did: an update
+ * overwrites its slot in place, an insert takes `n`, a delete tombstones (key
+ * `null`, norm `NaN`). Trailing tombstones are popped; once a quarter of the
+ * slots are dead the live rows are moved down, keeping their order.
+ *
+ * Both exact search and the IVF index read the rows from here, so the index adds
+ * no second copy of the vectors. Not part of the stable API: it is exported so
+ * the snapshot module can read and fill it.
  */
-class ScanCache {
-    constructor(dim, capacity) {
-        /** Rows in use, tombstones included, and how many of those are tombstones. */
+export class VectorTable {
+    constructor(dim) {
+        this.chunks = [];
+        /** Euclidean norm of each row, computed from the float32 values; NaN = tombstone. */
+        this.norms = new Float64Array(0);
+        /** Node type of each row, as an index into `typeNames`. */
+        this.codes = new Int32Array(0);
+        /** Model of each row, as an index into `modelNames`. */
+        this.modelIx = new Int32Array(0);
+        /** `"type:id"` of each row, or null for a tombstone. */
+        this.keys = [];
+        this.refs = [];
+        this.texts = [];
+        this.modelNames = [];
+        this.typeNames = [];
+        this.codeOf = new Map();
+        /** key -> slot: the only lookup structure. */
+        this.index = new Map();
+        this._modelOf = new Map();
+        /** Slots in use, tombstones included, and how many of those are tombstones. */
         this.n = 0;
         this.dead = 0;
-        this.keys = [];
-        this.pos = new Map();
-        this.codeOf = new Map();
         this.ivf = null;
         this.dim = dim;
-        this.matrix = new Float32Array(capacity * dim);
-        this.norms = new Float64Array(capacity);
-        this.codes = new Int32Array(capacity);
-        this.alive = new Uint8Array(capacity);
         this.query = new Float32Array(dim);
-    }
-    static build(records, count, dim) {
-        const cache = new ScanCache(dim, count + Math.max(1024, count >> 4));
-        for (const record of records)
-            cache.put(record.id, record);
-        return cache;
     }
     get capacity() {
         return this.norms.length;
     }
-    _grow() {
-        const capacity = this.capacity + Math.max(1024, this.capacity >> 2);
-        const matrix = new Float32Array(capacity * this.dim);
-        matrix.set(this.matrix.subarray(0, this.n * this.dim));
+    /** Live rows. */
+    get live() {
+        return this.index.size;
+    }
+    _modelId(name) {
+        let id = this._modelOf.get(name);
+        if (id === undefined) {
+            id = this.modelNames.length;
+            this.modelNames.push(name);
+            this._modelOf.set(name, id);
+        }
+        return id;
+    }
+    _growColumns() {
+        const capacity = this.capacity + Math.max(1024, this.capacity >> 1);
         const norms = new Float64Array(capacity);
         norms.set(this.norms.subarray(0, this.n));
         const codes = new Int32Array(capacity);
         codes.set(this.codes.subarray(0, this.n));
-        const alive = new Uint8Array(capacity);
-        alive.set(this.alive.subarray(0, this.n));
-        this.matrix = matrix;
+        const modelIx = new Int32Array(capacity);
+        modelIx.set(this.modelIx.subarray(0, this.n));
         this.norms = norms;
         this.codes = codes;
-        this.alive = alive;
+        this.modelIx = modelIx;
     }
-    /** Mirror one upserted record. */
-    put(key, record) {
+    /** Make sure the chunk holding `slot` exists and is big enough. */
+    _ensureRow(slot) {
+        const c = slot >>> CHUNK_SHIFT;
         const dim = this.dim;
-        let i = this.pos.get(key);
-        if (i === undefined) {
-            if (this.n >= this.capacity)
-                this._grow();
-            i = this.n++;
-            this.keys[i] = key;
-            this.pos.set(key, i);
-            const type = record.nodeRef[0];
-            let code = this.codeOf.get(type);
-            if (code === undefined) {
-                code = this.codeOf.size;
-                this.codeOf.set(type, code);
-            }
-            this.codes[i] = code;
-            this.alive[i] = 1;
+        if (c === this.chunks.length) {
+            this.chunks.push(new Float32Array((c === 0 ? FIRST_CHUNK_ROWS : CHUNK_ROWS) * dim));
         }
-        const vector = record.vector;
-        const base = i * dim;
+        else if (c === 0) {
+            const first = this.chunks[0];
+            const need = ((slot & CHUNK_MASK) + 1) * dim;
+            if (first.length < need) {
+                const grown = new Float32Array(Math.min(CHUNK_ROWS * dim, Math.max(need, first.length * 2)));
+                grown.set(first);
+                this.chunks[0] = grown;
+            }
+        }
+    }
+    /** Find or create the slot of `key` and set its metadata; the caller writes the row and the norm. */
+    _claim(key, ref, text, model) {
+        const type = ref[0];
+        let code = this.codeOf.get(type);
+        if (code === undefined) {
+            code = this.typeNames.length;
+            this.typeNames.push(type);
+            this.codeOf.set(type, code);
+        }
+        let slot = this.index.get(key);
+        if (slot === undefined) {
+            if (this.n >= this.capacity)
+                this._growColumns();
+            slot = this.n++;
+            this._ensureRow(slot);
+            this.keys[slot] = key;
+            this.index.set(key, slot);
+        }
+        this.refs[slot] = ref;
+        this.texts[slot] = text;
+        this.codes[slot] = code;
+        this.modelIx[slot] = this._modelId(model);
+        return slot;
+    }
+    /** Insert or overwrite the row of `key`; returns its slot. The values are stored as float32. */
+    put(key, ref, text, model, vector) {
+        const slot = this._claim(key, ref, text, model);
+        const dim = this.dim;
+        const chunk = this.chunks[slot >>> CHUNK_SHIFT];
+        const base = (slot & CHUNK_MASK) * dim;
         let sum = 0;
         for (let j = 0; j < dim; j++) {
             const f = Math.fround(vector[j]);
-            this.matrix[base + j] = f;
+            chunk[base + j] = f;
             sum += f * f;
         }
-        this.norms[i] = Math.sqrt(sum);
+        this.norms[slot] = Math.sqrt(sum);
         if (this.ivf !== null)
-            this.ivf.notePut(i, this.capacity);
+            this.ivf.notePut(slot, this.capacity);
+        return slot;
     }
-    /** Mirror one deleted record. */
-    drop(key) {
-        const i = this.pos.get(key);
-        if (i === undefined)
-            return;
-        this.pos.delete(key);
-        this.matrix.fill(0, i * this.dim, (i + 1) * this.dim);
-        this.norms[i] = 0;
-        this.alive[i] = 0;
-        this.keys[i] = null;
+    /**
+     * Like {@link put}, from `dim * 4` bytes of little-endian IEEE-754 float32
+     * (the snapshot's row encoding). On a little-endian host the bytes are copied
+     * as they are; otherwise (or with `portable`) each float is read through a
+     * DataView.
+     */
+    putLittleEndian(key, ref, text, model, bytes, portable = false) {
+        const slot = this._claim(key, ref, text, model);
+        const dim = this.dim;
+        const chunk = this.chunks[slot >>> CHUNK_SHIFT];
+        const base = (slot & CHUNK_MASK) * dim;
+        if (HOST_LITTLE_ENDIAN && !portable) {
+            new Uint8Array(chunk.buffer, chunk.byteOffset + base * 4, dim * 4).set(bytes);
+        }
+        else {
+            const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+            for (let j = 0; j < dim; j++)
+                chunk[base + j] = view.getFloat32(4 * j, true);
+        }
+        let sum = 0;
+        for (let j = 0; j < dim; j++) {
+            const f = chunk[base + j];
+            sum += f * f;
+        }
+        this.norms[slot] = Math.sqrt(sum);
+        if (this.ivf !== null)
+            this.ivf.notePut(slot, this.capacity);
+        return slot;
+    }
+    /** Tombstone the row of `key`; false when there is none. */
+    remove(key) {
+        const slot = this.index.get(key);
+        if (slot === undefined)
+            return false;
+        this.index.delete(key);
+        this.keys[slot] = null;
+        this.refs[slot] = null;
+        this.texts[slot] = '';
+        this.norms[slot] = NaN;
         this.dead++;
         if (this.ivf !== null)
-            this.ivf.noteDrop(i);
-        while (this.n > 0 && this.alive[this.n - 1] === 0) { // trailing tombstones
+            this.ivf.noteDrop(slot);
+        while (this.n > 0 && this.keys[this.n - 1] === null) { // trailing tombstones
             this.n--;
             this.keys.pop();
+            this.refs.pop();
+            this.texts.pop();
             this.dead--;
         }
         if (this.dead > 32 && this.dead * 4 > this.n)
             this._compact();
+        return true;
     }
     /** Squeeze the tombstones out, keeping the live rows in their order. */
     _compact() {
@@ -922,33 +1015,58 @@ class ScanCache {
         const live = new Int32Array(this.n - this.dead);
         let kept = 0;
         for (let r = 0; r < this.n; r++)
-            if (this.alive[r] === 1)
+            if (this.keys[r] !== null)
                 live[kept++] = r;
         if (this.ivf !== null)
             this.ivf.compact(live);
         for (let w = 0; w < kept; w++) {
             const r = live[w];
-            if (r !== w) {
-                this.matrix.copyWithin(w * dim, r * dim, (r + 1) * dim);
-                this.norms[w] = this.norms[r];
-                this.codes[w] = this.codes[r];
-                const key = this.keys[r];
-                this.keys[w] = key;
-                this.pos.set(key, w);
-            }
+            if (r === w)
+                continue;
+            const src = this.chunks[r >>> CHUNK_SHIFT];
+            const dst = this.chunks[w >>> CHUNK_SHIFT];
+            const so = (r & CHUNK_MASK) * dim;
+            const d = (w & CHUNK_MASK) * dim;
+            if (src === dst)
+                src.copyWithin(d, so, so + dim);
+            else
+                dst.set(src.subarray(so, so + dim), d);
+            this.norms[w] = this.norms[r];
+            this.codes[w] = this.codes[r];
+            this.modelIx[w] = this.modelIx[r];
+            const key = this.keys[r];
+            this.keys[w] = key;
+            this.refs[w] = this.refs[r];
+            this.texts[w] = this.texts[r];
+            this.index.set(key, w);
         }
-        this.alive.fill(1, 0, kept);
-        this.alive.fill(0, kept, this.n);
         this.keys.length = kept;
+        this.refs.length = kept;
+        this.texts.length = kept;
+        this.chunks.length = Math.ceil(kept / CHUNK_ROWS);
         this.n = kept;
         this.dead = 0;
     }
+    /** The vector of `slot` as a fresh array of numbers (the float32 values, widened). */
+    vectorAt(slot) {
+        const dim = this.dim;
+        const chunk = this.chunks[slot >>> CHUNK_SHIFT];
+        const base = (slot & CHUNK_MASK) * dim;
+        const out = new Array(dim);
+        for (let j = 0; j < dim; j++)
+            out[j] = chunk[base + j];
+        return out;
+    }
+    /** Bytes of the vectors and the numeric columns (not the strings). */
     bytes() {
-        return this.matrix.byteLength + this.norms.byteLength + this.codes.byteLength + this.alive.byteLength;
+        let total = this.norms.byteLength + this.codes.byteLength + this.modelIx.byteLength;
+        for (const chunk of this.chunks)
+            total += chunk.byteLength;
+        return total;
     }
 }
 /**
- * Inverted-file ("IVF-flat") index over a {@link ScanCache}.
+ * Inverted-file ("IVF-flat") index over a {@link VectorTable}.
  *
  * Spherical k-means partitions the rows into `nlist` cells by direction, which
  * is what cosine similarity compares. A query scores the `nprobe` cells whose
@@ -957,7 +1075,7 @@ class ScanCache {
  * cell number per row (`assign`) plus the rows grouped by cell
  * (`order`/`offsets`), about 8 bytes per vector plus the centroids.
  *
- * It follows its cache instead of being rebuilt on every write:
+ * It follows its table instead of being rebuilt on every write:
  *  - a **new** or **updated** row is *pending* (cell -1): every query scores
  *    the pending rows exactly, so a write is visible at once and costs the
  *    index nothing;
@@ -965,7 +1083,7 @@ class ScanCache {
  *    are enough of them (see `EmbeddingStore._annIndex`);
  *  - a **delete** clears the row's cell; stale entries in `order` are skipped
  *    at query time;
- *  - the cache's compaction renumbers rows, and `compact` carries the cells
+ *  - the table's compaction renumbers rows, and `compact` carries the cells
  *    across without retraining;
  *  - `churn` counts writes and deletes since training; the store retrains when
  *    it passes a fraction of the trained size.
@@ -992,11 +1110,11 @@ class IvfIndex {
     /** Train centroids on a sample, then give every live row its cell. */
     static build(cache, nlistWanted, seed) {
         const started = nowMs();
-        const { n, dim, matrix, norms, alive } = cache;
+        const { n, dim, chunks, norms, keys } = cache;
         const live = new Int32Array(n - cache.dead);
         let total = 0;
         for (let r = 0; r < n; r++)
-            if (alive[r] === 1)
+            if (keys[r] !== null)
                 live[total++] = r;
         const nlist = Math.max(1, Math.min(Math.floor(nlistWanted), total));
         const rng = new Rng(seed);
@@ -1021,10 +1139,11 @@ class IvfIndex {
         for (let i = 0; i < sampleN; i++) {
             const r = sample[i];
             const inv = norms[r] > 0 ? 1 / norms[r] : 0;
-            const src = r * dim;
+            const chunk = chunks[r >>> CHUNK_SHIFT];
+            const src = (r & CHUNK_MASK) * dim;
             const dst = i * dim;
             for (let j = 0; j < dim; j++)
-                x[dst + j] = matrix[src + j] * inv;
+                x[dst + j] = chunk[src + j] * inv;
         }
         // Initial centroids: distinct sample points.
         const centroids = new Float32Array(nlist * dim);
@@ -1076,7 +1195,7 @@ class IvfIndex {
         index.trainedN = total;
         for (let t = 0; t < total; t++) {
             const r = live[t];
-            index.assign[r] = index._search.nearest(matrix, r * dim);
+            index.assign[r] = index._search.nearest(chunks[r >>> CHUNK_SHIFT], (r & CHUNK_MASK) * dim);
         }
         index.relist(n);
         index.buildSeconds = (nowMs() - started) / 1000;
@@ -1109,8 +1228,9 @@ class IvfIndex {
     /** Give every pending row its nearest cell and regroup. */
     fold(cache) {
         if (this.pending.size > 0) {
+            const chunks = cache.chunks;
             for (const r of this.pending) {
-                this.assign[r] = this._search.nearest(cache.matrix, r * this.dim);
+                this.assign[r] = this._search.nearest(chunks[r >>> CHUNK_SHIFT], (r & CHUNK_MASK) * this.dim);
             }
             this.pending.clear();
         }
@@ -1132,7 +1252,7 @@ class IvfIndex {
         this.pending.delete(i);
         this.churn++;
     }
-    /** Follow the cache's compaction (`live` = the old rows kept, in order). */
+    /** Follow the table's compaction (`live` = the old rows kept, in order). */
     compact(live) {
         const kept = live.length;
         const moved = new Int32Array(kept);
@@ -1195,7 +1315,7 @@ class IvfIndex {
         }
         const candRows = this.candRows;
         const candScores = this.candScores;
-        const { matrix, norms, codes } = cache;
+        const { chunks, norms, codes } = cache;
         const assign = this.assign;
         let m = 0;
         for (let k = 0; k < nChosen; k++) {
@@ -1207,7 +1327,7 @@ class IvfIndex {
                 if (code >= 0 && codes[r] !== code)
                     continue;
                 const denom = norms[r] * qnorm;
-                const s = denom > 0 ? dot2(matrix, r * dim, q, 0, dim) / denom : 0;
+                const s = denom > 0 ? dot2(chunks[r >>> CHUNK_SHIFT], (r & CHUNK_MASK) * dim, q, 0, dim) / denom : 0;
                 if (s < floor)
                     continue;
                 candRows[m] = r;
@@ -1219,7 +1339,7 @@ class IvfIndex {
             if (code >= 0 && codes[r] !== code)
                 continue;
             const denom = norms[r] * qnorm;
-            const s = denom > 0 ? dot2(matrix, r * dim, q, 0, dim) / denom : 0;
+            const s = denom > 0 ? dot2(chunks[r >>> CHUNK_SHIFT], (r & CHUNK_MASK) * dim, q, 0, dim) / denom : 0;
             if (s < floor)
                 continue;
             candRows[m] = r;
@@ -1312,6 +1432,29 @@ function lowerBound(values, target) {
     return lo;
 }
 /**
+ * Dot products of one query with four rows, written to `out[0..3]`. Each sum
+ * runs over the dimensions in order, exactly as a loop over one row would, so
+ * the results are bit-identical to four separate loops; only the interleaving
+ * differs.
+ */
+function dotRows4(q, a, ao, b, bo, c, co, d, dof, dim, out) {
+    let s0 = 0;
+    let s1 = 0;
+    let s2 = 0;
+    let s3 = 0;
+    for (let j = 0; j < dim; j++) {
+        const x = q[j];
+        s0 += x * a[ao + j];
+        s1 += x * b[bo + j];
+        s2 += x * c[co + j];
+        s3 += x * d[dof + j];
+    }
+    out[0] = s0;
+    out[1] = s1;
+    out[2] = s2;
+    out[3] = s3;
+}
+/**
  * In-memory embedding storage with brute-force cosine similarity search.
  *
  * Search is exact by default. For large stores an opt-in approximate index
@@ -1321,7 +1464,7 @@ function lowerBound(values, target) {
  */
 export class EmbeddingStore {
     constructor(encoder, options = {}) {
-        this._embeddings = new Map();
+        this._table = null;
         this._dimension = null;
         this._onModelMismatch = 'warn';
         this._warnedMismatch = new Set();
@@ -1331,7 +1474,6 @@ export class EmbeddingStore {
         this._annMinSize = ANN_MIN_SIZE;
         this._annSeed = 0;
         this._annCounts = { approximate: 0, exact: 0, widened: 0, builds: 0 };
-        this._scan = null;
         /** Metadata of the most recent imported sidecar (empty before any). */
         this.lastImportMeta = {};
         this._encoder = adoptEncoder(encoder);
@@ -1413,20 +1555,29 @@ export class EmbeddingStore {
             throw new DimensionMismatchError(`${what} has ${vector.length} dimensions, store holds ${this._dimension}`);
         }
     }
-    _cosineSimilarity(v1, v2) {
-        let dot = 0;
-        let norm1 = 0;
-        let norm2 = 0;
-        for (let i = 0; i < v1.length; i++) {
-            dot += v1[i] * v2[i];
-            norm1 += v1[i] * v1[i];
-            norm2 += v2[i] * v2[i];
-        }
-        norm1 = Math.sqrt(norm1);
-        norm2 = Math.sqrt(norm2);
-        if (norm1 === 0 || norm2 === 0)
+    /** Euclidean norm, summed in index order (the order the stored norms are summed in). */
+    static _norm(v) {
+        let sum = 0;
+        for (let i = 0; i < v.length; i++)
+            sum += v[i] * v[i];
+        return Math.sqrt(sum);
+    }
+    /**
+     * Cosine of a query against the row at `slot`: float64, the dot product summed
+     * in dimension order, 0 when either norm is 0. The one definition every exact
+     * path shares.
+     */
+    static _rowScore(table, q, qnorm, slot) {
+        const rn = table.norms[slot];
+        if (qnorm === 0 || rn === 0)
             return 0;
-        return dot / (norm1 * norm2);
+        const dim = table.dim;
+        const chunk = table.chunks[slot >>> CHUNK_SHIFT];
+        const base = (slot & CHUNK_MASK) * dim;
+        let dot = 0;
+        for (let j = 0; j < dim; j++)
+            dot += q[j] * chunk[base + j];
+        return dot / (qnorm * rn);
     }
     _resolveQuery(query) {
         let vector;
@@ -1470,8 +1621,14 @@ export class EmbeddingStore {
      */
     models() {
         const counts = new Map();
-        for (const record of this._embeddings.values()) {
-            counts.set(record.model, (counts.get(record.model) ?? 0) + 1);
+        const table = this._table;
+        if (table !== null) {
+            for (let slot = 0; slot < table.n; slot++) {
+                if (table.keys[slot] === null)
+                    continue;
+                const model = table.modelNames[table.modelIx[slot]];
+                counts.set(model, (counts.get(model) ?? 0) + 1);
+            }
         }
         return Object.fromEntries(counts);
     }
@@ -1524,13 +1681,19 @@ export class EmbeddingStore {
         }
         const includeUnknown = options.includeUnknown ?? false;
         const out = [];
-        for (const record of this._embeddings.values()) {
+        const table = this._table;
+        if (table === null)
+            return out;
+        const byDim = dimension !== null && table.dim !== dimension;
+        for (let slot = 0; slot < table.n; slot++) {
+            if (table.keys[slot] === null)
+                continue;
+            const rowModel = table.modelNames[table.modelIx[slot]];
             const byModel = model !== null &&
-                record.model !== model &&
-                (includeUnknown || !UNKNOWN_MODELS.has(record.model));
-            const byDim = dimension !== null && record.vector.length !== dimension;
+                rowModel !== model &&
+                (includeUnknown || !UNKNOWN_MODELS.has(rowModel));
             if (byModel || byDim)
-                out.push(record.nodeRef);
+                out.push(table.refs[slot]);
         }
         return out;
     }
@@ -1543,14 +1706,18 @@ export class EmbeddingStore {
         }
         this._checkDimension(vector, "vector");
         const key = this._nodeRefToKey(nodeRef);
-        this._set(key, { id: key, nodeRef, vector, text, model: this._modelName() });
+        this._put(key, nodeRef, text, this._modelName(), vector);
         return key;
     }
-    /** Every write goes through here, so the approximate index's cache stays in step. */
-    _set(key, record) {
-        this._embeddings.set(key, record);
-        if (this._scan !== null)
-            this._scan.put(key, record);
+    /**
+     * Every write goes through here: the row is copied into the table (the one
+     * copy of the vector), and an existing approximate index is told about it.
+     */
+    _put(key, ref, text, model, vector) {
+        let table = this._table;
+        if (table === null)
+            table = this._table = new VectorTable(this._dimension);
+        table.put(key, ref, text, model, vector);
     }
     /** Add many embeddings, encoding their texts in one batched call. */
     addBatch(entries) {
@@ -1640,16 +1807,35 @@ export class EmbeddingStore {
         this._checkModelCompat();
         return this._checkQuery((await this.encodeTextsAsync([query]))[0]);
     }
+    /**
+     * The stored record of a node, or null. The record is a copy: `vector` is a
+     * fresh array of the stored float32 values, so changing it changes nothing in
+     * the store (use {@link add} to replace a vector).
+     */
     get(nodeRef) {
-        const key = this._nodeRefToKey(nodeRef);
-        return this._embeddings.get(key) || null;
+        const table = this._table;
+        if (table === null)
+            return null;
+        const slot = table.index.get(this._nodeRefToKey(nodeRef));
+        if (slot === undefined)
+            return null;
+        return {
+            id: table.keys[slot],
+            nodeRef: table.refs[slot],
+            vector: table.vectorAt(slot),
+            text: table.texts[slot],
+            model: table.modelNames[table.modelIx[slot]],
+        };
+    }
+    /** Whether a node has an embedding (no vector is copied). */
+    has(nodeRef) {
+        return this._table !== null && this._table.index.has(this._nodeRefToKey(nodeRef));
     }
     remove(nodeRef) {
-        const key = this._nodeRefToKey(nodeRef);
-        const removed = this._embeddings.delete(key);
-        if (removed && this._scan !== null)
-            this._scan.drop(key);
-        return removed;
+        const table = this._table;
+        if (table === null)
+            return false;
+        return table.remove(this._nodeRefToKey(nodeRef));
     }
     /**
      * Find the most similar nodes by embedding.
@@ -1675,20 +1861,108 @@ export class EmbeddingStore {
         }
         return this._scanExact(queryVector, topK, nodeType, threshold);
     }
-    /** The brute-force scan every search used before the approximate index existed. */
+    /**
+     * The brute-force scan every search used before the approximate index existed.
+     *
+     * Reads the rows straight from the table, in slot (= arrival) order: float64
+     * dot products over the float32 values, summed in dimension order, so a score
+     * is the same number whatever else is in the store. A bounded `topK` is kept
+     * in a small sorted buffer (a hit is only allocated as a result if it makes
+     * the cut); ties keep arrival order, exactly as {@link selectTopK} does.
+     */
     _scanExact(queryVector, topK, nodeType, threshold) {
-        const results = [];
-        for (const record of this._embeddings.values()) {
-            if (nodeType && record.nodeRef[0] !== nodeType)
-                continue;
-            const score = this._cosineSimilarity(queryVector, record.vector);
-            if (score >= threshold) {
-                results.push({ nodeRef: record.nodeRef, score, text: record.text });
+        const table = this._table;
+        if (table === null || table.live === 0)
+            return [];
+        if (topK !== null && topK <= 0)
+            return [];
+        let code = -1;
+        if (nodeType) {
+            code = table.codeOf.get(nodeType) ?? -2;
+            if (code === -2)
+                return []; // no node of that type exists
+        }
+        const bounded = topK !== null && Number.isInteger(topK) && topK <= EXACT_TOPK_BUFFER;
+        const k = bounded ? topK : 0;
+        const topRows = new Int32Array(k);
+        const topScores = new Float64Array(k);
+        let count = 0;
+        const all = [];
+        const { dim, chunks, norms, codes, keys, refs, texts } = table;
+        const qnorm = EmbeddingStore._norm(queryVector);
+        const consider = (slot, score) => {
+            if (!(score >= threshold))
+                return;
+            if (bounded) {
+                if (count === k && score <= topScores[k - 1])
+                    return;
+                let i = count < k ? count++ : k - 1;
+                while (i > 0 && topScores[i - 1] < score) {
+                    topScores[i] = topScores[i - 1];
+                    topRows[i] = topRows[i - 1];
+                    i--;
+                }
+                topScores[i] = score;
+                topRows[i] = slot;
             }
+            else {
+                all.push({ nodeRef: refs[slot], score, text: texts[slot] });
+            }
+        };
+        // Four rows at a time: four independent running sums hide the latency of the
+        // adds. Each is still summed in dimension order, so a score is the same
+        // number the one-row loop would give. Rows are handed to `consider` in slot
+        // order, so ties break as they always did.
+        const pend = new Int32Array(4);
+        const dots = new Float64Array(4);
+        let np = 0;
+        const flush = () => {
+            if (np === 4) {
+                const s0 = pend[0], s1 = pend[1], s2 = pend[2], s3 = pend[3];
+                dotRows4(queryVector, chunks[s0 >>> CHUNK_SHIFT], (s0 & CHUNK_MASK) * dim, chunks[s1 >>> CHUNK_SHIFT], (s1 & CHUNK_MASK) * dim, chunks[s2 >>> CHUNK_SHIFT], (s2 & CHUNK_MASK) * dim, chunks[s3 >>> CHUNK_SHIFT], (s3 & CHUNK_MASK) * dim, dim, dots);
+            }
+            else {
+                for (let i = 0; i < np; i++) {
+                    const slot = pend[i];
+                    const chunk = chunks[slot >>> CHUNK_SHIFT];
+                    const base = (slot & CHUNK_MASK) * dim;
+                    let dot = 0;
+                    for (let j = 0; j < dim; j++)
+                        dot += queryVector[j] * chunk[base + j];
+                    dots[i] = dot;
+                }
+            }
+            for (let i = 0; i < np; i++) {
+                const rn = norms[pend[i]];
+                consider(pend[i], rn === 0 ? 0 : dots[i] / (qnorm * rn));
+            }
+            np = 0;
+        };
+        for (let slot = 0; slot < table.n; slot++) {
+            if (keys[slot] === null)
+                continue;
+            if (code >= 0 && codes[slot] !== code)
+                continue;
+            if (qnorm === 0) {
+                consider(slot, 0);
+                continue;
+            }
+            pend[np++] = slot;
+            if (np === 4)
+                flush();
+        }
+        if (np > 0)
+            flush();
+        if (bounded) {
+            const out = new Array(count);
+            for (let i = 0; i < count; i++) {
+                out[i] = { nodeRef: refs[topRows[i]], score: topScores[i], text: texts[topRows[i]] };
+            }
+            return out;
         }
         if (topK === null)
-            return results.sort((a, b) => b.score - a.score);
-        return selectTopK(results, topK);
+            return all.sort((a, b) => b.score - a.score);
+        return selectTopK(all, topK);
     }
     /** {@link similaritySearch} with a text query encoded by awaiting the encoder. */
     async similaritySearchAsync(query, topK = 10, nodeType, threshold = 0.0, exact = false) {
@@ -1718,32 +1992,32 @@ export class EmbeddingStore {
      *    the index is retrained from the current data, with an automatic `nlist`
      *    re-chosen for the new size;
      *  - a cleared store, a dimension change, or a store that shrinks below
-     *    `annMinSize` drops the index with its cache.
+     *    `annMinSize` drops the index.
+     *
+     * The index reads the store's own rows; there is no second copy of the vectors.
      */
     _annIndex() {
         if (this._ann === null || this._dimension === null)
             return null;
-        const live = this._embeddings.size;
-        if (live < Math.max(2, this._annMinSize)) {
-            this._scan = null;
+        const table = this._table;
+        if (table === null || table.live < Math.max(2, this._annMinSize)) {
+            if (table !== null)
+                table.ivf = null;
             return null;
         }
-        let scan = this._scan;
-        if (scan === null) {
-            scan = this._scan = ScanCache.build(this._embeddings.values(), live, this._dimension);
-        }
-        let ivf = scan.ivf;
+        const live = table.live;
+        let ivf = table.ivf;
         if (ivf !== null && ivf.churn > ANN_RETRAIN_FRACTION * ivf.trainedN)
-            ivf = scan.ivf = null;
+            ivf = table.ivf = null;
         if (ivf === null) {
             const nlist = this._annNlist ?? EmbeddingStore._annAutoNlist(live);
-            scan.ivf = IvfIndex.build(scan, nlist, this._annSeed);
+            table.ivf = IvfIndex.build(table, nlist, this._annSeed);
             this._annCounts.builds++;
         }
         else if (ivf.pending.size >= Math.max(ANN_FOLD_MIN, ANN_FOLD_FRACTION * ivf.trainedN)) {
-            ivf.fold(scan);
+            ivf.fold(table);
         }
-        return scan;
+        return table;
     }
     _annProbe(ivf) {
         const wanted = this._annNprobe ?? Math.max(1, roundHalfEven(0.05 * ivf.nlist));
@@ -1762,7 +2036,7 @@ export class EmbeddingStore {
             return lists >= ivf.nlist ? null : lists;
         return lists * 2 >= ivf.nlist ? null : lists;
     }
-    /** Load the query into the cache's float32 buffer; null when it has no direction (all zeros). */
+    /** Load the query into the table's float32 buffer; null when it has no direction (all zeros). */
     _annQuery(scan, queryVector, nodeType) {
         const q = scan.query;
         let sum = 0;
@@ -1808,8 +2082,8 @@ export class EmbeddingStore {
             const best = ivf.best(m, topK);
             const results = [];
             for (let i = 0; i < best.length; i++) {
-                const record = this._embeddings.get(scan.keys[ivf.candRows[best[i]]]);
-                results.push({ nodeRef: record.nodeRef, score: ivf.candScores[best[i]], text: record.text });
+                const row = ivf.candRows[best[i]];
+                results.push({ nodeRef: scan.refs[row], score: ivf.candScores[best[i]], text: scan.texts[row] });
             }
             this._annCounts.approximate++;
             if (scale > 1)
@@ -1824,11 +2098,15 @@ export class EmbeddingStore {
      */
     annPolish(results, queryVector, threshold) {
         const out = [];
+        const table = this._table;
+        if (table === null)
+            return out;
+        const qnorm = EmbeddingStore._norm(queryVector);
         for (const result of results) {
-            const record = this._embeddings.get(this._nodeRefToKey(result.nodeRef));
-            if (!record)
+            const slot = table.index.get(this._nodeRefToKey(result.nodeRef));
+            if (slot === undefined)
                 continue;
-            const score = this._cosineSimilarity(queryVector, record.vector);
+            const score = EmbeddingStore._rowScore(table, queryVector, qnorm, slot);
             if (score >= threshold)
                 out.push({ nodeRef: result.nodeRef, score, text: result.text });
         }
@@ -1861,12 +2139,12 @@ export class EmbeddingStore {
                 for (let i = 0; i < m; i++)
                     slots[i] = i;
                 slots.sort((a, b) => scores[b] - scores[a] || rows[a] - rows[b]);
-                const keys = scan.keys;
-                const embeddings = this._embeddings;
+                const refs = scan.refs;
+                const texts = scan.texts;
                 const ranked = (function* () {
                     for (let i = 0; i < m; i++) {
-                        const record = embeddings.get(keys[rows[slots[i]]]);
-                        yield { nodeRef: record.nodeRef, score: scores[slots[i]], text: record.text };
+                        const row = rows[slots[i]];
+                        yield { nodeRef: refs[row], score: scores[slots[i]], text: texts[row] };
                     }
                 })();
                 return { ranked, approximate: true };
@@ -1885,8 +2163,8 @@ export class EmbeddingStore {
         if (this._ann === null) {
             throw new EmbeddingError("this store has no approximate index; create it with ann: 'ivf'");
         }
-        if (force && this._scan !== null)
-            this._scan.ivf = null;
+        if (force && this._table !== null)
+            this._table.ivf = null;
         const scan = this._annIndex();
         if (scan !== null && scan.ivf !== null && scan.ivf.pending.size > 0)
             scan.ivf.fold(scan);
@@ -1894,7 +2172,7 @@ export class EmbeddingStore {
     }
     /** What the approximate index looks like right now. Never builds anything. */
     annStats() {
-        const scan = this._scan;
+        const scan = this._table;
         const ivf = scan === null ? null : scan.ivf;
         return {
             enabled: this._ann !== null,
@@ -1907,7 +2185,8 @@ export class EmbeddingStore {
             churn: ivf === null ? 0 : ivf.churn,
             buildSeconds: ivf === null ? null : ivf.buildSeconds,
             indexBytes: ivf === null ? 0 : ivf.bytes(),
-            cacheBytes: scan === null ? 0 : scan.bytes(),
+            cacheBytes: 0,
+            vectorBytes: scan === null ? 0 : scan.bytes(),
             minSize: this._annMinSize,
             searches: { ...this._annCounts },
         };
@@ -1976,7 +2255,7 @@ export class EmbeddingStore {
             const mid = ordered.length >> 1;
             return ordered.length % 2 ? ordered[mid] : 0.5 * (ordered[mid - 1] + ordered[mid]);
         };
-        const ivf = this._scan === null ? null : this._scan.ivf;
+        const ivf = this._table === null ? null : this._table.ivf;
         return {
             recall: recalls.length ? recalls.reduce((a, b) => a + b, 0) / recalls.length : 1,
             minRecall: recalls.length ? Math.min(...recalls) : 1,
@@ -1998,15 +2277,28 @@ export class EmbeddingStore {
     scoreMap(query, nodeType) {
         const queryVector = this._resolveQuery(query);
         const scores = new Map();
-        for (const [key, record] of this._embeddings) {
-            if (nodeType && record.nodeRef[0] !== nodeType)
+        const table = this._table;
+        if (table === null)
+            return scores;
+        let code = -1;
+        if (nodeType) {
+            code = table.codeOf.get(nodeType) ?? -2;
+            if (code === -2)
+                return scores;
+        }
+        const qnorm = EmbeddingStore._norm(queryVector);
+        for (let slot = 0; slot < table.n; slot++) {
+            const key = table.keys[slot];
+            if (key === null)
                 continue;
-            scores.set(key, this._cosineSimilarity(queryVector, record.vector));
+            if (code >= 0 && table.codes[slot] !== code)
+                continue;
+            scores.set(key, EmbeddingStore._rowScore(table, queryVector, qnorm, slot));
         }
         return scores;
     }
     count() {
-        return this._embeddings.size;
+        return this._table === null ? 0 : this._table.live;
     }
     /**
      * Clear all embeddings.
@@ -2017,8 +2309,7 @@ export class EmbeddingStore {
      *   wrong length even when empty.
      */
     clear(resetDimension = false) {
-        this._embeddings.clear();
-        this._scan = null;
+        this._table = null;
         if (resetDimension)
             this._dimension = null;
     }
@@ -2032,14 +2323,18 @@ export class EmbeddingStore {
      */
     exportEmbeddings(graphDigest) {
         const embeddings = [];
-        for (const record of this._embeddings.values()) {
+        const table = this._table;
+        for (let slot = 0; table !== null && slot < table.n; slot++) {
+            const ref = table.refs[slot];
+            if (ref === null)
+                continue;
             embeddings.push({
-                type: String(record.nodeRef[0]),
-                id: record.nodeRef[1],
-                id_type: typeof record.nodeRef[1] === 'number' ? 'int' : 'str',
-                text: record.text,
-                model: record.model,
-                vector: record.vector,
+                type: String(ref[0]),
+                id: ref[1],
+                id_type: typeof ref[1] === 'number' ? 'int' : 'str',
+                text: table.texts[slot],
+                model: table.modelNames[table.modelIx[slot]],
+                vector: table.vectorAt(slot),
             });
         }
         const payload = {
@@ -2086,16 +2381,28 @@ export class EmbeddingStore {
             const ref = [item.type, id];
             this._checkDimension(item.vector, `embedding for :${item.type}:${id}`);
             const key = this._nodeRefToKey(ref);
-            this._set(key, {
-                id: key,
-                nodeRef: ref,
-                vector: item.vector,
-                text: item.text ?? '',
-                model: item.model ?? 'unknown',
-            });
+            this._put(key, ref, item.text ?? '', item.model ?? 'unknown', item.vector);
             written++;
         }
         return written;
+    }
+    /**
+     * The table, the encoder's model and the version, for the snapshot writer
+     * (see `snapshot.ts`). Low-level: not part of the stable API.
+     */
+    snapshotState() {
+        return { table: this._table, encoderModel: this._currentModel(), encoderVersion: this.version };
+    }
+    /**
+     * Replace every embedding with the rows of a verified, fully built table
+     * (see `snapshot.ts`), as `importEmbeddings(payload, true)` would, and record
+     * the snapshot's metadata as the last import's. Low-level: not part of the
+     * stable API. Any approximate index is rebuilt lazily.
+     */
+    adoptTable(table, meta) {
+        this._table = table.live === 0 ? null : table;
+        this._dimension = table.live === 0 ? null : table.dim;
+        this.lastImportMeta = meta;
     }
 }
 // =============================================================================
@@ -3068,7 +3375,7 @@ export class SemanticGraph extends ISONGraph {
         const fn = textFn || defaultTextFn;
         const batch = [];
         for (const node of this.nodes()) {
-            if (skipExisting && this._embeddingStore.get(node.ref))
+            if (skipExisting && this._embeddingStore.has(node.ref))
                 continue;
             const text = fn(node);
             if (text)
@@ -3081,7 +3388,7 @@ export class SemanticGraph extends ISONGraph {
         const fn = textFn || ((node) => this.embedTextFor(node.properties) || `${node.type}:${node.id}`);
         const batch = [];
         for (const node of this.nodes()) {
-            if (skipExisting && this._embeddingStore.get(node.ref))
+            if (skipExisting && this._embeddingStore.has(node.ref))
                 continue;
             const text = fn(node);
             if (text)

@@ -35,3 +35,4 @@ obj/
 .idea/
 .DS_Store
 Thumbs.db
+!tests/fixtures/snapshot/*.embeddings.json

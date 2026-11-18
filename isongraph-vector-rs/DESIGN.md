@@ -308,7 +308,9 @@ sidecar bytes and the graph digest are byte-identical with or without a snapshot
   A snapshot is never used when the sidecar is missing.
 * Sidecar identity = `len` (u64) and `fingerprint` = SHA-256 over: `len` as u64 LE,
   the first 65,536 bytes, the last 65,536 bytes, and for i in 1..=64 the 4,096
-  bytes at offset `floor(len * i / 65)` (each clipped to the file end). Any
+  bytes at offset `floor(len * i / 65)` (each clipped to the file end; for a file
+  shorter than that the windows overlap; every window is still hashed, in order, even
+  where it overlaps another, and a window that starts at or past the end is empty). Any
   serializer rewriting the sidecar changes it; **limit**: an in-place edit that
   keeps the length and touches no sampled byte is not detected. Tools that rewrite
   the sidecar must delete the `.snap` (this crate's `save` does).
@@ -335,12 +337,28 @@ block * ceil(count / block_rows)       R = min(block_rows, rows left)
 trailer  32 bytes  SHA-256 of every byte before it (from offset 0)
 ```
 `string` = `u32 length` + that many UTF-8 bytes. `opt string` = the same, with length
-`0xFFFFFFFF` meaning absent. Rows are in the **sidecar's order**: live rows only,
-sorted by node type then id (byte order), so loading a snapshot yields the same
-slots, tombstone-free, as loading the JSON (equal score ties resolve identically).
-`key = type ":" id`. A reader must reject: a length past the end of the file, a
-model index >= n_models, a repeated key, `count * dim * 4` larger than the file,
-bytes between the last block and the trailer or after it, a trailer mismatch.
+`0xFFFFFFFF` meaning absent. Rows are in **the writing port's own sidecar order**,
+live rows only, so that loading a snapshot yields the same slots, tombstone-free,
+as loading that port's JSON (equal score ties resolve identically *within a port*).
+The Rust crate sorts by node type then id (byte order); Python, TypeScript and
+JavaScript write arrival order, C# its own comparer. A reader must **not** check or
+rely on row order, and tie order after a load can differ between ports.
+`key = type ":" id`; two rows whose keys are equal as strings (type `a:b` with id
+`c`, and type `a` with id `b:c`) are a repeated key: a reader rejects the file and
+falls back to the JSON, which keeps them apart in ports with tuple keys.
+A reader must reject: a length past the end of the file, a string that is not
+valid UTF-8, a model index >= n_models, a repeated key, `count * dim * 4` larger
+than the file, bytes between the last block and the trailer (bytes "after" the
+trailer cannot be told apart from these: the trailer is the last 32 bytes), a
+count above what the reader can hold (the format allows 2^32-1; a port whose arrays
+are limited, such as .NET, rejects more and falls back), a trailer mismatch.
+**Ids are text.** The format carries no id kind, so a snapshot cannot say that
+`("person", 1)` was an integer id. Ports whose ids can be integers (Python,
+TypeScript, JavaScript) restore the kind from the graph (a string id that names a
+node stays a string; a canonical integer string that names an integer node becomes
+the integer), and refuse to write a snapshot for an embedding that would not restore
+identically (they save the JSON pair, remove any stale `.snap` and report why).
+A version 2 should add an id-kind bit per row.
 The reader sets `dimension` from the first row (as the JSON import does), and the
 import metadata (encoder model/version, digest, basis) from the header.
 

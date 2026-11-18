@@ -724,6 +724,18 @@ public class PortabilityTests
 
 public class UpdateNodeTests
 {
+    // The store hands out copies of its one stored vector, so "left alone" is equal content, not one instance.
+    private static void AssertSameRecord(EmbeddingRecord? before, EmbeddingRecord? after)
+    {
+        Assert.NotNull(before);
+        Assert.NotNull(after);
+        Assert.Equal(before!.Id, after!.Id);
+        Assert.Equal(before.NodeRef, after.NodeRef);
+        Assert.Equal(before.Text, after.Text);
+        Assert.Equal(before.Model, after.Model);
+        Assert.Equal(before.Vector, after.Vector);
+    }
+
     private static Dictionary<string, object?> Props(string key, object? value) =>
         new() { [key] = value };
 
@@ -766,7 +778,7 @@ public class UpdateNodeTests
 
         graph.UpdateNode("person", "1", Props("age", 30L));
 
-        Assert.Same(before, graph.GetEmbedding(new NodeRef("person", "1")));
+        AssertSameRecord(before, graph.GetEmbedding(new NodeRef("person", "1")));
         Assert.Equal(30L, graph.Graph.GetNode("person", "1").Properties["age"]);
     }
 
@@ -779,7 +791,7 @@ public class UpdateNodeTests
 
         graph.UpdateNode("person", "1", Props("name", "Zebra"));
 
-        Assert.Same(before, graph.GetEmbedding(new NodeRef("person", "1")));
+        AssertSameRecord(before, graph.GetEmbedding(new NodeRef("person", "1")));
         Assert.Equal("managed by the caller", before!.Text);
     }
 
