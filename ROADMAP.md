@@ -15,8 +15,10 @@ What is deliberately not done yet, in rough priority order. Items marked
    and batch search, one copy of the vectors, no post-write stall, opt-in HNSW
    (level with faiss HNSW / hnswlib single-thread), int8 scan, binary snapshot.
    One copy of the vectors, batch search and the binary snapshot are now in
-   every port (HNSW and int8 are still Rust-only). Still open: HNSW for C++ and
-   C#; persist the ANN index; faster HNSW single-call inserts (1.4k/s at 1M); exact scan is at
+   every port; HNSW is in Rust, C++ and C# (int8 is still Rust-only). Still
+   open: HNSW for Python, TypeScript and JavaScript; a SIMD scorer for C++/C#
+   HNSW (build is 1.6-3x slower than Rust's, MSVC the slowest); find why C++
+   HNSW is only 1.2x IVF on hard synthetic data; persist the ANN index; faster HNSW single-call inserts (1.4k/s at 1M); exact scan is at
    parity with faiss Flat, not ahead.
 5. **Fix the slow ports.** The C++, C# and JS exact scans are scalar and still
    slower than numpy; JavaScript k-means takes about 8 minutes at 1M.

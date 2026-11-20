@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    HNSW benchmark and Rust cross-check: recall@10 vs speed over ef_search,
+    build time, memory and write latency, against the exact scan and IVF
+    (mirrors isongraph-vector-rs/examples/hnsw_bench.rs), plus a cross-check
+    mode that rebuilds a deterministic data set and compares its top-k ids with
+    a Rust dump. Not part of the solution or the test run. Run it with dotnet
+    run, Release configuration, from the csharp directory; the options are
+    listed at the top of Program.cs.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <IsPackable>false</IsPackable>
+    <ServerGarbageCollector>false</ServerGarbageCollector>
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\IsonGraph.Vector\IsonGraph.Vector.csproj" />
+  </ItemGroup>
+
+</Project>

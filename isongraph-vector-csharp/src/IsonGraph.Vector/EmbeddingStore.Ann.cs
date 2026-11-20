@@ -21,7 +21,8 @@ public sealed partial class EmbeddingStore
     private bool IndexReady()
     {
         if (_ann == AnnMode.None) return true;
-        if (AnnBelowMin()) return _ivf is null;
+        if (AnnBelowMin()) return _ivf is null && _hnsw is null;
+        if (_ann == AnnMode.Hnsw) return _hnsw is not null && !_hnsw.Stale;
         return _ivf is not null && !_ivf.Stale;
     }
 
@@ -37,6 +38,10 @@ public sealed partial class EmbeddingStore
     /// training exceed 50% of the trained size the index is retrained from the
     /// current data (with an automatic nlist, re-chosen for the new size). A
     /// store that shrinks below the minimum size, or is cleared, drops it.
+    ///
+    /// HNSW mode (section 12): the graph is built lazily the same way, links
+    /// every write as it happens (no pending list), and is rebuilt once updates
+    /// plus deletes since the build exceed its node count.
     /// </summary>
     private void EnsureIndex()
     {
@@ -44,6 +49,16 @@ public sealed partial class EmbeddingStore
         if (AnnBelowMin())
         {
             _ivf = null;
+            _hnsw = null;
+            return;
+        }
+        if (_ann == AnnMode.Hnsw)
+        {
+            if (_hnsw is null || _hnsw.Stale)
+            {
+                _hnsw = HnswIndex.Build(_table!, _annHnsw.M, _annHnsw.EfConstruction, _annSeed, ScanThreads);
+                Interlocked.Increment(ref _annBuilds);
+            }
             return;
         }
         if (_ivf is null || _ivf.Stale)
@@ -103,8 +118,9 @@ public sealed partial class EmbeddingStore
     /// costs time rather than silently returning a short list.
     /// </summary>
     private IReadOnlyList<SimilarityResult>? AnnSearch(
-        float[] queryVector, int topK, string? nodeType, float threshold)
+        float[] queryVector, int topK, string? nodeType, float threshold, int efSearch = 0)
     {
+        if (_ann == AnnMode.Hnsw) return HnswSearch(queryVector, topK, nodeType, threshold, efSearch);
         var ivf = _ivf;
         var table = _table;
         if (ivf is null || table is null) return null;
@@ -148,7 +164,12 @@ public sealed partial class EmbeddingStore
         try
         {
             CheckQuery(queryVector);
-            var ivf = _ivf;
+            if (_ann == AnnMode.Hnsw)
+            {
+                var ranked = HnswRanked(queryVector, nodeType, threshold, scale);
+                if (ranked is not null) return (ranked, true);
+            }
+            var ivf = _ann == AnnMode.Hnsw ? null : _ivf;
             var table = _table;
             if (ivf is not null && table is not null)
             {
@@ -206,11 +227,11 @@ public sealed partial class EmbeddingStore
     {
         if (_ann == AnnMode.None)
             throw new EmbeddingException(
-                "this store has no approximate index; create it with ann: AnnMode.Ivf");
+                "this store has no approximate index; create it with ann: AnnMode.Ivf or AnnMode.Hnsw");
         _rw.EnterWriteLock();
         try
         {
-            if (force) _ivf = null;
+            if (force) { _ivf = null; _hnsw = null; }
             EnsureIndex();
             if (_ivf is not null && _table is not null) _ivf.Fold(_table);
             return StatsLocked();
@@ -228,6 +249,7 @@ public sealed partial class EmbeddingStore
 
     private AnnStats StatsLocked()
     {
+        if (_ann == AnnMode.Hnsw) return HnswStatsLocked();
         var ivf = _ivf;
         int configured = Volatile.Read(ref _annNprobe);
         return new AnnStats(
@@ -260,8 +282,8 @@ public sealed partial class EmbeddingStore
         try
         {
             var t = _table;
-            if (t is null) return _ivf is null ? null : "index without a table";
-            return t.Verify() ?? _ivf?.Verify(t);
+            if (t is null) return _ivf is null && _hnsw is null ? null : "index without a table";
+            return t.Verify() ?? _ivf?.Verify(t) ?? _hnsw?.Verify(t);
         }
         finally { _rw.ExitReadLock(); }
     }

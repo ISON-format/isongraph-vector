@@ -345,6 +345,15 @@ store.AnnNprobe = 64;                                               // raise unt
 `GetAnnStats()` shows what it is doing; `BuildAnnIndex()` builds it ahead of the
 first search.
 
+For single-query latency, `ann: AnnMode.Hnsw` (with optional
+`annHnsw: new HnswOptions(M: 16, EfConstruction: 200, EfSearch: null)`) builds an
+HNSW graph instead: links only (about 145 bytes per vector), built lazily, never
+saved, scores identical to the exact scan's. `AnnEfSearch` and
+`SimilaritySearchVectorEf` change `ef` without a rebuild. It builds about 8x
+slower than IVF (about 24 s at 100k x 384 here) and a scalar kernel makes it
+0.6-0.7x the speed of the Rust index, so use it when queries dominate. Design:
+section 12 of `isongraph-vector-rs/DESIGN.md`.
+
 It is approximate: a true neighbour in a cell that is not probed is missed, and
 how many depends on how your data clusters, so measure with `RecallCheck` on real
 queries. Scores are the same cosine values the exact scan returns. It applies to

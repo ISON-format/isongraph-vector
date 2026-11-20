@@ -466,7 +466,8 @@ public sealed class SemanticGraph
     /// <param name="annNlist">Cells in the index; null picks about 4 * sqrt(N).</param>
     /// <param name="annNprobe">Cells scanned per query; null picks about 5% of nlist.</param>
     /// <param name="annMinSize">Below this many vectors search stays exact.</param>
-    /// <param name="annSeed">Seed for the k-means initialisation.</param>
+    /// <param name="annSeed">Seed for the k-means initialisation (IVF) or the HNSW level generator.</param>
+    /// <param name="annHnsw">Settings for <see cref="AnnMode.Hnsw"/>; null takes the defaults.</param>
     public SemanticGraph(
         string name = "semantic_graph",
         IEmbeddingEncoder? encoder = null,
@@ -479,11 +480,12 @@ public sealed class SemanticGraph
         int? annNlist = null,
         int? annNprobe = null,
         int annMinSize = EmbeddingStore.DefaultAnnMinSize,
-        int annSeed = 0)
+        int annSeed = 0,
+        HnswOptions? annHnsw = null)
     {
         _graph = new ISONGraph(name, directed);
         _view = new ReadOnlyGraphView(_graph);
-        _store = new EmbeddingStore(encoder, version, onModelMismatch, ann, annNlist, annNprobe, annMinSize, annSeed);
+        _store = new EmbeddingStore(encoder, version, onModelMismatch, ann, annNlist, annNprobe, annMinSize, annSeed, annHnsw);
         _autoEmbed = autoEmbed;
         _embedFields = (embedFields ?? DefaultEmbedFields).ToList();
     }
@@ -1448,7 +1450,8 @@ public sealed class SemanticGraph
     /// <param name="annNlist">Cells in the index; null picks about 4 * sqrt(N).</param>
     /// <param name="annNprobe">Cells scanned per query; null picks about 5% of nlist.</param>
     /// <param name="annMinSize">Below this many vectors search stays exact.</param>
-    /// <param name="annSeed">Seed for the k-means initialisation.</param>
+    /// <param name="annSeed">Seed for the k-means initialisation (IVF) or the HNSW level generator.</param>
+    /// <param name="annHnsw">Settings for <see cref="AnnMode.Hnsw"/>; null takes the defaults.</param>
     /// <exception cref="GraphEmbeddingMismatchException">Digest mismatch with <see cref="GraphMismatchMode.Error"/>.</exception>
     public static SemanticGraph Load(
         string path,
@@ -1464,9 +1467,10 @@ public sealed class SemanticGraph
         int? annNlist = null,
         int? annNprobe = null,
         int annMinSize = EmbeddingStore.DefaultAnnMinSize,
-        int annSeed = 0) =>
+        int annSeed = 0,
+        HnswOptions? annHnsw = null) =>
         LoadWithReport(path, encoder, embeddings, autoEmbed, embedFields, onMismatch, version,
-            onModelMismatch, onWarning, ann, annNlist, annNprobe, annMinSize, annSeed).Graph;
+            onModelMismatch, onWarning, ann, annNlist, annNprobe, annMinSize, annSeed, annHnsw).Graph;
 
     /// <summary>Binary snapshot path for a saved graph (<c>&lt;path&gt;.embeddings.snap</c>).</summary>
     public static string SnapshotPathFor(string path) =>
@@ -1498,7 +1502,8 @@ public sealed class SemanticGraph
         int? annNlist = null,
         int? annNprobe = null,
         int annMinSize = EmbeddingStore.DefaultAnnMinSize,
-        int annSeed = 0)
+        int annSeed = 0,
+        HnswOptions? annHnsw = null)
     {
         if (!Enum.IsDefined(onMismatch))
             throw new ArgumentOutOfRangeException(nameof(onMismatch), onMismatch, "unknown GraphMismatchMode");
@@ -1514,7 +1519,7 @@ public sealed class SemanticGraph
 
         var graph = new SemanticGraph(
             loaded.Name, encoder, autoEmbed, embedFields, loaded.Directed, version, onModelMismatch,
-            ann, annNlist, annNprobe, annMinSize, annSeed);
+            ann, annNlist, annNprobe, annMinSize, annSeed, annHnsw);
         if (onWarning is not null) graph._store.Warning += onWarning;
 
         foreach (var node in loaded.Nodes())

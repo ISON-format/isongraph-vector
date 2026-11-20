@@ -268,6 +268,102 @@ inline bool hitBefore(const IvfHit& a, const IvfHit& b) {
 }
 
 // =============================================================================
+// The scoring of one row (moved here from isongraph_vector.hpp so the HNSW
+// index, which also lives below that header, can use it unchanged)
+// =============================================================================
+
+/** The scoring of one row. Strict IEEE float arithmetic, one fixed order; see cosineRows. */
+#if defined(__clang__)
+#define ISONGRAPH_VECTOR_NOINLINE __attribute__((noinline))
+// Apple clang contracts a*b+c into fused multiply-adds (-ffp-contract=on) and may
+// choose differently per loop shape, which made cosineRows4 differ from cosineRows
+// in the last bit on Apple Silicon. The scorers switch contraction off themselves.
+#define ISONGRAPH_VECTOR_STRICT_FP _Pragma("clang fp contract(off)")
+#elif defined(__GNUC__)
+// optimize("fp-contract=off"): GCC fuses by default on targets that have an FMA
+// (aarch64 always, x86 with -mfma); the scorers must not depend on that.
+#define ISONGRAPH_VECTOR_NOINLINE __attribute__((noinline, noclone, optimize("fp-contract=off")))
+#elif defined(_MSC_VER)
+#define ISONGRAPH_VECTOR_NOINLINE __declspec(noinline)
+#else
+#define ISONGRAPH_VECTOR_NOINLINE
+#endif
+#ifndef ISONGRAPH_VECTOR_STRICT_FP
+#define ISONGRAPH_VECTOR_STRICT_FP
+#endif
+
+/**
+ * The cosine of two n-float rows: dot / (|a| * |b|), 0 when either norm is 0.
+ * The three sums run in ascending order in single-precision accumulators.
+ *
+ * THE one scoring routine. The exact scan, the batch search, the approximate
+ * index's re-score, scoreMap and a store loaded from a snapshot all call this
+ * function and nothing else, so one query/row pair has one score everywhere.
+ * It is out of line on purpose: two inlined copies are free to be contracted
+ * (fused multiply-add) or vectorised differently by an optimiser, which showed
+ * up as last-bit differences on GCC 15. Never compile this with -ffast-math.
+ */
+ISONGRAPH_VECTOR_NOINLINE inline float cosineRows(const float* a, const float* b, size_t n) {
+    ISONGRAPH_VECTOR_STRICT_FP
+    float dot = 0.0f;
+    float norm1 = 0.0f;
+    float norm2 = 0.0f;
+
+    for (size_t i = 0; i < n; ++i) {
+        dot += a[i] * b[i];
+        norm1 += a[i] * a[i];
+        norm2 += b[i] * b[i];
+    }
+
+    norm1 = std::sqrt(norm1);
+    norm2 = std::sqrt(norm2);
+
+    if (norm1 == 0.0f || norm2 == 0.0f) return 0.0f;
+    return dot / (norm1 * norm2);
+}
+
+/**
+ * cosineRows(q, r0, n), cosineRows(q, r1, n), cosineRows(q, r2, n) and
+ * cosineRows(q, r3, n) in one pass (the "1 query x 4 rows" kernel of DESIGN.md
+ * section 2): each of the twelve sums is the same ascending single-precision
+ * running sum, written with the same expression shapes, so every out[j] equals
+ * cosineRows(q, rj, n) bit for bit; only the number of independent dependency
+ * chains per pass differs (and the query's own norm is summed once). Out of
+ * line for the same reason as cosineRows. tests check the equality.
+ */
+ISONGRAPH_VECTOR_NOINLINE inline void cosineRows4(const float* q, const float* r0, const float* r1,
+                                                  const float* r2, const float* r3, size_t n,
+                                                  float* out) {
+    ISONGRAPH_VECTOR_STRICT_FP
+    float dot0 = 0.0f, dot1 = 0.0f, dot2 = 0.0f, dot3 = 0.0f;
+    float norm1 = 0.0f;
+    float n20 = 0.0f, n21 = 0.0f, n22 = 0.0f, n23 = 0.0f;
+
+    for (size_t i = 0; i < n; ++i) {
+        dot0 += q[i] * r0[i];
+        dot1 += q[i] * r1[i];
+        dot2 += q[i] * r2[i];
+        dot3 += q[i] * r3[i];
+        norm1 += q[i] * q[i];
+        n20 += r0[i] * r0[i];
+        n21 += r1[i] * r1[i];
+        n22 += r2[i] * r2[i];
+        n23 += r3[i] * r3[i];
+    }
+
+    norm1 = std::sqrt(norm1);
+    n20 = std::sqrt(n20);
+    n21 = std::sqrt(n21);
+    n22 = std::sqrt(n22);
+    n23 = std::sqrt(n23);
+
+    out[0] = (norm1 == 0.0f || n20 == 0.0f) ? 0.0f : dot0 / (norm1 * n20);
+    out[1] = (norm1 == 0.0f || n21 == 0.0f) ? 0.0f : dot1 / (norm1 * n21);
+    out[2] = (norm1 == 0.0f || n22 == 0.0f) ? 0.0f : dot2 / (norm1 * n22);
+    out[3] = (norm1 == 0.0f || n23 == 0.0f) ? 0.0f : dot3 / (norm1 * n23);
+}
+
+// =============================================================================
 // The vector matrix: one copy of every vector
 // =============================================================================
 

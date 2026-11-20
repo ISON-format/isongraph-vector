@@ -418,6 +418,7 @@ public sealed partial class EmbeddingStore
             _table = stage;
             _dimension = stage is null ? -1 : info.Dimension;
             _ivf = null;
+            _hnsw = null;
             var meta = new Dictionary<string, string>();
             if (info.EncoderModel is not null) meta["encoder_model"] = info.EncoderModel;
             if (info.EncoderVersion is not null) meta["encoder_version"] = info.EncoderVersion;

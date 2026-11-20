@@ -520,8 +520,9 @@ order.
   price is that rows of one batch find each other only by brute force, not
   through the graph; at most 6% of the graph, this costs no measurable recall
   (the recall-vs-ef curve equals hnswlib's on text-384 at 100k).
-* **Insert**: the write that stores a row links it (`link` of one job, no
-  parallelism). No pending list, so a search never waits for a fold and never
+* **Insert**: the write that stores a row links it (`link` of one job; the Rust
+  code still runs its reverse-link groups on the pool, the C# and C++ ports
+  run a lone insert serially and measured no loss). No pending list, so a search never waits for a fold and never
   scans an unindexed tail. Cost 0.4-1.5 ms per insert at 100k-1M x 384
   (dominated by the layer search at `ef_construction` 200 and the re-prunes).
 * **Update** (same slot, new vector): the node keeps its level; its own links
@@ -602,7 +603,33 @@ graph quality is the same; the batch column is where IVF is not beaten (12.8).
   filter widens `ef` and may end in the scan.
 * **No online graph repair** other than the bridging at compaction.
 
-### 12.9 Portable vs language-specific
+### 12.9 Ports and cross-checks
+
+C++ (`isongraph_vector_hnsw.hpp`) and C# (`HnswIndex.cs`) implement 12.3-12.5
+from this text. Checked with `examples/hnsw_xcheck.rs` and the matching C++ /
+C# dumpers on integer-generated data (5-6 parameter sets, n 5k-50k, m 2-32, through
+build, writes and compaction): the C# port gave identical ids, order and graph
+statistics in all six sets; C++ gave identical ids in four of five sets and one
+query of 200 differed by one id in the fifth. With the C++ scorer temporarily
+replaced by Rust's 8-lane fused order, ids **and** score bits were identical in
+every phase, so the portable rules above are sufficient to reproduce Rust's
+graph. What is not portable is the score itself: section 2 lets a port pick its
+summation order, and Rust's `dot` is fused (`mul_add`) on AVX2+FMA hosts and
+unfused on the portable fallback, so identical graphs across ports (or across
+Rust hosts) hold only up to last-bit near-ties. Scores are bit-identical to the
+exact scan **within a port**, not across ports.
+
+Notes for readers: (a) the plan selects `m` neighbours on layer 0, not `2m`;
+forward lists start at `m` and only reverse links grow them toward `2m`. (b) The
+visit budget `max(live / 8, 16 ef)` sends graph search to the exact scan often on
+small or hard stores (a 12,000 x 24-d Gaussian store sent 66% of queries to the
+scan at ef 64), so tests and benchmarks must count `approximate` searches, not
+just recall. (c) `Sc` orders with `f32::total_cmp` (-0.0 below +0.0) while the
+final sort and the exact scan treat +-0 as equal and break ties by slot; the
+C++ and C# ports use the exact-scan rule everywhere; the difference needs a
+score of exactly +-0.0.
+
+### 12.10 Portable vs language-specific
 
 *Portable (copy exactly)*: the level draw (integer, seeded), the (score, slot)
 order, the layout sizes, the plan/apply split with in-batch brute-force

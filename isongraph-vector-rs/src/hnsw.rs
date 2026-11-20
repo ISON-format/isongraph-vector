@@ -1,5 +1,5 @@
 //! The opt-in HNSW approximate index (`AnnMode::Hnsw`), beside the IVF-flat one
-//! in `ann.rs`. `DESIGN.md` section 10 is the specification; this file is its
+//! in `ann.rs`. `DESIGN.md` section 12 is the specification; this file is its
 //! Rust realisation.
 //!
 //! # What it is

@@ -359,11 +359,13 @@ every suite asserts that set.
 
 - **Search is exact (brute force) by default**, sqlite-vec included — linear in
   the number of nodes. Every in-memory store has an opt-in IVF index for large
-  stores. This is built for an application's own knowledge graph, not as a
-  vector-database replacement: measured against faiss, hnswlib and usearch
-  (`benchmarks/competitive/`) the ports are 2-4x slower per query at 100k and
-  about 14x slower at 1M vectors at equal recall, have no batched or concurrent
-  search, and persist vectors as JSON only. They do build indexes 8-25x faster
+  stores; Rust, C++ and C# also have an opt-in HNSW graph. This is built for
+  an application's own knowledge graph, not as a vector-database replacement:
+  measured against faiss, hnswlib and usearch (`benchmarks/competitive/`, taken
+  before the engine rework) the ports were 2-4x slower per query at 100k and
+  about 14x slower at 1M vectors at equal recall; batch and concurrent search
+  now exist in Rust, C++, C# and Python, and vectors persist as JSON or an
+  opt-in binary snapshot. They do build indexes 8-25x faster
   and take inserts and updates far faster than HNSW. For vectors on both
   nodes *and* edges and link prediction, RudraDB is the right tool; these are
   not really competitors despite the surface similarity.
