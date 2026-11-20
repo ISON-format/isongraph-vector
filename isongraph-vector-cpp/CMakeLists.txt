@@ -126,6 +126,13 @@ if(ISONGRAPH_VECTOR_BENCH)
     add_executable(stage_d_bench bench/stage_d_bench.cpp)
     target_link_libraries(stage_d_bench PRIVATE isongraph_vector)
     target_compile_definitions(stage_d_bench PRIVATE ISONGRAPH_BENCH_NEW=1)
+
+    # HNSW against IVF and the exact scan, and the cross-port answer dump that
+    # isongraph-vector-rs/examples/hnsw_xcheck.rs is compared against.
+    add_executable(hnsw_bench bench/hnsw_bench.cpp)
+    target_link_libraries(hnsw_bench PRIVATE isongraph_vector)
+    add_executable(hnsw_xcheck bench/hnsw_xcheck.cpp)
+    target_link_libraries(hnsw_xcheck PRIVATE isongraph_vector)
 endif()
 
 # Tests. Skipped when this project is consumed via add_subdirectory.
@@ -138,6 +145,11 @@ add_test(NAME test_isongraph_vector COMMAND test_isongraph_vector)
 # ports' fixtures at the repository root.
 target_compile_definitions(test_isongraph_vector PRIVATE
     ISONGRAPH_VECTOR_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../tests/fixtures/snapshot")
+
+# The opt-in HNSW index (include/isongraph_vector_hnsw.hpp, DESIGN.md section 12).
+add_executable(test_isongraph_vector_hnsw tests/test_isongraph_vector_hnsw.cpp)
+target_link_libraries(test_isongraph_vector_hnsw PRIVATE isongraph_vector)
+add_test(NAME test_isongraph_vector_hnsw COMMAND test_isongraph_vector_hnsw)
 
 if(ISONGRAPH_VECTOR_SQLITE)
     add_executable(test_isongraph_vector_sqlite tests/test_isongraph_vector_sqlite.cpp)

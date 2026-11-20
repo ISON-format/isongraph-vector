@@ -316,6 +316,17 @@ store.setAnnNprobe(64);                              // trade speed for recall, 
 AnnStats stats = store.annStats();                   // nlist, pending, churn, memory, counters
 ```
 
+For single-query latency you can use an HNSW graph instead
+(`store.enableAnn(AnnOptions::makeHnsw())`; `HnswOptions` has `m` 16,
+`efConstruction` 200, `efSearch` 0 = auto by size; `setAnnEfSearch` and
+`similaritySearchVectorEf` change `ef` without a rebuild). It holds links only
+(about 145 bytes per vector), is built lazily by the first search, is never
+saved, and keeps scores bit-identical to the exact scan. It builds 3-14x slower
+than IVF (the scorer is scalar and strictly ordered, and MSVC is about 2.5x
+slower than GCC), so pick it when queries dominate. Design: section 12 of
+`isongraph-vector-rs/DESIGN.md`; the same `minSize`, `exact`, `recallCheck`
+rules apply.
+
 It is **approximate**: a true neighbour in an unprobed cell is missed, and how
 often depends on how your data clusters. Measure with `recallCheck` on real
 queries before relying on a setting, and raise `nprobe` until the recall you

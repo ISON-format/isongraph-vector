@@ -61,6 +61,7 @@
 #endif
 #include "ison_graph.hpp"
 #include "isongraph_vector_ivf.hpp"
+#include "isongraph_vector_hnsw.hpp"
 
 namespace isongraph_vector {
 
@@ -1099,9 +1100,31 @@ inline std::string graphDigest(
 // Approximate search (opt-in)
 // =============================================================================
 
+/** Which approximate index EmbeddingStore::enableAnn builds. */
+enum class AnnMode {
+    Ivf,    ///< the IVF-flat index (the default)
+    Hnsw    ///< the HNSW graph index (DESIGN.md section 12)
+};
+
+/** Settings of the HNSW index; used when AnnOptions::mode is AnnMode::Hnsw. */
+struct HnswOptions {
+    /** Links per node on layers above 0 (layer 0 holds up to 2 * m). More is better recall and more memory. 2 to 64. */
+    size_t m = 16;
+    /** Candidates kept while linking a row; more is a better graph and a slower build and write (never below m). */
+    size_t efConstruction = 200;
+    /**
+     * Candidates kept per query (never below the topK asked for); more is higher
+     * recall and slower. 0 = automatic by store size, aiming at about 0.95
+     * recall@10 on 384-d text embeddings: 64 under 10,000 rows, 96 under
+     * 200,000, 128 under 600,000, 192 above. Measure yours with recallCheck().
+     */
+    size_t efSearch = 0;
+};
+
 /**
- * Configuration of the opt-in IVF-flat approximate index (see
- * EmbeddingStore::enableAnn). Defaults match the Python port.
+ * Configuration of the opt-in approximate index (see EmbeddingStore::enableAnn):
+ * IVF-flat by default (nlist / nprobe), or HNSW with `mode = AnnMode::Hnsw`
+ * (see makeHnsw()). Defaults match the Python port.
  */
 struct AnnOptions {
     /** Cells in the index; 0 = automatic, about 4 * sqrt(N) (see autoNlist) when the index is built. */
@@ -1115,9 +1138,22 @@ struct AnnOptions {
     /**
      * Threads used to train and fill the index (0 = hardware concurrency, 1 =
      * none). Queries are always single-threaded. The thread count never
-     * changes the resulting index.
+     * changes the resulting index (HNSW included: the graph depends on the
+     * seed, the data and the insertion order, never on the thread count).
      */
     size_t threads = 0;
+    /** The index to build: IVF (default) or HNSW. nlist / nprobe apply to IVF only, `hnsw` to HNSW only. */
+    AnnMode mode = AnnMode::Ivf;
+    /** HNSW settings; ignored unless `mode` is AnnMode::Hnsw. `seed` seeds the level generator. */
+    HnswOptions hnsw;
+
+    /** Options for the HNSW index (everything else at its default: minSize 50,000, seed 0, threads 0). */
+    static AnnOptions makeHnsw(HnswOptions settings = HnswOptions()) {
+        AnnOptions o;
+        o.mode = AnnMode::Hnsw;
+        o.hnsw = settings;
+        return o;
+    }
 
     /** The automatic nlist for a store of n vectors: round(4 * sqrt(n)) clamped to [16, 65536]. */
     static size_t autoNlist(size_t n) {
@@ -1150,6 +1186,18 @@ struct AnnStats {
     size_t widenedSearches = 0;
     size_t exactSearches = 0;
     size_t builds = 0;
+    /** The index this store is configured for (IVF unless enableAnn was given AnnMode::Hnsw). */
+    AnnMode mode = AnnMode::Ivf;
+    /** HNSW: candidates per query for a store of this size (configured or automatic); 0 in IVF mode. */
+    size_t efSearch = 0;
+    /** HNSW: the graph's top layer. */
+    size_t maxLevel = 0;
+    /** HNSW: nodes in the graph (tombstones included) and how many of them are tombstones. */
+    size_t graphNodes = 0;
+    size_t graphDead = 0;
+    /** HNSW: rows linked by writes since the build, and the time that took. */
+    size_t inserts = 0;
+    double insertSeconds = 0.0;
 };
 
 /**
@@ -1241,45 +1289,8 @@ struct LoadReport {
 
 namespace detail {
 
-/** The scoring of one row. Strict IEEE float arithmetic, one fixed order; see cosineRows. */
-#if defined(__clang__)
-#define ISONGRAPH_VECTOR_NOINLINE __attribute__((noinline))
-#elif defined(__GNUC__)
-#define ISONGRAPH_VECTOR_NOINLINE __attribute__((noinline, noclone))
-#elif defined(_MSC_VER)
-#define ISONGRAPH_VECTOR_NOINLINE __declspec(noinline)
-#else
-#define ISONGRAPH_VECTOR_NOINLINE
-#endif
-
-/**
- * The cosine of two n-float rows: dot / (|a| * |b|), 0 when either norm is 0.
- * The three sums run in ascending order in single-precision accumulators.
- *
- * THE one scoring routine. The exact scan, the batch search, the approximate
- * index's re-score, scoreMap and a store loaded from a snapshot all call this
- * function and nothing else, so one query/row pair has one score everywhere.
- * It is out of line on purpose: two inlined copies are free to be contracted
- * (fused multiply-add) or vectorised differently by an optimiser, which showed
- * up as last-bit differences on GCC 15. Never compile this with -ffast-math.
- */
-ISONGRAPH_VECTOR_NOINLINE inline float cosineRows(const float* a, const float* b, size_t n) {
-    float dot = 0.0f;
-    float norm1 = 0.0f;
-    float norm2 = 0.0f;
-
-    for (size_t i = 0; i < n; ++i) {
-        dot += a[i] * b[i];
-        norm1 += a[i] * a[i];
-        norm2 += b[i] * b[i];
-    }
-
-    norm1 = std::sqrt(norm1);
-    norm2 = std::sqrt(norm2);
-
-    if (norm1 == 0.0f || norm2 == 0.0f) return 0.0f;
-    return dot / (norm1 * norm2);
-}
+// cosineRows (THE scoring routine) and cosineRows4 now live in
+// isongraph_vector_ivf.hpp, in this namespace, so the HNSW header can share them.
 
 /** Per-slot data that is not the vector. */
 struct SlotMeta {
@@ -1367,6 +1378,7 @@ struct AnnState {
     mutable std::shared_mutex mutex;
     std::optional<AnnOptions> options;
     std::unique_ptr<IvfIndex> index;
+    std::unique_ptr<HnswIndex> hnsw;                       ///< the graph, in AnnMode::Hnsw (index stays null then)
     std::atomic<size_t> approximate{0}, widened{0}, exact{0}, builds{0};
 
     AnnState() = default;
@@ -1376,6 +1388,7 @@ struct AnnState {
         if (this != &other) {
             std::unique_lock<std::shared_mutex> lock(mutex);
             index.reset();
+            hnsw.reset();
             options = other.options;
             approximate = 0; widened = 0; exact = 0; builds = 0;
         }
@@ -1389,18 +1402,23 @@ struct AnnState {
         return *this;
     }
 
-    void reset() { index.reset(); }
+    void reset() {
+        index.reset();
+        hnsw.reset();
+    }
 
 private:
     void takeFrom(AnnState& other) {
         options = std::move(other.options);
         index = std::move(other.index);
+        hnsw = std::move(other.hnsw);
         approximate = other.approximate.load();
         widened = other.widened.load();
         exact = other.exact.load();
         builds = other.builds.load();
         other.options.reset();
         other.index.reset();
+        other.hnsw.reset();
     }
 };
 
@@ -1576,6 +1594,7 @@ private:
 
     using Ivf = detail::IvfIndex;
     using IvfHit = detail::IvfHit;
+    using Hnsw = detail::HnswIndex;
 
     /** Pending rows that trigger a fold into the approximate index at write time. */
     static constexpr size_t kFoldBatch = 256;
@@ -1742,6 +1761,7 @@ private:
         t_.codes.shrink_to_fit();
         t_.alive.shrink_to_fit();
         if (ann_.index) ann_.index->remap(remap, kept);
+        if (ann_.hnsw) ann_.hnsw->compact(remap, kept);
     }
 
     // -- scoring ----------------------------------------------------------------
@@ -1877,9 +1897,15 @@ private:
         return t_.liveCount() < std::max<size_t>(2, ann_.options->minSize) || !dimension_.has_value();
     }
 
+    bool annIsHnswLocked() const { return ann_.options && ann_.options->mode == AnnMode::Hnsw; }
+
     /** Does the index need building, retraining or dropping before it can answer? */
     bool annNeedsMaintenanceLocked() const {
         if (!ann_.options) return false;
+        if (annIsHnswLocked()) {
+            if (annTooSmallLocked()) return ann_.hnsw != nullptr;
+            return !ann_.hnsw || ann_.hnsw->stale();    // never built, or churn beyond the node count
+        }
         if (annTooSmallLocked()) return ann_.index != nullptr;
         if (!ann_.index) return true;
         return static_cast<double>(ann_.index->churn) > 0.5 * static_cast<double>(ann_.index->trainedN);
@@ -1902,6 +1928,29 @@ private:
         ann_.builds.fetch_add(1, std::memory_order_relaxed);
     }
 
+    detail::HnswRows hnswRows() const {
+        detail::HnswRows rows;
+        rows.matrix = &t_.matrix;
+        rows.alive = t_.alive.data();
+        rows.codes = t_.codes.data();
+        rows.dim = t_.matrix.dim();
+        return rows;
+    }
+
+    /** Build the graph over every live row in slot order (caller holds the lock exclusively). */
+    void annBuildHnswLocked() const {
+        const HnswOptions& h = ann_.options->hnsw;
+        ann_.hnsw = std::make_unique<Hnsw>(
+            Hnsw::build(hnswRows(), t_.slots(), h.m, h.efConstruction, ann_.options->seed, annThreads()));
+        ann_.builds.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    /** A delete took the store below minSize: the graph is dropped now (IVF drops at the next search). */
+    void annDropGraphIfTooSmall() {
+        std::unique_lock<std::shared_mutex> lock(ann_.mutex);
+        if (ann_.hnsw && annTooSmallLocked()) ann_.hnsw.reset();
+    }
+
     /**
      * Bring the index to the state the policy asks for (caller holds the lock
      * exclusively). Policy (as in Python):
@@ -1918,6 +1967,11 @@ private:
         if (!ann_.options) return;
         if (annTooSmallLocked()) {
             ann_.reset();
+            return;
+        }
+        if (annIsHnswLocked()) {
+            if (ann_.hnsw && ann_.hnsw->stale()) ann_.hnsw.reset();
+            if (!ann_.hnsw) annBuildHnswLocked();
             return;
         }
         if (ann_.index && static_cast<double>(ann_.index->churn) > 0.5 * static_cast<double>(ann_.index->trainedN)) {
@@ -1951,9 +2005,38 @@ private:
         }
     }
 
+    /**
+     * The graph, ready to search, with a shared lock held on `lock`; null (lock
+     * released) means "answer exactly". As annAcquire, for AnnMode::Hnsw: a
+     * missing or stale graph is (re)built under the exclusive lock first.
+     */
+    const Hnsw* annAcquireHnsw(std::shared_lock<std::shared_mutex>& lock) const {
+        for (;;) {
+            lock = std::shared_lock<std::shared_mutex>(ann_.mutex);
+            if (!ann_.options) {
+                lock.unlock();
+                return nullptr;
+            }
+            if (!annNeedsMaintenanceLocked()) {
+                if (!ann_.hnsw) {
+                    lock.unlock();
+                    return nullptr;
+                }
+                return ann_.hnsw.get();
+            }
+            lock.unlock();
+            std::unique_lock<std::shared_mutex> exclusive(ann_.mutex);
+            annMaintainLocked();
+        }
+    }
+
     /** A row was written (inserted or replaced in place). */
     void annAfterPut(uint32_t slot, bool added) {
         std::unique_lock<std::shared_mutex> lock(ann_.mutex);
+        if (ann_.hnsw) {
+            ann_.hnsw->notePut(hnswRows(), slot);   // linked now: no pending list, nothing to fold
+            return;
+        }
         if (!ann_.index) return;
         const float* v = t_.matrix.row(slot);
         if (added) {
@@ -1968,6 +2051,7 @@ private:
     void annBeforeErase(uint32_t slot) {
         std::unique_lock<std::shared_mutex> lock(ann_.mutex);
         if (ann_.index) ann_.index->drop(slot);
+        if (ann_.hnsw) ann_.hnsw->noteDrop();     // tombstone only: the node and its links stay
     }
 
     /**
@@ -2016,6 +2100,95 @@ private:
                 return materialize(exact, topK);
             }
         }
+    }
+
+    static size_t satMul(size_t a, size_t b) {
+        return (b != 0 && a > std::numeric_limits<size_t>::max() / b) ? std::numeric_limits<size_t>::max() : a * b;
+    }
+
+    /** ef_search for a query: the per-call override, else the configured value, else by store size; never below k. */
+    size_t hnswEfLocked(size_t over, size_t k, size_t live) const {
+        size_t ef = over != 0 ? over : ann_.options->hnsw.efSearch;
+        if (ef == 0) ef = detail::hnswAutoEf(live);
+        return std::max<size_t>({ef, k, size_t(1)});
+    }
+
+    /**
+     * Top-k from the HNSW graph, or nullopt to use the exact scan (counted as an
+     * exact search here). Widens ef 4x when a filter leaves fewer than topK, and
+     * gives up (scan) once ef would cover half the store or one search scores
+     * more nodes than the scan would cost (DESIGN.md 12.3). The scores come from
+     * the exact scorer, so they equal the exact scan's bit for bit.
+     */
+    std::optional<std::vector<SimilarityResult>> hnswSearch(
+        const std::vector<float>& query, size_t topK, const std::string& nodeType, float threshold,
+        size_t efOverride) const {
+        auto fallBack = [&]() -> std::optional<std::vector<SimilarityResult>> {
+            ann_.exact.fetch_add(1, std::memory_order_relaxed);
+            return std::nullopt;
+        };
+        const size_t live = t_.liveCount();
+        if (topK >= live) return fallBack();    // nothing to narrow down (and no graph is built for it)
+        std::shared_lock<std::shared_mutex> lock;
+        const Hnsw* graph = annAcquireHnsw(lock);
+        if (graph == nullptr) return fallBack();
+        const float norm = detail::hnswRowNorm(query.data(), query.size());
+        if (!(norm > 0.0f) || !std::isfinite(norm)) return fallBack();   // no direction to walk by
+
+        uint32_t code;
+        if (!typeFilter(nodeType, code)) return std::vector<SimilarityResult>();  // no such type at all
+        const size_t base = hnswEfLocked(efOverride, topK, live);
+        const detail::HnswRows rows = hnswRows();
+        detail::HnswFound found;
+        size_t scale = 1;
+        for (;;) {
+            const size_t ef = satMul(base, scale);
+            const bool exhausted = scale == 1 ? ef >= live : satMul(ef, 2) >= live;
+            if (exhausted) return fallBack();
+            graph->search(rows, query.data(), code, threshold, ef, std::max(live / 8, satMul(ef, 16)), found);
+            if (found.budgetHit) return fallBack();
+            if (found.hits.size() >= topK) {
+                // The graph's scores are the exact scorer's; recomputing the k we
+                // keep costs nothing and makes "bit-identical" true by construction.
+                std::vector<IvfHit> exact;
+                exact.reserve(topK);
+                for (size_t i = 0; i < topK; ++i) {
+                    const float score = detail::cosineRows(query.data(), rowOf(found.hits[i].slot), query.size());
+                    if (score >= threshold) exact.push_back(IvfHit{score, found.hits[i].slot});
+                }
+                if (exact.size() >= topK) {
+                    ann_.approximate.fetch_add(1, std::memory_order_relaxed);
+                    if (scale > 1) ann_.widened.fetch_add(1, std::memory_order_relaxed);
+                    return materialize(exact, topK);
+                }
+            }
+            scale = satMul(scale, 4);
+        }
+    }
+
+    /** One search: the index when configured and eligible, else the scan. `efOverride` 0 = none. */
+    std::vector<SimilarityResult> searchVector(
+        const std::vector<float>& queryVector, size_t topK, const std::string& nodeType,
+        float threshold, bool exact, size_t efOverride) const {
+        checkQuery(queryVector);
+
+        if (topK > 0) {
+            // A store without enableAnn() only reads its (empty) options under a
+            // brief shared lock here; the scan below is what it always was.
+            bool enabled, graph;
+            {
+                std::shared_lock<std::shared_mutex> lock(ann_.mutex);
+                enabled = ann_.options.has_value();
+                graph = annIsHnswLocked();
+            }
+            if (enabled && exact) ann_.exact.fetch_add(1, std::memory_order_relaxed);
+            if (enabled && !exact) {
+                auto answer = graph ? hnswSearch(queryVector, topK, nodeType, threshold, efOverride)
+                                    : annSearch(queryVector, topK, nodeType, threshold);
+                if (answer) return std::move(*answer);
+            }
+        }
+        return exactSearch(queryVector, topK, nodeType, threshold);
     }
 
     /** Threads for a batch: what was asked (0 = one per hardware thread), at most 256 and at most the tasks. */
@@ -2212,6 +2385,7 @@ public:
         t_.meta[slot] = detail::SlotMeta{};
         ++t_.dead;
         if (t_.dead >= 64 && t_.dead * 4 > t_.slots()) compact();
+        annDropGraphIfTooSmall();
         return true;
     }
 
@@ -2245,24 +2419,25 @@ public:
         float threshold = 0.0f,
         bool exact = false
     ) const {
-        checkQuery(queryVector);
+        return searchVector(queryVector, topK, nodeType, threshold, exact, 0);
+    }
 
-        if (topK > 0) {
-            // A store without enableAnn() only reads its (empty) options under a
-            // brief shared lock here; the scan below is what it always was.
-            bool enabled;
-            {
-                std::shared_lock<std::shared_mutex> lock(ann_.mutex);
-                enabled = ann_.options.has_value();
-            }
-            if (enabled && exact) ann_.exact.fetch_add(1, std::memory_order_relaxed);
-            if (enabled && !exact) {
-                if (auto answer = annSearch(queryVector, topK, nodeType, threshold)) {
-                    return std::move(*answer);
-                }
-            }
-        }
-        return exactSearch(queryVector, topK, nodeType, threshold);
+    /**
+     * similaritySearchVector() with the HNSW `efSearch` for this call only
+     * (AnnMode::Hnsw; the exact scan and IVF ignore it). Like the stored
+     * setting it is raised to topK when smaller.
+     *
+     * @throws EmbeddingError when efSearch is 0
+     */
+    std::vector<SimilarityResult> similaritySearchVectorEf(
+        const std::vector<float>& queryVector,
+        size_t topK,
+        const std::string& nodeType,
+        float threshold,
+        size_t efSearch
+    ) const {
+        if (efSearch == 0) throw EmbeddingError("hnsw efSearch must be at least 1");
+        return searchVector(queryVector, topK, nodeType, threshold, false, efSearch);
     }
 
     /**
@@ -2428,8 +2603,26 @@ public:
      * cells by the write that makes 256 of them. Concurrent searches are safe
      * and run in parallel; a lazy build or retrain makes them wait for it.
      * Calling this again replaces the options and drops the current index.
+     *
+     * With `options.mode = AnnMode::Hnsw` (AnnOptions::makeHnsw()) the index is
+     * an HNSW graph instead (DESIGN.md section 12): a walk through a layered
+     * neighbour graph touches far fewer rows per query than IVF's probed cells,
+     * so a single query can be several times faster at the same recall on data
+     * with neighbourhood structure (measure it: on near-uniform noise it is not),
+     * but the build is slower (13-35 s per 100,000 x 384 on 32 threads, against
+     * 1-3 s for IVF) and a batch is the same single-query walk per query. The
+     * graph keeps no copy of any vector,
+     * links a row in the write that stores it (no pending list), leaves a delete
+     * as a tombstone until the table compacts, rebuilds once updates plus
+     * deletes exceed the node count, and is never persisted. Tune with
+     * `options.hnsw` (m, efConstruction, efSearch), setAnnEfSearch() and
+     * similaritySearchVectorEf(); measure with recallCheck().
      */
     void enableAnn(AnnOptions options = AnnOptions()) {
+        if (options.hnsw.m < 2 || options.hnsw.m > detail::kHnswMaxCap / 2) {
+            throw EmbeddingError("hnsw m must be between 2 and " + std::to_string(detail::kHnswMaxCap / 2));
+        }
+        if (options.hnsw.efConstruction == 0) throw EmbeddingError("hnsw efConstruction must be at least 1");
         std::unique_lock<std::shared_mutex> lock(ann_.mutex);
         ann_.reset();
         ann_.options = options;
@@ -2452,6 +2645,18 @@ public:
         std::unique_lock<std::shared_mutex> lock(ann_.mutex);
         if (!ann_.options) throw EmbeddingError("this store has no approximate index; call enableAnn() first");
         ann_.options->nprobe = nprobe;
+    }
+
+    /**
+     * Change the HNSW `efSearch` from now on (0 = automatic by store size). No
+     * rebuild; applies to AnnMode::Hnsw only (stored and ignored in IVF mode).
+     *
+     * @throws EmbeddingError when enableAnn() was not called
+     */
+    void setAnnEfSearch(size_t efSearch) {
+        std::unique_lock<std::shared_mutex> lock(ann_.mutex);
+        if (!ann_.options) throw EmbeddingError("this store has no approximate index; call enableAnn() first");
+        ann_.options->hnsw.efSearch = efSearch;
     }
 
     /**
@@ -2482,6 +2687,24 @@ public:
         stats.widenedSearches = ann_.widened.load();
         stats.exactSearches = ann_.exact.load();
         stats.builds = ann_.builds.load();
+        stats.mode = ann_.options ? ann_.options->mode : AnnMode::Ivf;
+        if (stats.mode == AnnMode::Hnsw) {
+            if (const Hnsw* graph = ann_.hnsw.get()) {
+                stats.active = true;
+                stats.trainedN = graph->members();
+                stats.churn = graph->churn;
+                stats.buildSeconds = graph->buildSeconds;
+                stats.indexBytes = graph->bytes();
+                stats.maxLevel = graph->topLevel();
+                stats.graphNodes = graph->members();
+                stats.graphDead = graph->dead(hnswRows());
+                stats.inserts = static_cast<size_t>(graph->inserts);
+                stats.insertSeconds = graph->insertSeconds;
+            }
+            stats.efSearch = ann_.options->hnsw.efSearch != 0 ? ann_.options->hnsw.efSearch
+                                                               : detail::hnswAutoEf(t_.liveCount());
+            return stats;
+        }
         const Ivf* ix = ann_.index.get();
         stats.active = ix != nullptr;
         if (ix != nullptr) {
@@ -2576,7 +2799,32 @@ public:
                   size_t scale, const std::function<bool(SimilarityResult&&)>& visit) const {
         checkQuery(query);
         std::vector<uint32_t> order;
+        bool graphMode;
         {
+            std::shared_lock<std::shared_mutex> lock(ann_.mutex);
+            graphMode = annIsHnswLocked();
+        }
+        if (graphMode) {
+            // The best ef x scale admitted nodes of the graph, widened 4x per step
+            // (DESIGN.md 12.3); the caller's gate decides which of them count.
+            std::shared_lock<std::shared_mutex> lock;
+            const Hnsw* graph = annAcquireHnsw(lock);
+            if (graph == nullptr) return false;
+            const float norm = detail::hnswRowNorm(query.data(), query.size());
+            if (!(norm > 0.0f) || !std::isfinite(norm)) return false;
+            uint32_t code;
+            if (!typeFilter(nodeType, code)) return true;  // nothing of that type exists
+            const size_t live = t_.liveCount();
+            const size_t ef = satMul(hnswEfLocked(0, 1, live), scale);
+            if (scale == 1 ? ef >= live : satMul(ef, 2) >= live) return false;
+            detail::HnswFound found;
+            graph->search(hnswRows(), query.data(), code, threshold, ef, std::max(live / 8, satMul(ef, 16)), found);
+            if (found.budgetHit) return false;
+            order.reserve(found.hits.size());
+            for (const IvfHit& hit : found.hits) order.push_back(hit.slot);
+            ann_.approximate.fetch_add(1, std::memory_order_relaxed);
+            if (scale > 1) ann_.widened.fetch_add(1, std::memory_order_relaxed);
+        } else {
             std::shared_lock<std::shared_mutex> lock;
             const Ivf* ix = annAcquire(lock);
             if (ix == nullptr) return false;
@@ -2647,6 +2895,11 @@ public:
         if (ann_.index) {
             if (ann_.index->slots() != n) fail("approximate index has a different slot count");
             if (ann_.index->live() != n - dead) fail("approximate index has a different live count");
+        }
+        if (ann_.hnsw) {
+            // DESIGN.md 12.6, invariants 8-10: coverage, link lists, entry point
+            const std::string broken = ann_.hnsw->check(hnswRows(), n);
+            if (!broken.empty()) fail("hnsw graph: " + broken);
         }
     }
 

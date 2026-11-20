@@ -25,8 +25,9 @@ namespace IsonGraph.Vector;
 /// before a write or after it, never in between. The one thing a search can do
 /// besides read is build or retrain the approximate index, which it does by
 /// taking the exclusive lock first (so concurrent searches wait for the
-/// build). A write that makes 256 rows pending folds them into the index while
-/// it holds the exclusive lock (about 1-3 ms at 1M x 384).
+/// build). A write that makes 256 rows pending folds them into the IVF index while
+/// it holds the exclusive lock (about 1-3 ms at 1M x 384); with the HNSW index
+/// every write links its row into the graph under that lock instead.
 /// </summary>
 public sealed partial class EmbeddingStore
 {
@@ -74,7 +75,13 @@ public sealed partial class EmbeddingStore
     /// <see cref="RecallCheck(IEnumerable{float[]}, int, string?, float)"/>. The
     /// index is built lazily by the first search, never persisted, and kept
     /// current through writes and deletes. It holds no copy of the vectors
-    /// (only centroids and a cell number per row).
+    /// (only centroids and a cell number per row). <see cref="AnnMode.Hnsw"/> answers
+    /// them from an in-memory HNSW graph instead (configure it with
+    /// <paramref name="annHnsw"/>): several times faster per query than IVF at the
+    /// same recall, slower to build, also built lazily, never persisted, kept
+    /// current by every write (each insert links the new row at once) and with no
+    /// copy of the vectors (links only). <paramref name="annNlist"/> and
+    /// <paramref name="annNprobe"/> do not apply to it.
     /// </param>
     /// <param name="annNlist">Cells in the index. Null picks about 4 * sqrt(N) when it is built.</param>
     /// <param name="annNprobe">
@@ -83,7 +90,13 @@ public sealed partial class EmbeddingStore
     /// <see cref="AnnNprobe"/>.
     /// </param>
     /// <param name="annMinSize">Below this many vectors search stays exact. Default 50,000.</param>
-    /// <param name="annSeed">Seed for the k-means initialisation, so the same data gives the same index.</param>
+    /// <param name="annSeed">
+    /// Seed for the k-means initialisation (IVF) or the HNSW level generator, so the same data gives the same index.
+    /// </param>
+    /// <param name="annHnsw">
+    /// Settings for <see cref="AnnMode.Hnsw"/> (M, efConstruction, efSearch); null
+    /// takes the defaults. Ignored in any other mode.
+    /// </param>
     public EmbeddingStore(
         IEmbeddingEncoder? encoder = null,
         string? version = null,
@@ -92,7 +105,8 @@ public sealed partial class EmbeddingStore
         int? annNlist = null,
         int? annNprobe = null,
         int annMinSize = DefaultAnnMinSize,
-        int annSeed = 0)
+        int annSeed = 0,
+        HnswOptions? annHnsw = null)
     {
         CheckMode(onModelMismatch);
         if (!Enum.IsDefined(ann))
@@ -111,6 +125,9 @@ public sealed partial class EmbeddingStore
         _annNprobe = annNprobe ?? 0;
         _annMinSize = annMinSize;
         _annSeed = annSeed;
+        _annHnsw = annHnsw ?? new HnswOptions();
+        _annHnsw.Validate();
+        _annEfSearch = _annHnsw.EfSearch ?? 0;
     }
 
     /// <summary>The approximate index in use, or <see cref="AnnMode.None"/> for exact search.</summary>
@@ -377,6 +394,7 @@ public sealed partial class EmbeddingStore
         var table = _table ??= new VectorTable(vector.Length);
         int slot = table.Put(nodeRef, key, text, vector, model, out _);
         if (_ivf is not null && _ivf.NotePut(slot)) _ivf.Fold(table);
+        _hnsw?.NotePut(table, slot, ScanThreads);
         return key;
     }
 
@@ -433,8 +451,9 @@ public sealed partial class EmbeddingStore
             var t = _table;
             if (t is null || !t.Remove(Key(nodeRef), out int slot)) return false;
             _ivf?.NoteDrop(slot);
+            _hnsw?.NoteDrop();
             if (t.ShouldCompact) CompactLocked();
-            if (_ivf is not null && t.Live < Math.Max(2, _annMinSize)) _ivf = null;
+            if (t.Live < Math.Max(2, _annMinSize)) { _ivf = null; _hnsw = null; }
             return true;
         }
         finally { _rw.ExitWriteLock(); }
@@ -446,6 +465,7 @@ public sealed partial class EmbeddingStore
         var t = _table!;
         var remap = t.Compact();
         _ivf?.Compact(remap, t.Slots);
+        if (_hnsw is not null) _hnsw = _hnsw.Compacted(remap, t.Slots);
     }
 
     /// <summary>
@@ -491,6 +511,7 @@ public sealed partial class EmbeddingStore
     {
         _table = null;
         _ivf = null;
+        _hnsw = null;
         if (resetDimension) _dimension = -1;
     }
 
@@ -566,7 +587,7 @@ public sealed partial class EmbeddingStore
         {
             foreach (var q in queries) CheckQuery(q);       // fail before any work, deterministically
             var results = new IReadOnlyList<SimilarityResult>[n];
-            int degree = Math.Min(maxDegreeOfParallelism == 0 ? Environment.ProcessorCount : maxDegreeOfParallelism, n);
+            int degree = Math.Min(BatchDegree(maxDegreeOfParallelism), n);
             if (degree <= 1)
             {
                 for (int i = 0; i < n; i++)
@@ -584,7 +605,7 @@ public sealed partial class EmbeddingStore
 
     /// <summary>One search, with a shared lock held and (if wanted) the index ready.</summary>
     private IReadOnlyList<SimilarityResult> SearchCore(
-        float[] queryVector, int? topK, string? nodeType, float threshold, bool exact, int maxThreads)
+        float[] queryVector, int? topK, string? nodeType, float threshold, bool exact, int maxThreads, int efSearch = 0)
     {
         CheckQuery(queryVector);
         if (_ann != AnnMode.None)
@@ -593,7 +614,7 @@ public sealed partial class EmbeddingStore
                 Interlocked.Increment(ref _annExact);
             else
             {
-                var answer = AnnSearch(queryVector, topK.Value, nodeType, threshold);
+                var answer = AnnSearch(queryVector, topK.Value, nodeType, threshold, efSearch);
                 if (answer is not null) return answer;
                 Interlocked.Increment(ref _annExact);
             }

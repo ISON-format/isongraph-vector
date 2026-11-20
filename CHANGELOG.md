@@ -208,6 +208,29 @@ JavaScript, Rust and C++.
   Costs: single-thread exact scan is 0-13% slower, ingest is slower, and
   updates at 1M are 2-3x slower because index upkeep moved from the first
   search to the write.
+- **C++ and C#: opt-in HNSW** (`DESIGN.md` section 12, ported from the Rust
+  index; links only, about 145 B/node, never persisted, graph file / sidecar /
+  digest / snapshot bytes unchanged). C++: `AnnOptions::makeHnsw()`,
+  `setAnnEfSearch`, `similaritySearchVectorEf`. C#: `AnnMode.Hnsw`,
+  `HnswOptions`, `AnnEfSearch`, `SimilaritySearchVectorEf`. Built
+  deterministically (the graph does not depend on the thread count); batch
+  equals single-query bit for bit. Checked against Rust on shared integer data:
+  C# ids and order identical in 6 of 6 parameter sets, C++ in 4 of 5 (one query
+  in 200 differed by one id), and identical in score bits too once C++ used
+  Rust's summation order, so the spec reproduces the Rust graph; scores are
+  bit-identical to the exact scan within a port, not across ports. Measured at
+  100k x 384 on a shared Windows laptop, synthetic clustered vectors (not real
+  text): the whole store is 1.21-1.22x raw; build 10-14 s (C++ g++) /
+  28-35 s (C++ MSVC) / about 24 s (C#) against 1-3 s for IVF; inserts 1.1-2.6
+  ms. Single-query speed over IVF at equal recall ranged from 1.2x (C++, recall
+  0.74, hard noise) to about 10x (C#, recall 0.95); on Rust's real-text data it
+  is 4x at 100k, so treat the C++ figure as unexplained and run your own data.
+  Side by side on one machine C# is about 1.6x slower to build and 0.6-0.7x the
+  QPS of Rust, because its scalar kernel stands in for AVX2/FMA. Not run on
+  Linux/GCC 15, macOS or real text embeddings. **Breaking (binary only, C#):**
+  new trailing optional `annHnsw` parameter on four public signatures;
+  `AnnMode` gained a case. C++: none at source level (`enableAnn` now rejects
+  `hnsw.m` outside 2..64).
 - **Python, C#, TypeScript, JavaScript and C++: one copy of every vector,
   batch search, binary snapshot** (the Rust design of `DESIGN.md` sections 1, 5
   and 11 carried over; measured per port below). Each store now keeps every
@@ -281,7 +304,7 @@ JavaScript, Rust and C++.
 - The synchronous JavaScript / TypeScript encoder interface still only serves
   prefetched texts; use the `...Async` methods to embed through a network
   encoder. `loadGraph({onMismatch: 'reembed'})` has no async form.
-- Approximate search is IVF-flat in every port; only Rust also has HNSW. Recall on real embeddings was
+- Approximate search is IVF-flat in every port; Rust, C++ and C# also have opt-in HNSW. Recall on real embeddings was
   measured at 100k and 1M (`benchmarks/competitive/`); the index is not
   persisted and is rebuilt after load. JavaScript builds are slow (about 8
   minutes at 1M vectors).
