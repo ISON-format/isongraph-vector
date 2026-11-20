@@ -275,12 +275,21 @@ inline bool hitBefore(const IvfHit& a, const IvfHit& b) {
 /** The scoring of one row. Strict IEEE float arithmetic, one fixed order; see cosineRows. */
 #if defined(__clang__)
 #define ISONGRAPH_VECTOR_NOINLINE __attribute__((noinline))
+// Apple clang contracts a*b+c into fused multiply-adds (-ffp-contract=on) and may
+// choose differently per loop shape, which made cosineRows4 differ from cosineRows
+// in the last bit on Apple Silicon. The scorers switch contraction off themselves.
+#define ISONGRAPH_VECTOR_STRICT_FP _Pragma("clang fp contract(off)")
 #elif defined(__GNUC__)
-#define ISONGRAPH_VECTOR_NOINLINE __attribute__((noinline, noclone))
+// optimize("fp-contract=off"): GCC fuses by default on targets that have an FMA
+// (aarch64 always, x86 with -mfma); the scorers must not depend on that.
+#define ISONGRAPH_VECTOR_NOINLINE __attribute__((noinline, noclone, optimize("fp-contract=off")))
 #elif defined(_MSC_VER)
 #define ISONGRAPH_VECTOR_NOINLINE __declspec(noinline)
 #else
 #define ISONGRAPH_VECTOR_NOINLINE
+#endif
+#ifndef ISONGRAPH_VECTOR_STRICT_FP
+#define ISONGRAPH_VECTOR_STRICT_FP
 #endif
 
 /**
@@ -295,6 +304,7 @@ inline bool hitBefore(const IvfHit& a, const IvfHit& b) {
  * up as last-bit differences on GCC 15. Never compile this with -ffast-math.
  */
 ISONGRAPH_VECTOR_NOINLINE inline float cosineRows(const float* a, const float* b, size_t n) {
+    ISONGRAPH_VECTOR_STRICT_FP
     float dot = 0.0f;
     float norm1 = 0.0f;
     float norm2 = 0.0f;
@@ -324,6 +334,7 @@ ISONGRAPH_VECTOR_NOINLINE inline float cosineRows(const float* a, const float* b
 ISONGRAPH_VECTOR_NOINLINE inline void cosineRows4(const float* q, const float* r0, const float* r1,
                                                   const float* r2, const float* r3, size_t n,
                                                   float* out) {
+    ISONGRAPH_VECTOR_STRICT_FP
     float dot0 = 0.0f, dot1 = 0.0f, dot2 = 0.0f, dot3 = 0.0f;
     float norm1 = 0.0f;
     float n20 = 0.0f, n21 = 0.0f, n22 = 0.0f, n23 = 0.0f;
