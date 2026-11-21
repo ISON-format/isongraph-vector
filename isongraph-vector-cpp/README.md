@@ -321,9 +321,10 @@ For single-query latency you can use an HNSW graph instead
 `efConstruction` 200, `efSearch` 0 = auto by size; `setAnnEfSearch` and
 `similaritySearchVectorEf` change `ef` without a rebuild). It holds links only
 (about 145 bytes per vector), is built lazily by the first search, is never
-saved, and keeps scores bit-identical to the exact scan. It builds 3-14x slower
-than IVF (the scorer is scalar and strictly ordered, and MSVC is about 2.5x
-slower than GCC), so pick it when queries dominate. Design: section 12 of
+saved, and keeps scores bit-identical to the exact scan. On real text (100k x
+384, single thread, recall about 0.95) it answers about 4.5-5x faster than IVF
+(Rust: 3.6x); building takes about 10-14 s (IVF: a few seconds), so pick it when
+queries dominate. Design: section 12 of
 `isongraph-vector-rs/DESIGN.md`; the same `minSize`, `exact`, `recallCheck`
 rules apply.
 

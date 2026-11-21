@@ -278,6 +278,17 @@ graph.recallCheck(sampleQueries, 10);                       // recall@10 against
 graph.embeddingStore.annStats();                            // cells, pending rows, memory, counters
 ```
 
+For single-query latency, `ann: 'hnsw'` builds an HNSW graph instead
+(`annHnsw: { m: 16, efConstruction: 200, efSearch }`; `efSearch` defaults by size,
+`store.annEfSearch` / `setAnnEfSearch(n)` / `similaritySearchEf(...)` change it
+without a rebuild). It holds links only (about 145 bytes per vector), is built
+lazily, never saved, and a hit's score equals the exact scan's. On real text
+(100k x 384, Node 24) it answered about 1,600 queries/s at recall@10 0.95 where
+IVF answered about 200 (8x), at the price of a build of about 2.6 minutes
+(IVF: 57 s) and about 1.7 ms per insert. It is single-threaded, and 1M vectors
+are unmeasured (expect half an hour or more to build). Design: section 12 of
+`isongraph-vector-rs/DESIGN.md`.
+
 Options (also `EmbeddingStore`'s second argument): `ann`, `annNlist` (default
 about `4 * sqrt(N)`, between 16 and 65536), `annNprobe` (default 5% of the
 cells; settable later as `store.annNprobe`), `annMinSize` (default 50000: below

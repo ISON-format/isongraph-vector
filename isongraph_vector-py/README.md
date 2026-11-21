@@ -244,6 +244,10 @@ Homebrew's `python@3.12` and most Linux distribution builds do support it.
 
 ### Approximate search (opt-in, past ~1M vectors)
 
+(This port has no HNSW: a pure-Python graph was only 1.6-1.7x faster than the IVF
+below at equal recall because each hop pays numpy call overhead, so it was not shipped;
+Rust, C++, C#, TypeScript and JavaScript have one.)
+
 Everything above is exact. The numpy scan stays under about 5 ms at 100,000
 vectors and reaches 50 ms at about 960,000 (measured, 384-d, one machine).
 Beyond that, an optional IVF index trades a little recall for latency:
