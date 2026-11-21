@@ -1,0 +1,15 @@
+csharp: ds=text384 n=100000 d=384 queries=2000 cpus=32
+  ingest 0.18s
+  exact recall=1 qps=57.5
+  ivf build 2.71s nlist=1265
+  ivf nprobe=1 recall=0.2776 qps1t=6021
+  ivf nprobe=2 recall=0.3992 qps1t=5568
+  ivf nprobe=4 recall=0.5201 qps1t=4369
+  ivf nprobe=8 recall=0.6376 qps1t=3353
+  ivf nprobe=16 recall=0.7452 qps1t=2495
+  ivf nprobe=32 recall=0.8359 qps1t=1515
+  ivf nprobe=64 recall=0.9060 qps1t=870
+  ivf nprobe=128 recall=0.9528 qps1t=473
+  ivf nprobe=256 recall=0.9822 qps1t=225
+  ivf nprobe=1265 recall=1.0000 qps1t=57
+wrote results/post_rework/raw\csharp__text384__100000__core+saveload.json

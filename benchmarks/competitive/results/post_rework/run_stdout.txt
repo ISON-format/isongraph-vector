@@ -1,0 +1,46 @@
+[22:16:25] START numpy_bf__text384__100000__core+saveload load_before=14.8%
+[22:16:59] END   numpy_bf__text384__100000__core+saveload ok 34s
+[22:17:14] START faiss_flat__text384__100000__core+saveload load_before=11.7%
+[22:17:46] END   faiss_flat__text384__100000__core+saveload ok 33s
+[22:18:02] START faiss_ivfflat__text384__100000__core+saveload load_before=12.9%
+[22:19:19] END   faiss_ivfflat__text384__100000__core+saveload ok 77s
+[22:19:34] START faiss_hnsw__text384__100000__core+saveload load_before=14.5%
+[22:21:04] END   faiss_hnsw__text384__100000__core+saveload ok 90s
+[22:21:19] START hnswlib__text384__100000__core+saveload load_before=13.3%
+[22:22:27] END   hnswlib__text384__100000__core+saveload ok 69s
+[22:22:42] START isong_py__text384__100000__core+saveload load_before=11.9%
+[22:24:43] END   isong_py__text384__100000__core+saveload ok 121s
+[22:24:59] START isong_py_ivf__text384__100000__core+saveload load_before=11.4%
+[22:27:52] END   isong_py_ivf__text384__100000__core+saveload ok 173s
+[22:28:07] START rust_default__text384__100000__core+int8+saveload load_before=16.4%
+[22:30:21] END   rust_default__text384__100000__core+int8+saveload ok 134s
+[22:30:37] START rust_default__text384__100000__hnsw load_before=13.9%
+[22:31:24] END   rust_default__text384__100000__hnsw ok 47s
+[22:31:38] START rust_native__text384__100000__core+int8 load_before=12.1%
+[22:33:48] END   rust_native__text384__100000__core+int8 ok 130s
+[22:34:04] START rust_native__text384__100000__hnsw load_before=13.3%
+[22:34:51] END   rust_native__text384__100000__hnsw ok 47s
+[22:35:05] START cpp_default__text384__100000__core+saveload load_before=24.2%
+[22:38:11] END   cpp_default__text384__100000__core+saveload ok 186s
+[22:38:25] START cpp_default__text384__100000__hnsw load_before=20.2%
+[22:39:21] END   cpp_default__text384__100000__hnsw ok 56s
+[22:39:35] START cpp_avx2__text384__100000__core load_before=11.8%
+[22:41:29] END   cpp_avx2__text384__100000__core ok 114s
+[22:41:38] START cpp_avx2__text384__100000__hnsw load_before=18.8%
+[22:42:25] END   cpp_avx2__text384__100000__hnsw ok 47s
+[22:42:41] START csharp__text384__100000__core+saveload load_before=19.2%
+[22:44:49] END   csharp__text384__100000__core+saveload ok 128s
+[22:45:04] START csharp__text384__100000__hnsw load_before=13.0%
+[22:46:15] END   csharp__text384__100000__hnsw ok 71s
+[22:46:29] START js__text384__100000__core load_before=11.5%
+[22:49:34] END   js__text384__100000__core ok 185s
+[22:49:50] START js__text384__100000__hnsw load_before=14.2%
+[22:55:11] END   js__text384__100000__hnsw ok 321s
+[22:55:25] START js__text384__100000__saveload load_before=18.4%
+[22:55:30] END   js__text384__100000__saveload ok 5s
+[22:55:46] START ts__text384__100000__core load_before=18.2%
+[22:58:51] END   ts__text384__100000__core ok 184s
+[22:59:06] START ts__text384__100000__hnsw load_before=12.9%
+[23:04:29] END   ts__text384__100000__hnsw ok 324s
+[23:04:44] START ts__text384__100000__saveload load_before=13.3%
+[23:04:49] END   ts__text384__100000__saveload ok 6s

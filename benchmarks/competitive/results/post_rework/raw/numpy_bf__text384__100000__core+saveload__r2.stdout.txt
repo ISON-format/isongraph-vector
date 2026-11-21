@@ -1,0 +1,1 @@
+  numpy_bf text384 100000 knob=None recall=0.9999 qps1t=108 med=9.041ms batch=655

@@ -359,14 +359,16 @@ every suite asserts that set.
 
 - **Search is exact (brute force) by default**, sqlite-vec included — linear in
   the number of nodes. Every in-memory store has an opt-in IVF index for large
-  stores; Rust, C++ and C# also have an opt-in HNSW graph. This is built for
+  stores; Rust, C++, C#, TypeScript and JavaScript also have an opt-in HNSW graph. This is built for
   an application's own knowledge graph, not as a vector-database replacement:
-  measured against faiss, hnswlib and usearch (`benchmarks/competitive/`, taken
-  before the engine rework) the ports were 2-4x slower per query at 100k and
-  about 14x slower at 1M vectors at equal recall; batch and concurrent search
-  now exist in Rust, C++, C# and Python, and vectors persist as JSON or an
-  opt-in binary snapshot. They do build indexes 8-25x faster
-  and take inserts and updates far faster than HNSW. For vectors on both
+  re-measured against faiss, hnswlib and numpy after the engine rework
+  (`benchmarks/competitive/README_post_rework.md`, real text embeddings at 100k and
+  1M), Rust and C++ HNSW are 1.1-1.4x faster per thread at equal recall, C# 0.8x
+  and JS/TS 0.4x, while every port's IVF is 0.1-0.3x of the HNSW libraries;
+  batch and concurrent search exist in Rust, C++, C# and Python, and vectors
+  persist as JSON or an opt-in binary snapshot, but no index is persisted.
+  IVF builds in seconds where HNSW takes minutes (and the HNSW libraries build
+  as fast as or faster than ours at 100k). For vectors on both
   nodes *and* edges and link prediction, RudraDB is the right tool; these are
   not really competitors despite the surface similarity.
 - **Where it does help: multi-hop questions.** On HotpotQA, 2WikiMultihopQA and

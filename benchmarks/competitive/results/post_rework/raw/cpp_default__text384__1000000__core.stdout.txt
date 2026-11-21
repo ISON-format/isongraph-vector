@@ -1,0 +1,14 @@
+cpp_default: ds=text384 n=1000000 d=384 queries=2000 cpus=32
+  ingest 0.695772 s
+  exact qps=2.88854
+  ivf build 28.2765 s nlist=4000
+  ivf nprobe=1 recall=0.2669 qps1t=2638.07
+  ivf nprobe=2 recall=0.3726 qps1t=2065.05
+  ivf nprobe=4 recall=0.4897 qps1t=1604.24
+  ivf nprobe=8 recall=0.6026 qps1t=1180.52
+  ivf nprobe=16 recall=0.699556 qps1t=715.157
+  ivf nprobe=32 recall=0.789409 qps1t=409.902
+  ivf nprobe=64 recall=0.862338 qps1t=236.019
+  ivf nprobe=128 recall=0.916317 qps1t=130.05
+  ivf nprobe=256 recall=0.953465 qps1t=70.2367
+wrote results/post_rework/raw\cpp_default__text384__1000000__core.json

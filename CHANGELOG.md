@@ -219,18 +219,65 @@ JavaScript, Rust and C++.
   in 200 differed by one id), and identical in score bits too once C++ used
   Rust's summation order, so the spec reproduces the Rust graph; scores are
   bit-identical to the exact scan within a port, not across ports. Measured at
-  100k x 384 on a shared Windows laptop, synthetic clustered vectors (not real
-  text): the whole store is 1.21-1.22x raw; build 10-14 s (C++ g++) /
-  28-35 s (C++ MSVC) / about 24 s (C#) against 1-3 s for IVF; inserts 1.1-2.6
-  ms. Single-query speed over IVF at equal recall ranged from 1.2x (C++, recall
-  0.74, hard noise) to about 10x (C#, recall 0.95); on Rust's real-text data it
-  is 4x at 100k, so treat the C++ figure as unexplained and run your own data.
-  Side by side on one machine C# is about 1.6x slower to build and 0.6-0.7x the
-  QPS of Rust, because its scalar kernel stands in for AVX2/FMA. Not run on
-  Linux/GCC 15, macOS or real text embeddings. **Breaking (binary only, C#):**
+  100k x 384 on a shared Windows laptop: the whole store is 1.21-1.22x raw;
+  C# builds in about 24 s (synthetic clustered data) against 1-3 s for IVF and
+  is about 10x IVF single-query at recall 0.95; side by side on one machine it
+  is about 1.6x slower to build and 0.6-0.7x the QPS of Rust, because its scalar
+  kernel stands in for AVX2/FMA. C++ numbers on real text are in the next
+  bullet. Run on CI for Linux (GCC 15), macOS (Apple Silicon) and Windows; the
+  first macOS run caught Apple clang fusing multiply-adds differently in two
+  scorers, now switched off in both. **Breaking (binary only, C#):**
   new trailing optional `annHnsw` parameter on four public signatures;
   `AnnMode` gained a case. C++: none at source level (`enableAnn` now rejects
   `hnsw.m` outside 2..64).
+- **C++ HNSW scorer** (found by comparing with Rust on real text): the C++ graph
+  visits exactly as many rows per query as Rust's at equal `ef` (1,850 at
+  ef 96, same recall .9477), so the first measurement's low speed-up over IVF
+  (1.2x on hard synthetic data) was a slow scorer plus the data, not the graph.
+  The HNSW now scores several rows at once, one row per SSE2 lane, with cached
+  row norms; each lane runs the same strict ascending sums as `cosineRows`, so
+  scores stay bit-identical to the exact scan (a scalar strict kernel is the
+  fallback on NEON and `ISONGRAPH_VECTOR_NO_SIMD`; the NEON path has never run
+  on ARM hardware). Real text-384, 100k, single thread, recall about .94-.95
+  (medians of 3, shared laptop, so +-15%): HNSW ef 96 about 2,700 QPS (MSVC) /
+  3,500 (g++) against IVF about 590 / 660, i.e. 4.5x / 5.2x (Rust measured
+  3,100 vs 860 on the same day); build 13.5 s (MSVC) / 9.7 s (g++) / 9.4 s
+  (Rust); insert 1.3 / 0.65 ms. A query now reads about 2.8 MB of rows and the
+  graph is memory-bound, so a wider (AVX2) kernel would not help. Adds 4 B/node
+  for cached norms.
+- **TypeScript and JavaScript: opt-in HNSW** (`ann: 'hnsw'`, `annHnsw: { m,
+  efConstruction, efSearch }`, `annEfSearch`, `setAnnEfSearch`,
+  `similaritySearchEf`; single-threaded, never persisted, graph file / sidecar /
+  digest / snapshot bytes unchanged). Top-k ids match Rust's in 6 of 6
+  cross-check parameter sets. Real text-384, 100k, Node 24, ef 96: recall .948,
+  about 1,600 QPS against IVF's about 200 at recall .946 (about 8x); recall by
+  ef equals Rust's (.915 / .948 / .963 / .980). Costs: build about 2.6 minutes
+  at 100k (IVF 57 s; 1M is unmeasured and extrapolates to half an hour or
+  more), insert about 1.7 ms, whole store 1.23x (JS) / 1.30x (TS) raw. Only
+  Node 24 was run; Node 20/22 and browsers are unverified. **Breaking:**
+  `AnnMode` is now `'ivf' | 'hnsw'`; `ann: 'hnsw'` used to throw.
+- **Competitive benchmark re-run** (`benchmarks/competitive/README_post_rework.md`,
+  raw JSON in `results/post_rework/raw/`): faiss, hnswlib, numpy and every port on
+  the same machine, text-384 at 100k and 1M. QPS at recall 0.95, one thread,
+  100k: Rust HNSW 3,416, C++ 2,969 (4,004 with `/arch:AVX2`), C# 2,026, JS/TS
+  about 967, against faiss HNSW 2,671 and hnswlib 2,575; at 1M Rust 1,446, C++
+  1,308, C# 926 against 1,207 and 1,040. Rust exact batch is 3.1x faiss Flat
+  (5,454 vs 1,775 QPS) and 7.6x numpy. Not run: mutation, filters, GloVe, SIFT,
+  usearch/chromadb/lancedb. The run also recorded things the library still
+  does not do well: IVF index builds measured 2-3x slower than in the
+  pre-rework run in every native port (Rust 0.48 s to 1.42 s at 100k, not
+  machine drift; cause not yet found), Python ingest at 1M is 3.1x slower than
+  before (59.9 s vs 19.6 s), and the TypeScript/JavaScript JSON sidecar cannot be
+  written at 100k x 384 (`Invalid string length`; the snapshot works).
+- **Python: HNSW evaluated and not offered.** A pure-Python port of the same
+  index (faithful: top-k ids match Rust in 6 of 6 sets) was only 1.6-1.7x faster
+  than the Python IVF at equal recall on real text 100k (4-8x in the compiled
+  ports) because every graph hop pays numpy call overhead, and it took 5-8
+  minutes to build and 3-4 ms per write. It was not shipped. `canonical_scores`
+  stays on by default: it makes batch search 8.5x faster and scores
+  reproducible across slots and between single and batch calls, and costs IVF
+  single-query speed about 10-18% (exact single-query: none); turn it off if you
+  want that back.
 - **Python, C#, TypeScript, JavaScript and C++: one copy of every vector,
   batch search, binary snapshot** (the Rust design of `DESIGN.md` sections 1, 5
   and 11 carried over; measured per port below). Each store now keeps every
@@ -304,15 +351,22 @@ JavaScript, Rust and C++.
 - The synchronous JavaScript / TypeScript encoder interface still only serves
   prefetched texts; use the `...Async` methods to embed through a network
   encoder. `loadGraph({onMismatch: 'reembed'})` has no async form.
-- Approximate search is IVF-flat in every port; Rust, C++ and C# also have opt-in HNSW. Recall on real embeddings was
+- Approximate search is IVF-flat in every port; Rust, C++, C#, TypeScript and JavaScript also have opt-in HNSW (not Python: see above). Recall on real embeddings was
   measured at 100k and 1M (`benchmarks/competitive/`); the index is not
   persisted and is rebuilt after load. JavaScript builds are slow (about 8
   minutes at 1M vectors).
-- **Not a vector-database replacement.** Against faiss, hnswlib and usearch
-  the ports are 2-4x slower per query at 100k and about 14x slower at 1M text
-  vectors at equal recall; only Rust, C# and C++ have concurrent search and Python has batch search (TypeScript and JavaScript are single-threaded); the ANN index is
-  never persisted and the binary snapshot is opt-in (JSON is the portable default); and memory is 1.12-1.25x raw at 1M in the four ports measured, against 1.6-1.9 GB for faiss / hnswlib at 1M x 384 (re-run `benchmarks/competitive/` before quoting the
-  ratios: they predate the rework). Graph-aware retrieval
+- **Not a vector-database replacement.** Re-measured after the rework
+  (`benchmarks/competitive/README_post_rework.md`, real text-384, one machine,
+  one session): with HNSW, Rust is 1.2-1.3x faiss HNSW and 1.3-1.4x hnswlib per
+  thread at recall 0.95 (100k and 1M), C++ 1.1x, C# 0.76-0.77x, JS/TS 0.36x
+  (and a 4-minute build at 100k); the IVF indexes are 0.1-0.3x of the HNSW
+  libraries. hnswlib still builds faster than every port at 100k, the ANN index
+  is never persisted (faiss and hnswlib reload theirs in under a second, ours is
+  rebuilt), the binary snapshot is opt-in (JSON is the portable default), only
+  Rust, C# and C++ have concurrent search, Python has batch search (TypeScript
+  and JavaScript are single-threaded). Memory: Rust and C++ HNSW within 8% of
+  faiss / hnswlib at 1M x 384 (1.65-1.8 GB), C# 1.4-1.85x, JS/TS 2.5x. Other
+  stores in the old table (usearch, chromadb, lancedb, ...) were not re-run. Graph-aware retrieval
   beating plain vector search on multi-hop questions is the supported claim,
   and it depends on the graph carrying real structure
   (`benchmarks/multihop/README.md`).

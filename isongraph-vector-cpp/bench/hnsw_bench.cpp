@@ -3,6 +3,8 @@
 // isongraph-vector-rs/examples/hnsw_bench.rs (same measurements, synthetic data).
 //
 //   hnsw_bench <phase> [n=100000] [dim=384] [queries=300] [data=random|clustered] [noise=1.0]
+//   hnsw_bench real dir=<prep/text384> [n=100000] [queries=1000] [ef=64,96,128,192] [nprobe=a,b]
+//                   [budget=4] [pin=1] [batch=0] [hnsw=1] [ivf=1]
 //
 // phases (run each in its own process so the resident-set numbers are clean):
 //   mem     resident memory after importing n unit vectors, and after the HNSW
@@ -10,6 +12,12 @@
 //   search  HNSW build, recall and QPS at the automatic ef and a sweep of ef,
 //           batch QPS, insert / update / delete latency; then IVF (default
 //           nprobe and a sweep) and the exact scan on the same data and queries
+//   real    the benchmarks/competitive/ real vectors (prep/text384: base.f32,
+//           queries.f32, gt_<n>.i32, meta.json), read as isongraph-vector-rs/
+//           examples/hnsw_bench.rs reads them with --ds-dir: HNSW build, recall
+//           and single-thread / batch QPS over ef, insert latency, then IVF over
+//           nprobe (pin=1 pins the single-thread loops to one CPU on Windows,
+//           like the Rust --pin)
 //
 // data=random is uniform noise on the unit sphere (the hardest case: in 384-d
 // every pair is nearly orthogonal, so no approximate index has structure to
@@ -26,7 +34,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
+#include <map>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -175,9 +186,234 @@ Measured measure(EmbeddingStore& store, const std::vector<Vec>& queries,
     return m;
 }
 
+// ---- real data (the Rust benchmark's --ds-dir mode) ---------------------------------------
+
+std::vector<float> readF32(const std::string& path, size_t startRow, size_t rows, size_t d) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) { std::fprintf(stderr, "cannot open %s\n", path.c_str()); std::exit(2); }
+    f.seekg(static_cast<std::streamoff>(startRow * d * 4));
+    std::vector<float> out(rows * d);
+    f.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(out.size() * 4));
+    if (!f) { std::fprintf(stderr, "short read of %s\n", path.c_str()); std::exit(2); }
+    return out;
+}
+
+std::vector<int32_t> readI32(const std::string& path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) { std::fprintf(stderr, "cannot open %s\n", path.c_str()); std::exit(2); }
+    std::vector<int32_t> out(static_cast<size_t>(f.tellg()) / 4);
+    f.seekg(0);
+    f.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(out.size() * 4));
+    return out;
+}
+
+/** Run `f`, on one pinned CPU at high priority when `pin` (Windows; elsewhere just runs it). Like the Rust bench's --pin. */
+template <class F>
+void pinned(bool pin, F&& f) {
+#if defined(_WIN32)
+    if (pin) {
+        char* env = nullptr;
+        size_t envLen = 0;
+        _dupenv_s(&env, &envLen, "BENCH_PIN_CPU");
+        const unsigned cpu = env ? static_cast<unsigned>(std::atoi(env)) : 8u;
+        std::free(env);
+        DWORD_PTR processMask = 0, systemMask = 0;
+        GetProcessAffinityMask(GetCurrentProcess(), &processMask, &systemMask);
+        SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+        SetProcessAffinityMask(GetCurrentProcess(), static_cast<DWORD_PTR>(1) << cpu);
+        f();
+        SetProcessAffinityMask(GetCurrentProcess(), processMask);
+        return;
+    }
+#else
+    (void)pin;
+#endif
+    f();
+}
+
+struct RealPoint {
+    double recall = 0, qps1 = 0, medianMs = 0, p99Ms = 0, qpsBatch = 0;
+};
+
+RealPoint measureReal(EmbeddingStore& store, const std::vector<Vec>& queries,
+                      const std::vector<std::vector<int>>& truth, size_t threads, double budget, bool pin,
+                      bool withBatch) {
+    RealPoint p;
+    std::vector<std::vector<SimilarityResult>> found;
+    found.reserve(queries.size());
+    for (const auto& q : queries) found.push_back(store.similaritySearchVector(q, 10, "", 0.0f));
+    size_t hit = 0;
+    for (size_t i = 0; i < found.size(); ++i) {
+        std::set<std::string> want;
+        for (size_t j = 0; j < 10 && j < truth[i].size(); ++j) want.insert(std::to_string(truth[i][j]));
+        for (const auto& r : found[i]) hit += want.count(r.node_ref.id);
+    }
+    p.recall = static_cast<double>(hit) / static_cast<double>(10 * found.size());
+    std::vector<double> ms;
+    const auto loopStart = Clock::now();
+    pinned(pin, [&] {
+        for (int pass = 0; pass < 3; ++pass) {
+            for (const auto& q : queries) {
+                const auto t = Clock::now();
+                auto r = store.similaritySearchVector(q, 10, "", 0.0f);
+                ms.push_back(secondsSince(t) * 1000.0);
+                if (r.empty()) std::fputc('!', stderr);
+                if (secondsSince(loopStart) > budget) return;
+            }
+        }
+    });
+    p.qps1 = static_cast<double>(ms.size()) / secondsSince(loopStart);
+    p.medianMs = percentile(ms, 0.5);
+    p.p99Ms = percentile(ms, 0.99);
+    if (!withBatch) return p;
+    const auto t = Clock::now();
+    size_t done = 0;
+    while (secondsSince(t) < std::min(budget, 3.0)) {
+        store.similaritySearchBatch(queries, 10, "", 0.0f, false, threads);
+        done += queries.size();
+    }
+    p.qpsBatch = static_cast<double>(done) / secondsSince(t);
+    return p;
+}
+
+void printHeader(const char* title) {
+    std::printf("\n%s\n  %-14s %8s %10s %10s %10s %12s\n", title, "setting", "recall", "qps(1T)", "median ms", "p99 ms", "qps(batch)");
+}
+
+void printPoint(const std::string& label, const RealPoint& p) {
+    std::printf("  %-14s %8.4f %10.0f %10.3f %10.3f %12.0f\n", label.c_str(), p.recall, p.qps1, p.medianMs, p.p99Ms, p.qpsBatch);
+    std::fflush(stdout);
+}
+
+int runReal(int argc, char** argv) {
+    std::map<std::string, std::string> opt;
+    for (int i = 2; i < argc; ++i) {
+        const std::string a = argv[i];
+        const size_t eq = a.find('=');
+        if (eq != std::string::npos) opt[a.substr(0, eq)] = a.substr(eq + 1);
+    }
+    auto get = [&](const char* key, const char* def) {
+        auto it = opt.find(key);
+        return it == opt.end() ? std::string(def) : it->second;
+    };
+    auto list = [&](const std::string& text) {
+        std::vector<size_t> out;
+        std::stringstream ss(text);
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+            if (!item.empty()) out.push_back(static_cast<size_t>(std::stoull(item)));
+        }
+        return out;
+    };
+    const std::string dir = get("dir", "");
+    if (dir.empty()) { std::fprintf(stderr, "real: dir=<prep/text384> is required\n"); return 2; }
+    const size_t n = std::stoull(get("n", "100000"));
+    const size_t nq = std::stoull(get("queries", "1000"));
+    const double budget = std::stod(get("budget", "4"));
+    const bool pin = get("pin", "0") == "1";
+    const bool withBatch = get("batch", "1") == "1";
+    const bool doHnsw = get("hnsw", "1") == "1", doIvf = get("ivf", "1") == "1";
+    const std::vector<size_t> efs = list(get("ef", "64,96,128,192"));
+    const size_t threads = std::max<unsigned>(1, std::thread::hardware_concurrency());
+
+    // meta.json: only "d" is needed
+    size_t d = 0;
+    {
+        std::ifstream f(dir + "/meta.json");
+        std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        const size_t at = text.find("\"d\"");
+        if (at == std::string::npos) { std::fprintf(stderr, "no d in meta.json\n"); return 2; }
+        d = static_cast<size_t>(std::strtoull(text.c_str() + text.find(':', at) + 1, nullptr, 10));
+    }
+    std::printf("hnsw_bench real: n=%zu d=%zu queries=%zu threads=%zu M=16 efC=200 data=%s pin=%d\n", n, d, nq,
+                threads, dir.c_str(), pin ? 1 : 0);
+
+    std::vector<Vec> queries;
+    {
+        const std::vector<float> q = readF32(dir + "/queries.f32", 0, nq, d);
+        for (size_t i = 0; i < nq; ++i) {
+            queries.emplace_back(q.begin() + static_cast<std::ptrdiff_t>(i * d), q.begin() + static_cast<std::ptrdiff_t>((i + 1) * d));
+        }
+    }
+    std::vector<std::vector<int>> truth;
+    {
+        const std::vector<int32_t> gt = readI32(dir + "/gt_" + std::to_string(n) + ".i32");
+        for (size_t i = 0; i < nq; ++i) {
+            truth.emplace_back(gt.begin() + static_cast<std::ptrdiff_t>(i * 100), gt.begin() + static_cast<std::ptrdiff_t>((i + 1) * 100));
+        }
+    }
+    const std::vector<float> base = readF32(dir + "/base.f32", 0, n + 2000, d);
+    auto rowVec = [&](size_t i) {
+        return Vec(base.begin() + static_cast<std::ptrdiff_t>(i * d), base.begin() + static_cast<std::ptrdiff_t>((i + 1) * d));
+    };
+    auto ingest = [&](EmbeddingStore& store) {
+        const auto t = Clock::now();
+        for (size_t i = 0; i < n; ++i) store.add(NodeRef("doc", std::to_string(i)), "", rowVec(i));
+        return secondsSince(t);
+    };
+
+    if (doHnsw) {
+        EmbeddingStore store;
+        const double ingestS = ingest(store);
+        std::printf("ingest %.2fs (%.0f vec/s)\n", ingestS, static_cast<double>(n) / ingestS);
+        AnnOptions h = AnnOptions::makeHnsw();
+        h.minSize = 0;
+        store.enableAnn(h);
+        const auto t = Clock::now();
+        store.buildAnnIndex();
+        const double buildS = secondsSince(t);
+        std::printf("\nHNSW build %.1fs (%.0f nodes/s), max level %zu, graph %.1f MB (%.0f B/node)\n", buildS,
+                    static_cast<double>(n) / buildS, store.annStats().maxLevel,
+                    mib(static_cast<double>(store.annStats().indexBytes)),
+                    static_cast<double>(store.annStats().indexBytes) / static_cast<double>(n));
+        printHeader("HNSW: recall@10 vs speed over ef_search");
+        for (size_t ef : efs) {
+            store.setAnnEfSearch(ef);
+            printPoint("ef=" + std::to_string(ef), measureReal(store, queries, truth, threads, budget, pin, withBatch));
+        }
+        store.setAnnEfSearch(0);
+        // writes into the built graph
+        const size_t extra = std::min<size_t>(2000, std::max<size_t>(nq, 500));
+        std::vector<double> ins;
+        for (size_t i = 0; i < extra; ++i) {
+            Vec v = rowVec(n + i);
+            const auto w = Clock::now();
+            store.add(NodeRef("doc", std::to_string(n + i)), "", v);
+            ins.push_back(secondsSince(w) * 1000.0);
+        }
+        std::printf("\ninsert into the built graph (ms): median %.3f p99 %.3f max %.3f\n", percentile(ins, 0.5),
+                    percentile(ins, 0.99), percentile(ins, 1.0));
+    }
+
+    if (doIvf) {
+        EmbeddingStore store;
+        ingest(store);
+        AnnOptions o;
+        o.minSize = 0;
+        store.enableAnn(o);
+        const auto t = Clock::now();
+        store.buildAnnIndex();
+        const size_t nlist = store.annStats().nlist;
+        std::printf("\nIVF build %.1fs nlist=%zu\n", secondsSince(t), nlist);
+        printHeader("IVF-flat: recall@10 vs speed over nprobe");
+        std::vector<size_t> probes = list(get("nprobe", ""));
+        if (probes.empty()) {
+            for (double pct : {0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0}) {
+                probes.push_back(std::max<size_t>(1, static_cast<size_t>(std::llround(static_cast<double>(nlist) * pct / 100.0))));
+            }
+        }
+        for (size_t np : probes) {
+            store.setAnnNprobe(np);
+            printPoint("nprobe=" + std::to_string(np), measureReal(store, queries, truth, threads, budget, pin, withBatch));
+        }
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "real") return runReal(argc, argv);
     const std::string phase = argc > 1 ? argv[1] : "search";
     const size_t n = argc > 2 ? std::strtoull(argv[2], nullptr, 10) : 100000;
     const size_t dim = argc > 3 ? std::strtoull(argv[3], nullptr, 10) : 384;

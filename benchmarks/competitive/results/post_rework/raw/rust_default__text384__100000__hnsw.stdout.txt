@@ -1,0 +1,17 @@
+rust_default: ds=text384 n=100000 d=384 queries=2000 cpus=32 release=true
+  hnsw: ingest 0.10s
+  hnsw build 6.80s graph_nodes=100000 max_level=Some(4) index_bytes=14458880
+  hnsw ef=10 recall=0.6178 qps1t=15396 median=0.058ms batch_qps=69541
+  hnsw ef=16 recall=0.7104 qps1t=12669 median=0.073ms batch_qps=57860
+  hnsw ef=24 recall=0.7847 qps1t=9589 median=0.096ms batch_qps=44700
+  hnsw ef=32 recall=0.8358 qps1t=8330 median=0.116ms batch_qps=38454
+  hnsw ef=48 recall=0.8852 qps1t=5575 median=0.171ms batch_qps=29939
+  hnsw ef=64 recall=0.9170 qps1t=4895 median=0.200ms batch_qps=25791
+  hnsw ef=96 recall=0.9479 qps1t=3527 median=0.284ms batch_qps=18542
+  hnsw ef=128 recall=0.9646 qps1t=2719 median=0.366ms batch_qps=14446
+  hnsw ef=192 recall=0.9808 qps1t=1989 median=0.506ms batch_qps=10103
+  hnsw ef=256 recall=0.9871 qps1t=1507 median=0.653ms batch_qps=7997
+  hnsw ef=400 recall=0.9938 qps1t=1054 median=0.955ms batch_qps=5708
+  hnsw ef=640 recall=0.9973 qps1t=698 median=1.438ms batch_qps=3853
+  hnsw default ef=Some(96) recall=0.9479 qps1t=3437
+wrote results/post_rework/raw\rust_default__text384__100000__hnsw.json

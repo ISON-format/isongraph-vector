@@ -1,0 +1,99 @@
+{
+ "system": "faiss_flat",
+ "ds": "text384",
+ "n": 1000000,
+ "d": 384,
+ "k": 10,
+ "queries": 2000,
+ "all_threads": 32,
+ "exps": [
+  "core",
+  "saveload"
+ ],
+ "started": "2026-11-20 23:08:23",
+ "mem_baseline": {
+  "rss_mb": 37.33203125,
+  "peak_mb": 37.33203125
+ },
+ "version": "faiss-cpu 1.16.0",
+ "build": {
+  "ingest_s": 1.1482926000608131,
+  "index_s": 2.800021320581436e-06,
+  "total_s": 1.1482954000821337,
+  "first_query_ms": 90.02680005505681,
+  "ready_s": 1.2383222001371905
+ },
+ "mem_after_build": {
+  "rss_mb": 1590.2734375,
+  "peak_mb": 2158.9921875
+ },
+ "mem_after_first_query": {
+  "rss_mb": 1590.3515625,
+  "peak_mb": 2158.9921875
+ },
+ "sweep": [
+  {
+   "nq": 31,
+   "recall_queries": 31,
+   "recall": 1.0,
+   "qps_1t_runs": [
+    10.627561264341466,
+    10.609645639276225,
+    10.488787654854937
+   ],
+   "qps_1t": 10.609645639276225,
+   "qps_1t_min": 10.488787654854937,
+   "qps_1t_max": 10.627561264341466,
+   "median_ms": 94.09399994183332,
+   "p95_ms": 101.65401997510344,
+   "p99_ms": 105.57899595238268,
+   "mean_ms": 94.5629075267202,
+   "knob": null,
+   "batch": {
+    "recall": 1.0,
+    "qps_batch_runs": [
+     177.47717718869876,
+     206.2660852096149,
+     199.39665562922085
+    ],
+    "qps_batch": 199.39665562922085,
+    "qps_batch_min": 177.47717718869876,
+    "qps_batch_max": 206.2660852096149,
+    "threads": 32
+   }
+  }
+ ],
+ "knob_name": null,
+ "loop_allthreads": {
+  "nq": 42,
+  "threads": 32,
+  "qps": 12.011821690236115,
+  "median_ms": 78.3635500119999,
+  "p95_ms": 98.57217498938553,
+  "p99_ms": 107.49947492149659,
+  "mean_ms": 79.96460953025176
+ },
+ "mem_after_sweep": {
+  "rss_mb": 1609.78515625,
+  "peak_mb": 2158.9921875
+ },
+ "ref_knob": null,
+ "ref_recall_pre": 1.0,
+ "saveload": {
+  "save_s": 1.7417545000789687,
+  "disk_mb": 1472.4732303619385,
+  "load_s": 1.5586344000184909,
+  "first_query_after_load_ms": 219.05930002685636,
+  "time_to_ready_s": 1.7776937000453472
+ },
+ "mem_end": {
+  "rss_mb": 1607.08203125,
+  "peak_mb": 3143.65234375
+ },
+ "status": "ok",
+ "finished": "2026-11-20 23:09:27",
+ "load_before_pct": 14.743749999999988,
+ "load_contaminated": false,
+ "wall_s": 63.94284248352051,
+ "job_exp": "core,saveload"
+}

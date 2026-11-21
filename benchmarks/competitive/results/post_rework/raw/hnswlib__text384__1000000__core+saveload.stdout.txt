@@ -1,0 +1,12 @@
+  hnswlib text384 1000000 knob=10 recall=0.5577 qps1t=7379 med=0.121ms batch=42192
+  hnswlib text384 1000000 knob=16 recall=0.6516 qps1t=6113 med=0.149ms batch=31271
+  hnswlib text384 1000000 knob=24 recall=0.7278 qps1t=5145 med=0.173ms batch=22501
+  hnswlib text384 1000000 knob=32 recall=0.7745 qps1t=5076 med=0.179ms batch=20193
+  hnswlib text384 1000000 knob=48 recall=0.8327 qps1t=4260 med=0.232ms batch=15928
+  hnswlib text384 1000000 knob=64 recall=0.8692 qps1t=2596 med=0.377ms batch=12711
+  hnswlib text384 1000000 knob=96 recall=0.9097 qps1t=1838 med=0.520ms batch=6045
+  hnswlib text384 1000000 knob=128 recall=0.9331 qps1t=1410 med=0.689ms batch=5972
+  hnswlib text384 1000000 knob=192 recall=0.9579 qps1t=902 med=1.042ms batch=4082
+  hnswlib text384 1000000 knob=256 recall=0.9687 qps1t=829 med=1.211ms batch=3865
+  hnswlib text384 1000000 knob=400 recall=0.9817 qps1t=550 med=1.807ms batch=2649
+  hnswlib text384 1000000 knob=640 recall=0.9899 qps1t=359 med=2.769ms batch=1299

@@ -1,0 +1,15 @@
+ts: ds=text384 n=100000 d=384 queries=2000
+  ingest 0.15s
+  exact recall=1 qps=27.4
+  ivf build 92.84s nlist=1265
+  ivf nprobe=1 recall=0.2654 qps1t=1251
+  ivf nprobe=2 recall=0.3867 qps1t=1144
+  ivf nprobe=4 recall=0.5155 qps1t=968
+  ivf nprobe=8 recall=0.6369 qps1t=764
+  ivf nprobe=16 recall=0.7414 qps1t=544
+  ivf nprobe=32 recall=0.8329 qps1t=354
+  ivf nprobe=64 recall=0.9058 qps1t=202
+  ivf nprobe=128 recall=0.9526 qps1t=109
+  ivf nprobe=256 recall=0.9818 qps1t=59
+  ivf nprobe=1265 recall=1.0000 qps1t=24
+wrote results/post_rework/raw\ts__text384__100000__core.json

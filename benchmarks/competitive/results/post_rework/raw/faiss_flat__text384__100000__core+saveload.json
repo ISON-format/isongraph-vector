@@ -1,0 +1,104 @@
+{
+ "system": "faiss_flat",
+ "ds": "text384",
+ "n": 100000,
+ "d": 384,
+ "k": 10,
+ "queries": 2000,
+ "all_threads": 32,
+ "exps": [
+  "core",
+  "saveload"
+ ],
+ "started": "2026-11-20 22:17:14",
+ "mem_baseline": {
+  "rss_mb": 37.47265625,
+  "peak_mb": 37.47265625
+ },
+ "version": "faiss-cpu 1.16.0",
+ "build": {
+  "ingest_s": 0.10840709984768182,
+  "index_s": 2.900022082030773e-06,
+  "total_s": 0.10840999986976385,
+  "first_query_ms": 8.447200059890747,
+  "ready_s": 0.1168571999296546,
+  "total_s_runs": [
+   0.10840999986976385,
+   0.194789299974218,
+   0.2068823000881821
+  ]
+ },
+ "mem_after_build": {
+  "rss_mb": 208.93359375,
+  "peak_mb": 354.59765625
+ },
+ "mem_after_first_query": {
+  "rss_mb": 209.01171875,
+  "peak_mb": 354.59765625
+ },
+ "sweep": [
+  {
+   "nq": 408,
+   "recall_queries": 1000,
+   "recall": 0.9999,
+   "qps_1t_runs": [
+    116.55221737107018,
+    108.45087207536534,
+    107.19129867511963
+   ],
+   "qps_1t": 108.45087207536534,
+   "qps_1t_min": 107.19129867511963,
+   "qps_1t_max": 116.55221737107018,
+   "median_ms": 9.16445004986599,
+   "p95_ms": 10.282199963694437,
+   "p99_ms": 11.289205010980366,
+   "mean_ms": 9.04324191409008,
+   "knob": null,
+   "batch": {
+    "recall": 1.0,
+    "qps_batch_runs": [
+     1446.1600402312463,
+     1960.47236802535,
+     1775.2058596003071
+    ],
+    "qps_batch": 1775.2058596003071,
+    "qps_batch_min": 1446.1600402312463,
+    "qps_batch_max": 1960.47236802535,
+    "threads": 32
+   }
+  }
+ ],
+ "knob_name": null,
+ "loop_allthreads": {
+  "nq": 369,
+  "threads": 32,
+  "qps": 118.13317695405073,
+  "median_ms": 8.503900025971234,
+  "p95_ms": 10.236189980059862,
+  "p99_ms": 11.235324000008406,
+  "mean_ms": 8.540571274155079
+ },
+ "mem_after_sweep": {
+  "rss_mb": 228.875,
+  "peak_mb": 354.59765625
+ },
+ "ref_knob": null,
+ "ref_recall_pre": 0.9999,
+ "saveload": {
+  "save_s": 0.2677941999863833,
+  "disk_mb": 147.24740028381348,
+  "load_s": 0.1416421999456361,
+  "first_query_after_load_ms": 19.792500068433583,
+  "time_to_ready_s": 0.16143470001406968
+ },
+ "mem_end": {
+  "rss_mb": 223.31640625,
+  "peak_mb": 528.68359375
+ },
+ "status": "ok",
+ "finished": "2026-11-20 22:17:46",
+ "load_before_pct": 11.709374999999985,
+ "load_contaminated": false,
+ "wall_s": 32.516000270843506,
+ "job_exp": "core,saveload"
+}

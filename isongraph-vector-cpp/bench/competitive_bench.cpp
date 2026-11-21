@@ -186,6 +186,38 @@ std::string point_impl(const EmbeddingStore& s, const Ctx& c, const std::vector<
     return o.str();
 }
 
+/** The batched call over all hardware threads: warm up once, then 3 timed runs of the whole query set. Returns a JSON object. */
+std::string batch_point(const EmbeddingStore& s, const Ctx& c, const std::vector<std::vector<int32_t>>& truth, Mode p) {
+    auto run = [&](double* qps) {
+        double t = now_s();
+        auto r = s.similaritySearchBatch(c.queries, c.k, "", 0.0f, p == Mode::Exact, 0);
+        *qps = c.queries.size() / (now_s() - t);
+        return r;
+    };
+    double q0 = 0;
+    run(&q0);
+    std::vector<double> qps;
+    std::vector<std::vector<size_t>> found;
+    for (int i = 0; i < 3; ++i) {
+        double q = 0;
+        auto r = run(&q);
+        qps.push_back(q);
+        if (i == 2) {
+            for (auto& row : r) {
+                std::vector<size_t> ids;
+                for (auto& x : row) ids.push_back(static_cast<size_t>(std::stoull(x.node_ref.id)));
+                found.push_back(std::move(ids));
+            }
+        }
+    }
+    std::ostringstream o;
+    o << "{\"nq\":" << c.queries.size() << ",\"threads\":" << std::thread::hardware_concurrency() << ",\"qps\":" << fnum(median(qps))
+      << ",\"qps_runs\":" << farr(qps) << ",\"recall\":" << fnum(recall(found, truth, c.k)) << "}";
+    return o.str();
+}
+
+std::vector<size_t> hnsw_knobs() { return {10, 16, 24, 32, 48, 64, 96, 128, 192, 256, 400, 640}; }
+
 size_t nlist_for(size_t n) { return static_cast<size_t>(std::min(std::max(std::nearbyint(4.0 * std::sqrt(static_cast<double>(n))), 16.0), 65536.0)); }
 std::vector<size_t> knobs(size_t n) {
     size_t nl = nlist_for(n);
@@ -285,7 +317,8 @@ int main(int argc, char** argv) {
         double qps_ex = 0;
         std::string p1 = point(store, c, truth, Mode::Exact, "", budget, &qps_ex);
         std::cout << "  exact qps=" << qps_ex << std::endl;
-        ex << ",\"sweep\":[{" << p1 << ",\"knob\":null}],\"mem_after_sweep\":" << mem_json() << "}";
+        ex << ",\"sweep\":[{" << p1 << ",\"knob\":null}],\"batch_allthreads\":" << batch_point(store, c, truth, Mode::Exact)
+           << ",\"mem_after_sweep\":" << mem_json() << "}";
         runs.push_back(ex.str());
 
         // ---- ivf ----
@@ -309,7 +342,7 @@ int main(int argc, char** argv) {
             double qps = 0, rec = 0;
             std::string p = point(store, c, truth, Mode::Ann, "", budget, &qps, &rec);
             std::cout << "  ivf nprobe=" << kn << " recall=" << rec << " qps1t=" << qps << std::endl;
-            pts.push_back("{" + p + ",\"knob\":" + std::to_string(kn) + "}");
+            pts.push_back("{" + p + ",\"knob\":" + std::to_string(kn) + ",\"batch_allthreads\":" + batch_point(store, c, truth, Mode::Ann) + "}");
             if (ref_knob < 0 && rec >= 0.95) { ref_knob = static_cast<long>(kn); ref_recall = rec; }
         }
         if (ref_knob < 0) ref_knob = static_cast<long>(knobs(n).back());
@@ -393,6 +426,20 @@ int main(int argc, char** argv) {
                 double fq = (now_s() - t) * 1000;
                 iv << "\"save_s\":" << fnum(save_s) << ",\"disk_mb\":" << fnum(mb) << ",\"load_s\":" << fnum(load_s) << ",\"first_query_after_load_ms\":" << fnum(fq)
                    << ",\"time_to_ready_s\":" << fnum(load_s + fq / 1000) << ",\"note\":\"load = JSON parse + insert; first query builds the IVF index (never persisted)\"";
+                // the opt-in binary snapshot of the same store (DESIGN.md section 11.2)
+                std::string snap = dir + "/../../work/cpp_" + ds + "_" + std::to_string(n) + ".snap";
+                t = now_s();
+                store.saveSnapshot(snap);
+                double ss = now_s() - t;
+                std::ifstream f2(snap, std::ios::binary | std::ios::ate);
+                double smb = static_cast<double>(f2.tellg()) / 1048576.0;
+                f2.close();
+                EmbeddingStore s3;
+                t = now_s();
+                s3.loadSnapshot(snap);
+                double sl_s = now_s() - t;
+                iv << ",\"snap_save_s\":" << fnum(ss) << ",\"snap_mb\":" << fnum(smb) << ",\"snap_load_s\":" << fnum(sl_s);
+                std::remove(snap.c_str());
                 std::remove(path.c_str());
             } catch (const std::exception& e) {
                 iv << "\"error\":\"" << e.what() << "\"";
@@ -401,6 +448,75 @@ int main(int argc, char** argv) {
         }
         iv << "}";
         runs.push_back(iv.str());
+    }
+
+    if (has("hnsw")) {
+        EmbeddingStore store;
+        double ingest_s = ingest(store, c, n, nullptr);
+        std::string mem_ing = mem_json();
+        std::cout << "  hnsw: ingest " << ingest_s << " s" << std::endl;
+        auto truth = c.gt("");
+        HnswOptions ho;
+        ho.m = 16;
+        ho.efConstruction = 200;
+        AnnOptions opt = AnnOptions::makeHnsw(ho);
+        opt.minSize = 0;
+        store.enableAnn(opt);
+        double t1 = now_s();
+        AnnStats st = store.buildAnnIndex();
+        double idx_s = now_s() - t1;
+        std::string mem_build = mem_json();
+        std::cout << "  hnsw build " << idx_s << " s graphNodes=" << st.graphNodes << " maxLevel=" << st.maxLevel << " indexBytes=" << st.indexBytes << std::endl;
+        std::ostringstream hn;
+        hn << header(label + "_hnsw") << ",\"knob_name\":\"ef_search\",\"build\":{\"ingest_s\":" << fnum(ingest_s) << ",\"index_s\":" << fnum(idx_s)
+           << ",\"total_s\":" << fnum(ingest_s + idx_s) << ",\"first_query_ms\":0,\"ready_s\":" << fnum(ingest_s + idx_s) << "},\"mem_baseline\":" << mem_base
+           << ",\"mem_after_ingest\":" << mem_ing << ",\"mem_after_build\":" << mem_build << ",\"index_stats\":{\"graph_nodes\":" << st.graphNodes
+           << ",\"max_level\":" << st.maxLevel << ",\"index_bytes\":" << st.indexBytes << ",\"build_seconds\":" << fnum(st.buildSeconds)
+           << ",\"default_ef_search\":" << st.efSearch << "}";
+        std::vector<std::string> pts;
+        long ref_knob = -1;
+        double ref_recall = 0;
+        std::vector<double> recs;
+        for (size_t kn : hnsw_knobs()) {
+            store.setAnnEfSearch(kn);
+            double qps = 0, rec = 0;
+            std::string p = point(store, c, truth, Mode::Ann, "", budget, &qps, &rec);
+            std::string b = batch_point(store, c, truth, Mode::Ann);
+            std::cout << "  hnsw ef=" << kn << " recall=" << rec << " qps1t=" << qps << std::endl;
+            pts.push_back("{" + p + ",\"knob\":" + std::to_string(kn) + ",\"batch_allthreads\":" + b + "}");
+            if (ref_knob < 0 && rec >= 0.95) { ref_knob = static_cast<long>(kn); ref_recall = rec; }
+            recs.push_back(rec);
+            if (recs.size() > 2 && rec >= 0.9995 && recs[recs.size() - 2] >= 0.9995) break;
+        }
+        if (ref_knob < 0) ref_knob = static_cast<long>(hnsw_knobs().back());
+        hn << ",\"sweep\":[";
+        for (size_t i = 0; i < pts.size(); ++i) hn << (i ? "," : "") << pts[i];
+        hn << "],\"ref_knob\":" << ref_knob << ",\"ref_recall_pre\":" << fnum(ref_recall) << ",\"mem_after_sweep\":" << mem_json();
+        // the library's automatic ef (what a user who just enables HNSW gets)
+        store.setAnnEfSearch(0);
+        {
+            double qps = 0, rec = 0;
+            std::string p = point(store, c, truth, Mode::Ann, "", budget, &qps, &rec);
+            std::string b = batch_point(store, c, truth, Mode::Ann);
+            hn << ",\"default_ef_point\":{" << p << ",\"knob\":" << st.efSearch << ",\"batch_allthreads\":" << b << "}";
+            std::cout << "  hnsw default ef=" << st.efSearch << " recall=" << rec << " qps1t=" << qps << std::endl;
+        }
+        // concurrent clients (const search is thread-safe)
+        store.setAnnEfSearch(static_cast<size_t>(ref_knob));
+        hn << ",\"concurrent_clients\":[";
+        bool firstc = true;
+        for (unsigned conc : {8u, std::min(16u, cpus)}) {
+            size_t total = std::min<size_t>(nq, 1000);
+            double t = now_s();
+            std::vector<std::thread> th;
+            for (unsigned w = 0; w < conc; ++w)
+                th.emplace_back([&, w] { for (size_t i = w; i < total; i += conc) do_search(store, c.queries[i], c.k, Mode::Ann, ""); });
+            for (auto& x : th) x.join();
+            hn << (firstc ? "" : ",") << "{\"clients\":" << conc << ",\"qps\":" << fnum(total / (now_s() - t)) << "}";
+            firstc = false;
+        }
+        hn << "]}";
+        runs.push_back(hn.str());
     }
 
     if (has("filter")) {

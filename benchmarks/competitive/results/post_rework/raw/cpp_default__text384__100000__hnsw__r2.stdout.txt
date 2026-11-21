@@ -1,0 +1,17 @@
+cpp_default: ds=text384 n=100000 d=384 queries=2000 cpus=32
+  hnsw: ingest 0.0602485 s
+  hnsw build 9.79296 s graphNodes=100000 maxLevel=4 indexBytes=14818980
+  hnsw ef=10 recall=0.61775 qps1t=14128.6
+  hnsw ef=16 recall=0.7103 qps1t=11190.8
+  hnsw ef=24 recall=0.7847 qps1t=8417.13
+  hnsw ef=32 recall=0.83585 qps1t=6972.11
+  hnsw ef=48 recall=0.8852 qps1t=5108.24
+  hnsw ef=64 recall=0.91695 qps1t=4097.64
+  hnsw ef=96 recall=0.948 qps1t=2990.19
+  hnsw ef=128 recall=0.9646 qps1t=2342.88
+  hnsw ef=192 recall=0.9808 qps1t=1658.56
+  hnsw ef=256 recall=0.98715 qps1t=1302.49
+  hnsw ef=400 recall=0.9938 qps1t=906.068
+  hnsw ef=640 recall=0.997384 qps1t=602.158
+  hnsw default ef=96 recall=0.948 qps1t=3002.56
+wrote results/post_rework/raw\cpp_default__text384__100000__hnsw__r2.json

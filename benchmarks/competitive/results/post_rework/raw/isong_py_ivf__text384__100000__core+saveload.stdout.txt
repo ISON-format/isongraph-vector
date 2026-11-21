@@ -1,0 +1,10 @@
+  isong_py_ivf text384 100000 knob=1 recall=0.2833 qps1t=4338 med=0.239ms
+  isong_py_ivf text384 100000 knob=2 recall=0.4083 qps1t=3718 med=0.277ms
+  isong_py_ivf text384 100000 knob=4 recall=0.5305 qps1t=3017 med=0.342ms
+  isong_py_ivf text384 100000 knob=8 recall=0.6501 qps1t=2264 med=0.449ms
+  isong_py_ivf text384 100000 knob=16 recall=0.7542 qps1t=1666 med=0.617ms
+  isong_py_ivf text384 100000 knob=32 recall=0.8428 qps1t=1073 med=0.949ms
+  isong_py_ivf text384 100000 knob=64 recall=0.9085 qps1t=637 med=1.609ms
+  isong_py_ivf text384 100000 knob=128 recall=0.9519 qps1t=336 med=2.998ms
+  isong_py_ivf text384 100000 knob=256 recall=0.9809 qps1t=192 med=5.322ms
+  isong_py_ivf text384 100000 knob=1265 recall=0.9999 qps1t=112 med=9.047ms

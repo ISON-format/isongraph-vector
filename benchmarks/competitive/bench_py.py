@@ -331,6 +331,11 @@ def saveload(args, A, name, ds, n, out):
         A.save(path)
         res["save_s"] = time.perf_counter() - t
         res["disk_mb"] = A.disk_bytes(path) / 2**20
+        if hasattr(A, "save_alt"):   # the binary snapshot of the same store (ISONGraph ports only)
+            t = time.perf_counter()
+            A.save_alt(path + ".snap")
+            res["snap_save_s"] = time.perf_counter() - t
+            res["snap_mb"] = os.path.getsize(path + ".snap") / 2**20
         t = time.perf_counter()
         A.load(path)
         res["load_s"] = time.perf_counter() - t
@@ -342,6 +347,14 @@ def saveload(args, A, name, ds, n, out):
         A.search1(Qall[0], K)
         res["first_query_after_load_ms"] = (time.perf_counter() - t) * 1000
         res["time_to_ready_s"] = res["load_s"] + res["first_query_after_load_ms"] / 1000
+        if hasattr(A, "load_alt"):
+            t = time.perf_counter()
+            A.load_alt(path + ".snap")
+            res["snap_load_s"] = time.perf_counter() - t
+            try:
+                os.remove(path + ".snap")
+            except OSError:
+                pass
     except NotImplementedError:
         res["unsupported"] = True
     except Exception as e:  # noqa: BLE001

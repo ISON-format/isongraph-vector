@@ -7,7 +7,9 @@
  *   node --max-old-space-size=24000 bench/competitive.mjs --ds-dir <prep>/text384 --ds text384 --n 100000 \
  *        --exp core,mutation --queries 2000 --label js --out result.json
  *   ... --exp filter
- * (No save/load experiment: this port has no vector-persistence call besides exportEmbeddings.)
+ * `--exp hnsw`   : the opt-in HNSW index (ann: 'hnsw', M 16, efConstruction 200), ef_search sweep, in its own store.
+ * `--exp saveload`: JSON sidecar vs binary snapshot save/load of a plain store (node.js saveEmbeddings / saveSnapshot).
+ * `--entry <file>`: import another build, e.g. ../../isongraph-vector-ts/dist/index.js for the TypeScript port.
  */
 import { openSync, readSync, closeSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { cpus } from 'node:os';
@@ -21,7 +23,7 @@ const dir = arg('--ds-dir', ''), ds = arg('--ds', ''), label = arg('--label', 'j
 const n = Number(arg('--n', '100000')), nq = Number(arg('--queries', '1000')), budget = Number(arg('--budget', '15'));
 const exps = new Set(arg('--exp', 'core').split(','));
 const outPath = arg('--out', '');
-const entry = resolve(here, '../src/index.js');
+const entry = arg('--entry', '') ? resolve(arg('--entry', '')) : resolve(here, '../src/index.js');
 const { EmbeddingStore } = await import(pathToFileURL(entry).href);
 
 const K = 10;
@@ -163,6 +165,76 @@ if (exps.has('core') || exps.has('mutation')) {
     } else iv.mutation = { skipped: 'dataset has no spare rows for this n' };
   }
   runs.push(iv);
+}
+if (exps.has('hnsw')) {
+  // HNSW: its own store, so the memory figure holds only the vectors and the graph
+  const hs = new EmbeddingStore(undefined, { ann: 'hnsw', annMinSize: 0, annSeed: 0, annHnsw: { m: 16, efConstruction: 200 } });
+  const ingestS = ingest(hs, null);
+  const memIng = memP();
+  console.log(`  hnsw: ingest ${ingestS.toFixed(2)}s`);
+  const truth = gt('');
+  const t0 = now();
+  const stats = hs.buildAnnIndex();
+  const idxS = now() - t0;
+  const memBuild = memP();
+  console.log(`  hnsw build ${idxS.toFixed(2)}s graphNodes=${stats.graphNodes} maxLevel=${stats.maxLevel} indexBytes=${stats.indexBytes}`);
+  const hn = header(`${label}_hnsw`);
+  hn.knob_name = 'ef_search';
+  hn.build = { ingest_s: ingestS, index_s: idxS, total_s: ingestS + idxS, first_query_ms: 0, ready_s: ingestS + idxS };
+  hn.mem_baseline = memBase; hn.mem_after_ingest = memIng; hn.mem_after_build = memBuild;
+  hn.index_stats = { graph_nodes: stats.graphNodes, max_level: stats.maxLevel, index_bytes: stats.indexBytes, build_seconds: stats.buildSeconds, default_ef_search: stats.efSearch };
+  const pts = [];
+  let refKnob = null, refRecall = 0;
+  const recs = [];
+  for (const ef of [10, 16, 24, 32, 48, 64, 96, 128, 192, 256, 400, 640]) {
+    hs.annEfSearch = ef;
+    const p = point(hs, truth, false); p.knob = ef;
+    console.log(`  hnsw ef=${ef} recall=${p.recall.toFixed(4)} qps1t=${p.qps_1t.toFixed(0)}`);
+    if (refKnob === null && p.recall >= 0.95) { refKnob = ef; refRecall = p.recall; }
+    pts.push(p); recs.push(p.recall);
+    if (recs.length > 2 && p.recall >= 0.9995 && recs[recs.length - 2] >= 0.9995) break;
+  }
+  if (refKnob === null) { refKnob = 640; refRecall = pts[pts.length - 1].recall; }
+  hn.sweep = pts; hn.ref_knob = refKnob; hn.ref_recall_pre = refRecall; hn.mem_after_sweep = memP();
+  hs.annEfSearch = null;
+  const pd = point(hs, truth, false); pd.knob = stats.efSearch;
+  hn.default_ef_point = pd;
+  console.log(`  hnsw default ef=${stats.efSearch} recall=${pd.recall.toFixed(4)} qps1t=${pd.qps_1t.toFixed(0)}`);
+  runs.push(hn);
+}
+if (exps.has('saveload')) {
+  // JSON sidecar vs binary snapshot of the same plain store
+  const nodeEntry = join(dirname(entry), 'node.js');
+  const { saveEmbeddings, loadEmbeddings, saveSnapshot, loadSnapshot } = await import(pathToFileURL(nodeEntry).href);
+  const { mkdirSync, statSync, unlinkSync } = await import('node:fs');
+  const s = new EmbeddingStore(undefined, {});
+  const ingestS = ingest(s, null);
+  const workDir = resolve(dir, '..', '..', 'work');
+  mkdirSync(workDir, { recursive: true });
+  const jpath = join(workDir, `${label}_${ds}_${n}.json`), spath = join(workDir, `${label}_${ds}_${n}.snap`);
+  const sl = {};
+  try {
+    let t = now();
+    saveEmbeddings(s, jpath);
+    sl.save_s = now() - t; sl.disk_mb = statSync(jpath).size / 1048576;
+    const s2 = new EmbeddingStore(undefined, {});
+    t = now(); loadEmbeddings(s2, jpath); sl.load_s = now() - t;
+    t = now(); search(s2, queries[0], true); sl.first_query_after_load_ms = (now() - t) * 1000;
+    sl.time_to_ready_s = sl.load_s + sl.first_query_after_load_ms / 1000;
+  } catch (e) { sl.json_error = String(e && e.message || e); }   // e.g. 'Invalid string length': the whole sidecar is one JS string
+  try {
+    let t = now();
+    saveSnapshot(s, spath); sl.snap_save_s = now() - t; sl.snap_mb = statSync(spath).size / 1048576;
+    const s3 = new EmbeddingStore(undefined, {});
+    t = now(); loadSnapshot(s3, spath); sl.snap_load_s = now() - t;
+    t = now(); search(s3, queries[0], true); sl.snap_first_query_ms = (now() - t) * 1000;
+    try { unlinkSync(jpath); unlinkSync(spath); } catch {}
+  } catch (e) { sl.error = String(e && e.message || e); }
+  const r = header(`${label}_exact`);
+  r.build = { ingest_s: ingestS };
+  r.saveload = sl;
+  console.log('  saveload', JSON.stringify(sl));
+  runs.push(r);
 }
 if (exps.has('filter')) {
   const g = readFileSync(join(dir, `grp_${n}.u8`));

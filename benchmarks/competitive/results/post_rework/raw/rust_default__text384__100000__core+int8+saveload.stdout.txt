@@ -1,0 +1,20 @@
+rust_default: ds=text384 n=100000 d=384 queries=2000 cpus=32 release=true
+  ingest 0.10s
+  exact 1T recall=1.0 qps=114.6 median=8.598ms
+  exact auto-threads qps=252.0 median=3.948ms
+  exact batch qps=5454.0
+  exact 8 concurrent clients (scan threads 1): 383.1 qps
+  exact int8 1T recall=0.9999151103565365 qps=372.0 auto qps=1215.7
+  exact int8 batch qps=4338.3
+  ivf build 1.42s nlist=Some(1265)
+  ivf nprobe=1 recall=0.2879 qps1t=16944 median=0.056ms allthreads_qps=11688 batch_qps=75209
+  ivf nprobe=2 recall=0.4120 qps1t=12611 median=0.079ms allthreads_qps=8957 batch_qps=58696
+  ivf nprobe=4 recall=0.5379 qps1t=8863 median=0.113ms allthreads_qps=6521 batch_qps=52777
+  ivf nprobe=8 recall=0.6493 qps1t=5872 median=0.167ms allthreads_qps=4084 batch_qps=48508
+  ivf nprobe=16 recall=0.7529 qps1t=4094 median=0.246ms allthreads_qps=2452 batch_qps=42029
+  ivf nprobe=32 recall=0.8434 qps1t=2415 median=0.409ms allthreads_qps=1349 batch_qps=39355
+  ivf nprobe=64 recall=0.9075 qps1t=1328 median=0.746ms allthreads_qps=815 batch_qps=30598
+  ivf nprobe=128 recall=0.9548 qps1t=695 median=1.441ms allthreads_qps=903 batch_qps=24112
+  ivf nprobe=256 recall=0.9833 qps1t=353 median=2.782ms allthreads_qps=743 batch_qps=15962
+  ivf nprobe=1265 recall=1.0000 qps1t=115 median=8.747ms allthreads_qps=242 batch_qps=5107
+wrote results/post_rework/raw\rust_default__text384__100000__core+int8+saveload.json

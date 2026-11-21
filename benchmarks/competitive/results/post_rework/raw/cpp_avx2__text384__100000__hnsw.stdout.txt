@@ -1,0 +1,17 @@
+cpp_avx2: ds=text384 n=100000 d=384 queries=2000 cpus=32
+  hnsw: ingest 0.0651581 s
+  hnsw build 7.31982 s graphNodes=100000 maxLevel=4 indexBytes=14818980
+  hnsw ef=10 recall=0.61775 qps1t=20163.7
+  hnsw ef=16 recall=0.7103 qps1t=14617.2
+  hnsw ef=24 recall=0.7847 qps1t=11684.5
+  hnsw ef=32 recall=0.83585 qps1t=10448
+  hnsw ef=48 recall=0.8852 qps1t=7111.75
+  hnsw ef=64 recall=0.91695 qps1t=5696.08
+  hnsw ef=96 recall=0.948 qps1t=4117.63
+  hnsw ef=128 recall=0.9646 qps1t=3267.34
+  hnsw ef=192 recall=0.9808 qps1t=1682.6
+  hnsw ef=256 recall=0.98715 qps1t=1324.66
+  hnsw ef=400 recall=0.9938 qps1t=874.665
+  hnsw ef=640 recall=0.997627 qps1t=599.433
+  hnsw default ef=96 recall=0.948 qps1t=2715.43
+wrote results/post_rework/raw\cpp_avx2__text384__100000__hnsw.json

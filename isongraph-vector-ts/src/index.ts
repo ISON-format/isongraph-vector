@@ -897,8 +897,30 @@ const ANN_COARSE_FACTOR = 3;
 /** float32 rows vs the float64 exact score differ by about 1e-7; candidates this close under the threshold are re-scored. */
 const ANN_THRESHOLD_SLACK = 1e-6;
 
-/** The approximate index kinds. Only IVF-flat exists. */
-export type AnnMode = 'ivf';
+/** The approximate index kinds: IVF-flat and the HNSW graph. */
+export type AnnMode = 'ivf' | 'hnsw';
+
+/** Settings for `ann: 'hnsw'`; ignored by any other mode. */
+export interface HnswOptions {
+  /**
+   * Links per node on layers above 0 (layer 0 holds up to `2 * m`). More is
+   * better recall and more memory. An integer from 2 to 64; default 16.
+   */
+  m?: number;
+  /**
+   * Candidates kept while linking a row. More is a better graph and a slower
+   * build and write. Default 200 (never used below `m`).
+   */
+  efConstruction?: number;
+  /**
+   * Candidates kept per query (never fewer than the `topK` asked for). More is
+   * higher recall and slower. Default: by store size, aiming at about 0.95
+   * recall@10 on 384-d text embeddings: 64 under 10,000 vectors, 96 under
+   * 200,000, 128 under 600,000, 192 above. Change it later with
+   * `setAnnEfSearch()`, or for one call with `similaritySearchEf()`.
+   */
+  efSearch?: number;
+}
 
 /** Approximate-search options shared by EmbeddingStore and SemanticGraph. */
 export interface AnnOptions {
@@ -913,6 +935,14 @@ export interface AnnOptions {
    * sidecar are byte-for-byte what they would be without it), and kept
    * current through writes and deletes. It keeps no copy of the vectors: it reads
    * the store's own float32 rows.
+   *
+   * `'hnsw'` answers the same bounded top-k searches from a layered neighbour
+   * graph (see {@link HnswOptions}): several times faster per query than IVF at
+   * the same recall on text embeddings, at the price of a much slower build.
+   * It links every write as it happens, never persists, and its hit scores
+   * are the exact scan's numbers (it reads the same rows with the same
+   * arithmetic), so `annNlist` and `annNprobe` do not apply to it. A single
+   * thread builds and searches it.
    */
   ann?: AnnMode | null;
   /** Cells in the index. Default: about `4 * sqrt(N)` (at least 16, at most 65536) when it is built. */
@@ -921,8 +951,10 @@ export interface AnnOptions {
   annNprobe?: number;
   /** Below this many vectors the index is not used and search stays exact. Default 50000. */
   annMinSize?: number;
-  /** Seed for the k-means initialisation, so the same data gives the same index. Default 0. */
+  /** Seed for the k-means initialisation (or the HNSW level draw), so the same data gives the same index. Default 0. */
   annSeed?: number;
+  /** Settings for `ann: 'hnsw'`. */
+  annHnsw?: HnswOptions;
 }
 
 /** What the approximate index looks like right now (see `annStats()`). */
@@ -952,6 +984,19 @@ export interface AnnStats {
   minSize: number;
   /** Counts since the store was created. */
   searches: { approximate: number; exact: number; widened: number; builds: number };
+  // The fields below are present only for `ann: 'hnsw'`. `nlist`/`nprobe` are null then, `trainedN`
+  // is the graph's node count and `pending` is always 0 (a write links its row at once).
+  /** Candidates per query now: the configured value, or the size-based default. */
+  efSearch?: number;
+  /** Top layer of the graph, or null while none is built. */
+  maxLevel?: number | null;
+  /** Nodes in the graph, tombstones included. */
+  graphNodes?: number;
+  /** Nodes whose rows were deleted and not yet compacted away. */
+  graphDead?: number;
+  /** Rows linked by a write since the build, and the seconds that took. */
+  inserts?: number;
+  insertSeconds?: number;
 }
 
 /** Recall of the approximate index against the exact scan (see `recallCheck()`). */
@@ -969,6 +1014,8 @@ export interface RecallReport {
   /** Median milliseconds per approximate query / per exact query. */
   annMs: number;
   exactMs: number;
+  /** Candidates per HNSW query used (`ann: 'hnsw'` only; `nlist` and `nprobe` are 0 then). */
+  efSearch?: number;
 }
 
 /** Banker's rounding, as Python's `round`, so the default cell counts agree across ports. */
@@ -1199,8 +1246,8 @@ const HOST_LITTLE_ENDIAN = hostIsLittleEndian();
  * `null`, norm `NaN`). Trailing tombstones are popped; once a quarter of the
  * slots are dead the live rows are moved down, keeping their order.
  *
- * Both exact search and the IVF index read the rows from here, so the index adds
- * no second copy of the vectors. Not part of the stable API: it is exported so
+ * Exact search, the IVF index and the HNSW graph all read the rows from here, so
+ * an index adds no second copy of the vectors. Not part of the stable API: it is exported so
  * the snapshot module can read and fill it.
  */
 export class VectorTable {
@@ -1226,6 +1273,7 @@ export class VectorTable {
   n = 0;
   dead = 0;
   ivf: IvfIndex | null = null;
+  hnsw: HnswIndex | null = null;
   /** The query as float32, reused between approximate searches. */
   readonly query: Float32Array;
 
@@ -1321,6 +1369,7 @@ export class VectorTable {
     }
     this.norms[slot] = Math.sqrt(sum);
     if (this.ivf !== null) this.ivf.notePut(slot, this.capacity);
+    if (this.hnsw !== null) this.hnsw.notePut(this, slot);
     return slot;
   }
 
@@ -1355,6 +1404,7 @@ export class VectorTable {
     }
     this.norms[slot] = Math.sqrt(sum);
     if (this.ivf !== null) this.ivf.notePut(slot, this.capacity);
+    if (this.hnsw !== null) this.hnsw.notePut(this, slot);
     return slot;
   }
 
@@ -1369,6 +1419,7 @@ export class VectorTable {
     this.norms[slot] = NaN;
     this.dead++;
     if (this.ivf !== null) this.ivf.noteDrop(slot);
+    if (this.hnsw !== null) this.hnsw.noteDrop();
     while (this.n > 0 && this.keys[this.n - 1] === null) {      // trailing tombstones
       this.n--;
       this.keys.pop();
@@ -1387,6 +1438,11 @@ export class VectorTable {
     let kept = 0;
     for (let r = 0; r < this.n; r++) if (this.keys[r] !== null) live[kept++] = r;
     if (this.ivf !== null) this.ivf.compact(live);
+    if (this.hnsw !== null) {
+      const remap = new Int32Array(this.n).fill(-1);
+      for (let w = 0; w < kept; w++) remap[live[w]] = w;
+      this.hnsw = this.hnsw.compacted(remap, kept);
+    }
     for (let w = 0; w < kept; w++) {
       const r = live[w];
       if (r === w) continue;
@@ -1821,6 +1877,1147 @@ function dotRows4(
   out[3] = s3;
 }
 
+// =============================================================================
+// HNSW graph index (opt-in, beside IVF)
+//
+// A port of the Rust crate's `src/hnsw.rs` (DESIGN.md section 12, the portable
+// rules): a layered neighbour graph over the table's slots. It holds links only
+// - every score is computed from the one stored copy of each vector with the
+// same dot product, in the same order, and the same cosine formula as the
+// exact scan, so a hit's score is the exact scan's number for that id, and
+// ties order by slot. This port is single-threaded: there is no pool and no
+// parallel planning, so the graph is built one batch at a time on the calling
+// thread (the graph does not depend on threads in any port: plans read a
+// frozen graph and are applied in a fixed order).
+// =============================================================================
+
+/** Largest `m`: layer 0 holds `2 * m` links, so a link block is at most 128 ints. */
+const HNSW_MAX_M = 64;
+const HNSW_DEFAULT_M = 16;
+const HNSW_DEFAULT_EF_CONSTRUCTION = 200;
+const HNSW_ABSENT = 255;
+const HNSW_MAX_LEVEL = 24;
+/** Largest batch planned against one frozen graph while building, and the batch's share of the nodes so far (size / 16). */
+const HNSW_BUILD_BATCH = 512;
+const HNSW_BUILD_RATIO = 16;
+/** Updates + deletes since the build beyond this many times the node count call for a rebuild. */
+const HNSW_REBUILD_FRACTION = 1;
+const HNSW_MAX_CAP = 2 * HNSW_MAX_M;
+/** Layer-0 link blocks live in chunks of this many nodes, so growth never copies them. */
+const HNSW_CHUNK_SHIFT = 10;
+const HNSW_CHUNK_ROWS = 1 << HNSW_CHUNK_SHIFT;
+const HNSW_CHUNK_MASK = HNSW_CHUNK_ROWS - 1;
+/** `seed XOR` this seeds the level generator (the Rust crate's constant), as two 32-bit halves. */
+const HNSW_SEED_XOR_HI = 0x48575357;
+const HNSW_SEED_XOR_LO = 0x48575357;
+
+/** `ef_search` by store size when none is configured (DESIGN.md section 12.1). */
+function hnswAutoEf(live: number): number {
+  if (live < 10_000) return 64;
+  if (live < 200_000) return 96;
+  if (live < 600_000) return 128;
+  return 192;
+}
+
+let mulHi = 0;
+let mulLo = 0;
+
+/** (ah:al) * (bh:bl) mod 2^64, 32-bit halves in and out (through `mulHi`/`mulLo`); no BigInt, no allocation. */
+function mul64(ah: number, al: number, bh: number, bl: number): void {
+  const a0 = al & 0xffff;
+  const a1 = al >>> 16;
+  const b0 = bl & 0xffff;
+  const b1 = bl >>> 16;
+  const p00 = a0 * b0;
+  const mid = a0 * b1 + a1 * b0 + (p00 >>> 16);
+  mulLo = (((mid & 0xffff) << 16) | (p00 & 0xffff)) >>> 0;
+  const hi = a1 * b1 + Math.floor(mid / 65536);
+  mulHi = (hi + Math.imul(ah, bl) + Math.imul(al, bh)) >>> 0;
+}
+
+/**
+ * SplitMix64, the generator of the level draw and of the cross-port test data:
+ * `state += 0x9E3779B97F4A7C15`, then the usual mix; `below(n)` is the high 64
+ * bits of `next * n`. Integers only (two 32-bit halves, no BigInt per draw, no
+ * logarithm). Low level: exported for the tests and the cross-port checks.
+ */
+export class SplitMix64 {
+  /** High and low 32 bits of the last value `next()` produced. */
+  hi = 0;
+  lo = 0;
+  private _sh: number;
+  private _sl: number;
+
+  /** `seed` is taken modulo 2^64 (a negative number or bigint wraps, as an unsigned cast would). */
+  constructor(seed: bigint | number = 0) {
+    const s = BigInt.asUintN(64, typeof seed === 'bigint' ? seed : BigInt(Math.trunc(Number.isFinite(seed) ? seed : 0)));
+    this._sh = Number(s >> BigInt(32));
+    this._sl = Number(s & BigInt(0xffffffff));
+  }
+
+  /** Advance one step; the value is in `hi`/`lo`. */
+  next(): void {
+    const sl = this._sl + 0x7f4a7c15;
+    this._sl = sl >>> 0;
+    this._sh = (this._sh + 0x9e3779b9 + (sl > 0xffffffff ? 1 : 0)) >>> 0;
+    let zh = this._sh;
+    let zl = this._sl;
+    // z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+    let th = zh >>> 30;
+    let tl = ((zh << 2) | (zl >>> 30)) >>> 0;
+    mul64((zh ^ th) >>> 0, (zl ^ tl) >>> 0, 0xbf58476d, 0x1ce4e5b9);
+    zh = mulHi;
+    zl = mulLo;
+    // z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+    th = zh >>> 27;
+    tl = ((zh << 5) | (zl >>> 27)) >>> 0;
+    mul64((zh ^ th) >>> 0, (zl ^ tl) >>> 0, 0x94d049bb, 0x133111eb);
+    zh = mulHi;
+    zl = mulLo;
+    // z ^ (z >> 31)
+    this.hi = (zh ^ (zh >>> 31)) >>> 0;
+    this.lo = (zl ^ (((zh << 1) | (zl >>> 31)) >>> 0)) >>> 0;
+  }
+
+  /** The last value as a bigint (for tests; the hot paths read `hi`/`lo`). */
+  value(): bigint {
+    return (BigInt(this.hi) << BigInt(32)) | BigInt(this.lo);
+  }
+
+  /** Uniform in [0, n): the high 64 bits of `next * n`. */
+  below(n: number): number {
+    this.next();
+    if (n < 2097152) {                                 // n < 2^21: both partial products stay exact in a double
+      const carry = Math.floor((this.lo * n) / 4294967296);
+      return Math.floor((this.hi * n + carry) / 4294967296);
+    }
+    return Number((this.value() * BigInt(n)) >> BigInt(64));
+  }
+}
+
+/** The 64-bit state of a store seed's level generator: `seed XOR 0x4857535748575357` (a negative seed sign-extends). */
+function hnswRngFor(seed: number): SplitMix64 {
+  const base = BigInt.asUintN(64, BigInt(Math.trunc(Number.isFinite(seed) ? seed : 0)));
+  const mask = (BigInt(HNSW_SEED_XOR_HI) << BigInt(32)) | BigInt(HNSW_SEED_XOR_LO);
+  return new SplitMix64(base ^ mask);
+}
+
+/** The first `count` levels the generator draws for a store seed and `m` (`level = 0; while level < 24 and rng.below(m) == 0: level++`). */
+export function hnswLevelSequence(seed: number, m: number, count: number): number[] {
+  const rng = hnswRngFor(seed);
+  const out: number[] = [];
+  for (let i = 0; i < count; i++) {
+    let level = 0;
+    while (level < HNSW_MAX_LEVEL && rng.below(m) === 0) level++;
+    out.push(level);
+  }
+  return out;
+}
+
+/**
+ * Dot products of one float64 query with four rows, into `out[0..3]`. Each sum
+ * runs over the dimensions in order from 0, exactly as `dotRows4` and the
+ * one-row loop do, so a score equals the exact scan's; the query is always a
+ * Float64Array here, which keeps this function monomorphic (`dotRows4` takes a
+ * number[] too).
+ */
+function dotRows4F64(
+  q: Float64Array,
+  a: Float32Array, ao: number,
+  b: Float32Array, bo: number,
+  c: Float32Array, co: number,
+  d: Float32Array, dof: number,
+  dim: number,
+  out: Float64Array
+): void {
+  let s0 = 0;
+  let s1 = 0;
+  let s2 = 0;
+  let s3 = 0;
+  for (let j = 0; j < dim; j++) {
+    const x = q[j];
+    s0 += x * a[ao + j];
+    s1 += x * b[bo + j];
+    s2 += x * c[co + j];
+    s3 += x * d[dof + j];
+  }
+  out[0] = s0;
+  out[1] = s1;
+  out[2] = s2;
+  out[3] = s3;
+}
+
+/** Cosine from a dot product and the two norms, as the exact scan computes it (0 when either norm is 0); NaN ranks last. */
+function hnswCosine(dot: number, qn: number, rn: number): number {
+  if (qn === 0 || rn === 0) return 0;
+  const s = dot / (qn * rn);
+  return s !== s ? -Infinity : s;
+}
+
+/** A binary heap of (score, slot) pairs in typed arrays, the best on top (a max-heap) or the worst on top. "Better": higher score, then lower slot. */
+class HnswHeap {
+  s: Float64Array;
+  id: Int32Array;
+  n = 0;
+  /** The pair `pop()` removed last. */
+  topS = 0;
+  topI = 0;
+  private readonly _best: boolean;
+
+  constructor(bestOnTop: boolean, capacity: number = 256) {
+    this._best = bestOnTop;
+    this.s = new Float64Array(capacity);
+    this.id = new Int32Array(capacity);
+  }
+
+  clear(): void {
+    this.n = 0;
+  }
+
+  private _grow(): void {
+    const s = new Float64Array(this.s.length * 2);
+    s.set(this.s);
+    const id = new Int32Array(this.id.length * 2);
+    id.set(this.id);
+    this.s = s;
+    this.id = id;
+  }
+
+  /** True when (sa, ia) belongs above (sb, ib) in this heap. */
+  private _above(sa: number, ia: number, sb: number, ib: number): boolean {
+    return this._best ? sa > sb || (sa === sb && ia < ib) : sb > sa || (sb === sa && ib < ia);
+  }
+
+  push(score: number, slot: number): void {
+    if (this.n === this.s.length) this._grow();
+    const s = this.s;
+    const id = this.id;
+    let i = this.n++;
+    while (i > 0) {
+      const p = (i - 1) >> 1;
+      if (!this._above(score, slot, s[p], id[p])) break;
+      s[i] = s[p];
+      id[i] = id[p];
+      i = p;
+    }
+    s[i] = score;
+    id[i] = slot;
+  }
+
+  /** Remove the top into `topS`/`topI`. */
+  pop(): void {
+    const s = this.s;
+    const id = this.id;
+    this.topS = s[0];
+    this.topI = id[0];
+    const last = --this.n;
+    if (last > 0) {
+      const ls = s[last];
+      const li = id[last];
+      let i = 0;
+      for (;;) {
+        const l = 2 * i + 1;
+        if (l >= last) break;
+        let c = l;
+        const r = l + 1;
+        if (r < last && this._above(s[r], id[r], s[l], id[l])) c = r;
+        if (!this._above(s[c], id[c], ls, li)) break;
+        s[i] = s[c];
+        id[i] = id[c];
+        i = c;
+      }
+      s[i] = ls;
+      id[i] = li;
+    }
+  }
+}
+
+/** Visited marks, 1 bit per slot, cleared by the words a query touched, so a query pays for what it visited. */
+class HnswVisited {
+  private _bits = new Int32Array(64);
+  private _words = new Int32Array(256);
+  private _count = 0;
+
+  begin(slots: number): void {
+    this.clear();
+    const need = (slots + 31) >>> 5;
+    if (this._bits.length < need) this._bits = new Int32Array(Math.max(need, this._bits.length * 2));
+  }
+
+  clear(): void {
+    const bits = this._bits;
+    const words = this._words;
+    for (let i = 0; i < this._count; i++) bits[words[i]] = 0;
+    this._count = 0;
+  }
+
+  /** Mark `slot`; true if it already was. */
+  testSet(slot: number): boolean {
+    const w = slot >>> 5;
+    const m = 1 << (slot & 31);
+    const cur = this._bits[w];
+    if ((cur & m) !== 0) return true;
+    if (cur === 0) {
+      if (this._count === this._words.length) {
+        const grown = new Int32Array(this._count * 2);
+        grown.set(this._words);
+        this._words = grown;
+      }
+      this._words[this._count++] = w;
+    }
+    this._bits[w] = cur | m;
+    return false;
+  }
+}
+
+/**
+ * The graph over a {@link VectorTable}: per table slot a level (255 = not in the
+ * graph), a block of `2m + 1` ints on layer 0 (link count, then links) in chunks
+ * of 1024 nodes, and for a node of level L, L blocks of `m + 1` ints in one
+ * arena for layers 1..L. About 146 bytes a node at m = 16 and no copy of any
+ * vector.
+ *
+ * Follows its table instead of being rebuilt on every write (section 12.5): a
+ * write links the row at once, a delete only tombstones (the table's NaN norm
+ * hides the row; the node and its links stay so routes keep working), the
+ * table's compaction renumbers the graph and bridges over the tombstones, and
+ * updates + deletes beyond the node count mark it stale so the next search
+ * rebuilds it. Never persisted.
+ *
+ * Single-threaded: all scratch (visited bitmap, both heaps, score and result
+ * buffers) is kept on the instance and reused, so a query allocates nothing
+ * proportional to the store.
+ */
+class HnswIndex {
+  readonly m: number;
+  readonly m0: number;
+  readonly efC: number;
+  /** Per slot: highest layer, or 255. */
+  levels = new Uint8Array(0);
+  /** Per slot: start of its upper blocks in `upper`, or -1. */
+  upperAt = new Int32Array(0);
+  /** Slots covered; at least the table's, more while trailing tombstones the table popped still have nodes. */
+  slots = 0;
+  l0: Int32Array[] = [];
+  upper = new Int32Array(0);
+  upperLen = 0;
+  entry = -1;
+  top = 0;
+  /** Nodes in the graph, tombstones included. */
+  members = 0;
+  churn = 0;
+  buildSeconds = 0;
+  inserts = 0;
+  insertSeconds = 0;
+  /** The last search stopped after scoring more nodes than its budget. */
+  budgetHit = false;
+  /** The best-first result of the last layer search: `count` pairs in `outS`/`outI`. */
+  outS = new Float64Array(256);
+  outI = new Int32Array(256);
+  private _rng: SplitMix64;
+  private readonly _dim: number;
+  private readonly _visited = new HnswVisited();
+  private readonly _cand = new HnswHeap(true);
+  private readonly _kept = new HnswHeap(false);
+  private readonly _sort = new HnswHeap(true);
+  private readonly _fresh = new Int32Array(HNSW_MAX_CAP);
+  private readonly _scores = new Float64Array(HNSW_MAX_CAP);
+  private readonly _d4 = new Float64Array(4);
+  /** The float64 query of a search, of a plan (the row being linked) and of the diversity check. */
+  private readonly _qSearch: Float64Array;
+  private readonly _qPlan: Float64Array;
+  private readonly _qSel: Float64Array;
+  private _epS = new Float64Array(256);
+  private _epI = new Int32Array(256);
+  private _candS = new Float64Array(256);
+  private _candI = new Int32Array(256);
+  private _selS = new Float64Array(256);
+  private _selI = new Int32Array(256);
+  private _memI = new Int32Array(64);
+  private _memS = new Float64Array(64);
+  private _curS = 0;
+  private _curI = 0;
+
+  constructor(m: number, efConstruction: number, seed: number, dim: number) {
+    this.m = m;
+    this.m0 = 2 * m;
+    this.efC = Math.max(efConstruction, m);
+    this._rng = hnswRngFor(seed);
+    this._dim = dim;
+    this._qSearch = new Float64Array(dim);
+    this._qPlan = new Float64Array(dim);
+    this._qSel = new Float64Array(dim);
+  }
+
+  get stale(): boolean {
+    return this.churn > HNSW_REBUILD_FRACTION * Math.max(1, this.members);
+  }
+
+  /** Memory of the graph itself: levels, upper-layer offsets, the arena and the layer-0 chunks. */
+  bytes(): number {
+    let total = this.levels.byteLength + this.upperAt.byteLength + this.upper.byteLength;
+    for (const chunk of this.l0) total += chunk.byteLength;
+    return total;
+  }
+
+  private _cap(level: number): number {
+    return level === 0 ? this.m0 : this.m;
+  }
+
+  private _drawLevel(): number {
+    let level = 0;
+    while (level < HNSW_MAX_LEVEL && this._rng.below(this.m) === 0) level++;
+    return level;
+  }
+
+  // -- storage -----------------------------------------------------------------
+
+  /** Cover slot `s`: new slots start absent, and the layer-0 chunk holding it exists. */
+  private _ensureSlot(s: number): void {
+    if (s >= this.slots) {
+      if (s >= this.levels.length) {
+        const cap = Math.max(this.levels.length * 2, s + 1, 16);
+        const levels = new Uint8Array(cap);
+        levels.set(this.levels);
+        this.levels = levels;
+        const upperAt = new Int32Array(cap);
+        upperAt.set(this.upperAt);
+        this.upperAt = upperAt;
+      }
+      for (let i = this.slots; i <= s; i++) {
+        this.levels[i] = HNSW_ABSENT;
+        this.upperAt[i] = -1;
+      }
+      this.slots = s + 1;
+    }
+    while (this.l0.length <= s >>> HNSW_CHUNK_SHIFT) this.l0.push(new Int32Array(HNSW_CHUNK_ROWS * (this.m0 + 1)));
+  }
+
+  /** The array holding the link block of `s` on `level`, and where in it the block starts (count, then links). */
+  private _arr(s: number, level: number): Int32Array {
+    return level === 0 ? this.l0[s >>> HNSW_CHUNK_SHIFT] : this.upper;
+  }
+
+  private _off(s: number, level: number): number {
+    return level === 0 ? (s & HNSW_CHUNK_MASK) * (this.m0 + 1) : this.upperAt[s] + (level - 1) * (this.m + 1);
+  }
+
+  /** Replace the links of `s` on `level` with `items[0..count)`. */
+  private _setList(s: number, level: number, items: ArrayLike<number>, count: number): void {
+    const block = this._arr(s, level);
+    const at = this._off(s, level);
+    block[at] = count;
+    for (let i = 0; i < count; i++) block[at + 1 + i] = items[i];
+  }
+
+  /** A copy of the links of `s` on `level`. */
+  linksOf(s: number, level: number): Int32Array {
+    const block = this._arr(s, level);
+    const at = this._off(s, level);
+    return block.slice(at + 1, at + 1 + block[at]);
+  }
+
+  private _addNode(s: number, level: number): void {
+    this._ensureSlot(s);
+    this.levels[s] = level;
+    if (level >= 1) {
+      const need = level * (this.m + 1);
+      if (this.upperLen + need > this.upper.length) {
+        const grown = new Int32Array(Math.max(this.upper.length * 2, this.upperLen + need, 256));
+        grown.set(this.upper);
+        this.upper = grown;
+      }
+      this.upperAt[s] = this.upperLen;
+      this.upperLen += need;
+    }
+    this.members++;
+  }
+
+  inGraph(s: number): boolean {
+    return s < this.slots && this.levels[s] !== HNSW_ABSENT;
+  }
+
+  levelOf(s: number): number {
+    return s < this.slots && this.levels[s] !== HNSW_ABSENT ? this.levels[s] : -1;
+  }
+
+  // -- scores ------------------------------------------------------------------------
+
+  /** The norm of a tombstone's still-present floats (the table marks its own norm NaN), summed as `VectorTable.put` sums it. */
+  private _floatNorm(t: VectorTable, slot: number): number {
+    const dim = t.dim;
+    const chunk = t.chunks[slot >>> CHUNK_SHIFT];
+    const base = (slot & CHUNK_MASK) * dim;
+    let sum = 0;
+    for (let j = 0; j < dim; j++) {
+      const f = chunk[base + j];
+      sum += f * f;
+    }
+    return Math.sqrt(sum);
+  }
+
+  private _rowNorm(t: VectorTable, slot: number): number {
+    const n = t.norms[slot];
+    return n !== n ? this._floatNorm(t, slot) : n;
+  }
+
+  /** Copy the floats of `slot` into `into` (widened), so a stored row can be the query. */
+  private _loadRow(t: VectorTable, slot: number, into: Float64Array): void {
+    const dim = t.dim;
+    const chunk = t.chunks[slot >>> CHUNK_SHIFT];
+    const base = (slot & CHUNK_MASK) * dim;
+    for (let j = 0; j < dim; j++) into[j] = chunk[base + j];
+  }
+
+  /**
+   * Cosine of the query (`q`, norm `qn`) with each of `slots[start .. start+n)`,
+   * four rows at a time and then one, into `out[0..n)`. Every sum runs in
+   * dimension order, so a live row scores exactly as the exact scan scores it.
+   * A tombstone is scored from its floats; anything that stays NaN ranks last.
+   */
+  private _scoreInto(t: VectorTable, q: Float64Array, qn: number, slots: Int32Array, start: number, n: number, out: Float64Array): void {
+    const dim = t.dim;
+    const chunks = t.chunks;
+    const norms = t.norms;
+    const d4 = this._d4;
+    const end = start + n;
+    let p = start;
+    let o = 0;
+    for (; p + 4 <= end; p += 4, o += 4) {
+      const s0 = slots[p];
+      const s1 = slots[p + 1];
+      const s2 = slots[p + 2];
+      const s3 = slots[p + 3];
+      dotRows4F64(
+        q,
+        chunks[s0 >>> CHUNK_SHIFT], (s0 & CHUNK_MASK) * dim,
+        chunks[s1 >>> CHUNK_SHIFT], (s1 & CHUNK_MASK) * dim,
+        chunks[s2 >>> CHUNK_SHIFT], (s2 & CHUNK_MASK) * dim,
+        chunks[s3 >>> CHUNK_SHIFT], (s3 & CHUNK_MASK) * dim,
+        dim, d4
+      );
+      let r = norms[s0];
+      out[o] = hnswCosine(d4[0], qn, r !== r ? this._floatNorm(t, s0) : r);
+      r = norms[s1];
+      out[o + 1] = hnswCosine(d4[1], qn, r !== r ? this._floatNorm(t, s1) : r);
+      r = norms[s2];
+      out[o + 2] = hnswCosine(d4[2], qn, r !== r ? this._floatNorm(t, s2) : r);
+      r = norms[s3];
+      out[o + 3] = hnswCosine(d4[3], qn, r !== r ? this._floatNorm(t, s3) : r);
+    }
+    for (; p < end; p++, o++) {
+      const s = slots[p];
+      const chunk = chunks[s >>> CHUNK_SHIFT];
+      const base = (s & CHUNK_MASK) * dim;
+      let dot = 0;
+      for (let j = 0; j < dim; j++) dot += q[j] * chunk[base + j];
+      const r = norms[s];
+      out[o] = hnswCosine(dot, qn, r !== r ? this._floatNorm(t, s) : r);
+    }
+  }
+
+  /** Score one slot into `_curS`/`_curI`. */
+  private _scoreOne(t: VectorTable, q: Float64Array, qn: number, slot: number): void {
+    const one = this._fresh;
+    const out = this._scores;
+    one[0] = slot;
+    this._scoreInto(t, q, qn, one, 0, 1, out);
+    this._curS = out[0];
+    this._curI = slot;
+  }
+
+  // -- search ------------------------------------------------------------------------
+
+  private _ensureOut(n: number): void {
+    if (this.outS.length < n) {
+      const size = Math.max(n, this.outS.length * 2);
+      this.outS = new Float64Array(size);
+      this.outI = new Int32Array(size);
+    }
+  }
+
+  /**
+   * Walk to the best node reachable by single steps on `level`, from
+   * (`_curS`, `_curI`); the answer is left there. "Better": higher score, then
+   * lower slot.
+   */
+  private _greedy(t: VectorTable, q: Float64Array, qn: number, level: number): void {
+    const scores = this._scores;
+    for (;;) {
+      const cur = this._curI;
+      const block = this._arr(cur, level);
+      const at = this._off(cur, level);
+      const count = block[at];
+      if (count === 0) return;
+      this._scoreInto(t, q, qn, block, at + 1, count, scores);
+      let bestS = this._curS;
+      let bestI = cur;
+      let moved = false;
+      for (let i = 0; i < count; i++) {
+        const s = scores[i];
+        const id = block[at + 1 + i];
+        if (s > bestS || (s === bestS && id < bestI)) {
+          bestS = s;
+          bestI = id;
+          moved = true;
+        }
+      }
+      if (!moved) return;
+      this._curS = bestS;
+      this._curI = bestI;
+    }
+  }
+
+  /**
+   * Best-first search of one layer from `nEps` entry points (`eps*`), keeping
+   * the `ef` best admitted nodes into `outS`/`outI`, best first; returns how
+   * many. Tombstones and non-admitted nodes (a node is admitted when its row is
+   * live, its type code matches `code` (-1 = any), its score is at least
+   * `threshold` and it is not `exclude`) are routed through but never kept.
+   * Stops when the best unexpanded node is worse than the worst kept one (once
+   * `ef` are kept), or, setting `budgetHit`, after `budget` nodes were scored.
+   */
+  private _searchLayer(
+    t: VectorTable, q: Float64Array, qn: number,
+    epS: Float64Array, epI: Int32Array, nEps: number,
+    ef: number, level: number,
+    code: number, threshold: number, exclude: number, budget: number
+  ): number {
+    const visited = this._visited;
+    visited.clear();
+    const cand = this._cand;
+    const kept = this._kept;
+    cand.clear();
+    kept.clear();
+    const norms = t.norms;
+    const codes = t.codes;
+    for (let e = 0; e < nEps; e++) {
+      const slot = epI[e];
+      if (visited.testSet(slot)) continue;
+      const score = epS[e];
+      cand.push(score, slot);
+      if (slot !== exclude && norms[slot] === norms[slot] && score >= threshold && (code < 0 || codes[slot] === code)) {
+        kept.push(score, slot);
+        if (kept.n > ef) kept.pop();
+      }
+    }
+    const fresh = this._fresh;
+    const scores = this._scores;
+    let scored = 0;
+    this.budgetHit = false;
+    while (cand.n > 0) {
+      cand.pop();
+      const cs = cand.topS;
+      const ci = cand.topI;
+      if (kept.n >= ef) {                                 // stop when the candidate is worse than the worst kept
+        const ws = kept.s[0];
+        if (ws > cs || (ws === cs && kept.id[0] < ci)) break;
+      }
+      const block = this._arr(ci, level);
+      const at = this._off(ci, level);
+      const count = block[at];
+      let nf = 0;
+      for (let i = 1; i <= count; i++) {
+        const x = block[at + i];
+        if (!visited.testSet(x)) fresh[nf++] = x;
+      }
+      if (nf === 0) continue;
+      this._scoreInto(t, q, qn, fresh, 0, nf, scores);
+      scored += nf;
+      for (let i = 0; i < nf; i++) {
+        const score = scores[i];
+        const slot = fresh[i];
+        if (kept.n < ef || score > kept.s[0] || (score === kept.s[0] && slot < kept.id[0])) {
+          cand.push(score, slot);
+          if (slot !== exclude && norms[slot] === norms[slot] && score >= threshold && (code < 0 || codes[slot] === code)) {
+            kept.push(score, slot);
+            if (kept.n > ef) kept.pop();
+          }
+        }
+      }
+      if (scored > budget) {
+        this.budgetHit = true;
+        break;
+      }
+    }
+    const n = kept.n;
+    this._ensureOut(n);
+    const outS = this.outS;
+    const outI = this.outI;
+    for (let i = n - 1; i >= 0; i--) {                    // worst first, so fill from the back
+      kept.pop();
+      outS[i] = kept.topS;
+      outI[i] = kept.topI;
+    }
+    return n;
+  }
+
+  /**
+   * The `ef` best admitted nodes for a query, best first, into `outS`/`outI`;
+   * returns how many (`budgetHit` says the search gave up scoring too many).
+   * `query` holds the raw numbers the exact scan would use; `qn` is their norm.
+   */
+  search(t: VectorTable, query: ArrayLike<number>, qn: number, code: number, threshold: number, ef: number, budget: number): number {
+    this.budgetHit = false;
+    if (this.entry === -1) return 0;
+    const q = this._qSearch;
+    for (let j = 0; j < this._dim; j++) q[j] = query[j];
+    this._visited.begin(this.slots);
+    try {
+      this._scoreOne(t, q, qn, this.entry);
+      for (let level = this.top; level >= 1; level--) this._greedy(t, q, qn, level);
+      const epS = this._epS;
+      const epI = this._epI;
+      epS[0] = this._curS;
+      epI[0] = this._curI;
+      return this._searchLayer(t, q, qn, epS, epI, 1, ef, 0, code, threshold, -1, budget);
+    } finally {
+      this._visited.clear();
+    }
+  }
+
+  // -- linking -----------------------------------------------------------------------
+
+  private _grow(name: '_epS' | '_candS' | '_selS' | '_memS', nameI: '_epI' | '_candI' | '_selI' | '_memI', need: number): void {
+    if (this[name].length >= need) return;
+    const size = Math.max(need, this[name].length * 2);
+    const s = new Float64Array(size);
+    s.set(this[name]);
+    this[name] = s;
+    const i = new Int32Array(size);
+    i.set(this[nameI]);
+    this[nameI] = i;
+  }
+
+  /**
+   * The diversity heuristic: walk the `n` candidates (`S`/`I`, best first) and
+   * keep one only if it scores no better with any node already kept than with
+   * the base (`sim(c, kept) > sim(c, base)` rejects); stop at `cap`. With at
+   * most `cap` candidates, keep all.
+   */
+  private _select(t: VectorTable, S: Float64Array, I: Int32Array, n: number, cap: number): Int32Array {
+    if (n <= cap) return I.slice(0, n);
+    const chosen = new Int32Array(cap);
+    let count = 0;
+    const scores = this._scores;
+    const q = this._qSel;
+    for (let i = 0; i < n; i++) {
+      if (count >= cap) break;
+      const c = I[i];
+      let reject = false;
+      if (count > 0) {
+        this._loadRow(t, c, q);
+        this._scoreInto(t, q, this._rowNorm(t, c), chosen, 0, count, scores);
+        const cs = S[i];
+        for (let j = 0; j < count; j++) {
+          if (scores[j] > cs) {
+            reject = true;
+            break;
+          }
+        }
+      }
+      if (!reject) chosen[count++] = c;
+    }
+    return count === cap ? chosen : chosen.slice(0, count);
+  }
+
+  /** Sort `n` pairs (`S`/`I`) best first, in place, through the sorting heap. */
+  private _sortBest(S: Float64Array, I: Int32Array, n: number): void {
+    const h = this._sort;
+    h.clear();
+    for (let i = 0; i < n; i++) h.push(S[i], I[i]);
+    for (let i = 0; i < n; i++) {
+      h.pop();
+      S[i] = h.topS;
+      I[i] = h.topI;
+    }
+  }
+
+  /**
+   * The neighbours chosen for the job (`x`, `level`) on every layer, against the
+   * graph as it is now plus the other new members of its batch (the intra-batch
+   * slots with level >= the layer, scored by brute force).
+   */
+  private _plan(t: VectorTable, x: number, level: number, intraSlots: Int32Array, intraLevels: Int32Array, intraCount: number): Int32Array[] {
+    const visited = this._visited;
+    visited.begin(this.slots);
+    const q = this._qPlan;
+    this._loadRow(t, x, q);
+    const qn = this._rowNorm(t, x);
+    const top = this.top;
+    const lists: Int32Array[] = new Array(level + 1);
+    let nEps = 0;
+    if (this.entry !== -1) {
+      this._scoreOne(t, q, qn, this.entry);
+      for (let l = top; l >= level + 1; l--) this._greedy(t, q, qn, l);
+      this._epS[0] = this._curS;
+      this._epI[0] = this._curI;
+      nEps = 1;
+    }
+    for (let l = level; l >= 0; l--) {
+      let nc = 0;
+      if (l <= top && nEps > 0) {
+        nc = this._searchLayer(t, q, qn, this._epS, this._epI, nEps, this.efC, l, -1, -Infinity, x, 0x7fffffff);
+        this._grow('_candS', '_candI', nc);
+        this._candS.set(this.outS.subarray(0, nc));
+        this._candI.set(this.outI.subarray(0, nc));
+        if (nc > 0) {
+          this._grow('_epS', '_epI', nc);
+          this._epS.set(this._candS.subarray(0, nc));
+          this._epI.set(this._candI.subarray(0, nc));
+          nEps = nc;
+        }
+      }
+      let members = 0;
+      for (let i = 0; i < intraCount; i++) if (intraSlots[i] !== x && intraLevels[i] >= l) members++;
+      if (members > 0) {
+        this._grow('_memS', '_memI', members);
+        const memI = this._memI;
+        const memS = this._memS;
+        for (let i = 0, j = 0; i < intraCount; i++) if (intraSlots[i] !== x && intraLevels[i] >= l) memI[j++] = intraSlots[i];
+        this._scoreInto(t, q, qn, memI, 0, members, memS);
+        this._grow('_candS', '_candI', nc + members);
+        const candS = this._candS;
+        const candI = this._candI;
+        for (let i = 0; i < members; i++) {
+          candS[nc + i] = memS[i];
+          candI[nc + i] = memI[i];
+        }
+        nc += members;
+        this._sortBest(candS, candI, nc);
+      }
+      lists[l] = this._select(t, this._candS, this._candI, nc, this.m);
+    }
+    return lists;
+  }
+
+  /**
+   * The list of `target` on `layer` with `incoming` added, pruned to the
+   * layer's capacity when it overflows (tombstones are dropped then, and the
+   * rest re-pruned with the diversity heuristic). Null if nothing changes.
+   */
+  private _grownList(t: VectorTable, layer: number, target: number, incoming: number[]): Int32Array | null {
+    const cap = this._cap(layer);
+    const block = this._arr(target, layer);
+    const at = this._off(target, layer);
+    const len = block[at];
+    const all = new Int32Array(len + incoming.length);
+    for (let i = 0; i < len; i++) all[i] = block[at + 1 + i];
+    let count = len;
+    for (const nb of incoming) {
+      if (nb === target) continue;
+      let seen = false;
+      for (let i = 0; i < count; i++) {
+        if (all[i] === nb) {
+          seen = true;
+          break;
+        }
+      }
+      if (!seen) all[count++] = nb;
+    }
+    if (count === len) return null;
+    if (count <= cap) return all.slice(0, count);
+    const norms = t.norms;
+    let live = 0;
+    for (let i = 0; i < count; i++) {
+      const nm = norms[all[i]];
+      if (nm === nm) all[live++] = all[i];
+    }
+    count = live;
+    if (count <= cap) return all.slice(0, count);
+    const scores = new Float64Array(count);
+    this._loadRow(t, target, this._qSel);
+    this._scoreInto(t, this._qSel, this._rowNorm(t, target), all, 0, count, scores);
+    const S = new Float64Array(count);
+    const I = new Int32Array(count);
+    for (let i = 0; i < count; i++) {
+      S[i] = scores[i];
+      I[i] = all[i];
+    }
+    this._sortBest(S, I, count);
+    return this._select(t, S, I, count, cap);
+  }
+
+  /**
+   * Link `count` jobs (slot, level, relink) into the graph: plan every job
+   * against the graph as it is (read-only), then apply the plans in job order.
+   * One routine for build, insert and update.
+   */
+  private _link(t: VectorTable, slots: Int32Array, levels: Int32Array, relink: Uint8Array, count: number): void {
+    const intraSlots = new Int32Array(count);
+    const intraLevels = new Int32Array(count);
+    let intra = 0;
+    for (let i = 0; i < count; i++) {
+      if (relink[i] === 0) {
+        intraSlots[intra] = slots[i];
+        intraLevels[intra++] = levels[i];
+      }
+    }
+    const plans: Int32Array[][] = new Array(count);
+    for (let i = 0; i < count; i++) plans[i] = this._plan(t, slots[i], levels[i], intraSlots, intraLevels, intra);
+    this._visited.clear();
+
+    // forward links
+    for (let i = 0; i < count; i++) {
+      if (relink[i] === 0) this._addNode(slots[i], levels[i]);
+      const plan = plans[i];
+      for (let l = 0; l < plan.length; l++) this._setList(slots[i], l, plan[l], plan[l].length);
+    }
+
+    // backward links, grouped by (layer, target) in a fixed order
+    const norms = t.norms;
+    const groups = new Map<number, number[]>();
+    for (let i = 0; i < count; i++) {
+      const plan = plans[i];
+      for (let l = 0; l < plan.length; l++) {
+        const list = plan[l];
+        for (let k = 0; k < list.length; k++) {
+          const nb = list[k];
+          if (norms[nb] !== norms[nb]) continue;
+          const key = l * 4294967296 + nb;
+          const group = groups.get(key);
+          if (group === undefined) groups.set(key, [slots[i]]);
+          else group.push(slots[i]);
+        }
+      }
+    }
+    const keys = Float64Array.from(groups.keys()).sort();
+    for (let g = 0; g < keys.length; g++) {
+      const key = keys[g];
+      const layer = Math.floor(key / 4294967296);
+      const target = key - layer * 4294967296;
+      const grown = this._grownList(t, layer, target, groups.get(key)!);
+      if (grown !== null) this._setList(target, layer, grown, grown.length);
+    }
+
+    // the entry point is the first new node of the highest level
+    for (let i = 0; i < count; i++) {
+      if (relink[i] !== 0) continue;
+      if (this.entry === -1 || levels[i] > this.top) {
+        this.entry = slots[i];
+        this.top = levels[i];
+      }
+    }
+  }
+
+  /**
+   * A graph over every live row of `t` with a finite norm, built in slot order
+   * in batches of size/16 (1 at the start, at most 512), one `_link` call each.
+   */
+  static build(t: VectorTable, m: number, efConstruction: number, seed: number): HnswIndex {
+    const started = nowMs();
+    const h = new HnswIndex(m, efConstruction, seed, t.dim);
+    const n = t.n;
+    if (n > 0) h._ensureSlot(n - 1);
+    const norms = t.norms;
+    const order = new Int32Array(n);
+    let live = 0;
+    for (let s = 0; s < n; s++) if (Number.isFinite(norms[s])) order[live++] = s;   // a tombstone's norm is NaN
+    const slots = new Int32Array(HNSW_BUILD_BATCH);
+    const levels = new Int32Array(HNSW_BUILD_BATCH);
+    const relink = new Uint8Array(HNSW_BUILD_BATCH);
+    let at = 0;
+    while (at < live) {
+      const size = Math.min(Math.max(Math.floor(at / HNSW_BUILD_RATIO), 1), HNSW_BUILD_BATCH);
+      const end = Math.min(at + size, live);
+      let c = 0;
+      for (let i = at; i < end; i++) {
+        slots[c] = order[i];
+        levels[c++] = h._drawLevel();
+      }
+      h._link(t, slots, levels, relink, c);
+      at = end;
+    }
+    h.buildSeconds = (nowMs() - started) / 1000;
+    return h;
+  }
+
+  private readonly _one = {
+    slots: new Int32Array(1),
+    levels: new Int32Array(1),
+    relink: new Uint8Array(1),
+  };
+
+  /**
+   * A row was written (new, or its vector replaced): link it into the graph now.
+   * An update keeps the node's level and relinks it; other nodes' links to its
+   * old position stay (routing hints). Counts as churn.
+   */
+  notePut(t: VectorTable, slot: number): void {
+    const started = nowMs();
+    this._ensureSlot(slot);
+    const norm = t.norms[slot];
+    if (!Number.isFinite(norm)) {
+      if (this.inGraph(slot)) this.churn++;
+      return;
+    }
+    const one = this._one;
+    one.slots[0] = slot;
+    if (this.inGraph(slot)) {
+      this.churn++;
+      one.levels[0] = this.levels[slot];
+      one.relink[0] = 1;
+    } else {
+      one.levels[0] = this._drawLevel();
+      one.relink[0] = 0;
+    }
+    this._link(t, one.slots, one.levels, one.relink, 1);
+    this.inserts++;
+    this.insertSeconds += (nowMs() - started) / 1000;
+  }
+
+  /** A row was deleted: the table's NaN norm hides it; the node and its links stay. */
+  noteDrop(): void {
+    this.churn++;
+  }
+
+  // -- compaction --------------------------------------------------------------------
+
+  /**
+   * The graph after the table's compaction (`remap[old]` is the new slot, or
+   * -1 for a dead one; slots past `remap.length` are dead): tombstones leave,
+   * links are renumbered, and a node that lost links takes up the links of the
+   * tombstones it pointed to ("bridging"), computing no distance. The entry
+   * point becomes the first node of the highest level.
+   */
+  compacted(remap: Int32Array, newSlots: number): HnswIndex {
+    const oldN = this.slots;
+    const fresh = new HnswIndex(this.m, this.efC, 0, this._dim);
+    fresh._rng = this._rng;
+    fresh.churn = this.churn;
+    fresh.buildSeconds = this.buildSeconds;
+    fresh.inserts = this.inserts;
+    fresh.insertSeconds = this.insertSeconds;
+    if (newSlots > 0) fresh._ensureSlot(newSlots - 1);
+    const lost: number[] = [];
+    const out = new Int32Array(HNSW_MAX_CAP);
+    const mapped = (s: number): number => (s < remap.length ? remap[s] : -1);
+    for (let old = 0; old < oldN; old++) {
+      const nw = mapped(old);
+      if (nw < 0) continue;
+      const level = this.levels[old];
+      if (level === HNSW_ABSENT) continue;
+      fresh._addNode(nw, level);
+      for (let l = 0; l <= level; l++) {
+        const cap = this._cap(l);
+        let oc = 0;
+        lost.length = 0;
+        const block = this._arr(old, l);
+        const at = this._off(old, l);
+        const len = block[at];
+        for (let i = 1; i <= len; i++) {
+          const nb = block[at + i];
+          const n2 = mapped(nb);
+          if (n2 >= 0) out[oc++] = n2;
+          else lost.push(nb);
+        }
+        for (const d of lost) {
+          if (oc >= cap) break;
+          if (d >= oldN || this.levels[d] === HNSW_ABSENT || this.levels[d] < l) continue;
+          const db = this._arr(d, l);
+          const da = this._off(d, l);
+          const dl = db[da];
+          for (let i = 1; i <= dl; i++) {
+            const nw2 = mapped(db[da + i]);
+            if (nw2 < 0 || nw2 === nw) continue;
+            let seen = false;
+            for (let k = 0; k < oc; k++) {
+              if (out[k] === nw2) {
+                seen = true;
+                break;
+              }
+            }
+            if (seen) continue;
+            out[oc++] = nw2;
+            if (oc >= cap) break;
+          }
+        }
+        fresh._setList(nw, l, out, oc);
+      }
+      if (fresh.entry === -1 || level > fresh.top) {
+        fresh.entry = nw;
+        fresh.top = level;
+      }
+    }
+    return fresh;
+  }
+
+  // -- checks ------------------------------------------------------------------------
+
+  /** DESIGN.md section 12.6 invariants 8-10 against the table; null when they hold. */
+  verify(t: VectorTable): string | null {
+    const n = t.n;
+    if (this.slots < n) return `graph covers ${this.slots} rows, table has ${n}`;
+    if (this.l0.length !== Math.ceil(this.slots / HNSW_CHUNK_ROWS)) return `${this.l0.length} link chunks for ${this.slots} rows`;
+    let members = 0;
+    let maxLevel = 0;
+    const norms = t.norms;
+    for (let s = 0; s < this.slots; s++) {
+      const level = this.levels[s];
+      if (level === HNSW_ABSENT) {
+        if (s < n && t.keys[s] !== null && Number.isFinite(norms[s])) return `live slot ${s} is not in the graph`;
+        continue;
+      }
+      if (s >= n && !(norms[s] !== norms[s])) return `slot ${s} past the table's end is not marked dead`;
+      members++;
+      maxLevel = Math.max(maxLevel, level);
+      for (let l = 0; l <= level; l++) {
+        const list = this.linksOf(s, l);
+        if (list.length > this._cap(l)) return `slot ${s} layer ${l} holds ${list.length} links`;
+        const seen = list.slice().sort();
+        for (let i = 1; i < seen.length; i++) if (seen[i] === seen[i - 1]) return `slot ${s} layer ${l} links a node twice`;
+        for (const nb of list) {
+          if (nb < 0 || nb >= this.slots || nb === s) return `slot ${s} layer ${l} links ${nb}`;
+          if (this.levels[nb] === HNSW_ABSENT || this.levels[nb] < l) return `slot ${s} layer ${l} links ${nb}, which is not on that layer`;
+        }
+      }
+    }
+    if (members !== this.members) return `member counter ${this.members} but ${members} nodes`;
+    if (members === 0) {
+      if (this.entry !== -1) return 'an empty graph has an entry point';
+    } else if (this.entry === -1 || this.levels[this.entry] !== this.top || maxLevel !== this.top) {
+      return `entry ${this.entry} does not sit on top level ${this.top} (highest node ${maxLevel})`;
+    }
+    return null;
+  }
+
+  /** Nodes whose rows are tombstones (or past the table's end). */
+  dead(t: VectorTable): number {
+    let dead = 0;
+    for (let s = 0; s < this.slots; s++) {
+      if (this.levels[s] === HNSW_ABSENT) continue;
+      const nm = t.norms[s];
+      if (nm !== nm) dead++;
+    }
+    return dead;
+  }
+
+  /** A comparable digest of the whole structure (levels, links, entry), to tell two graphs apart (tests). */
+  structureHash(): string {
+    let h1 = 0x811c9dc5;
+    let h2 = 0x01000193;
+    const mix = (v: number): void => {
+      h1 = Math.imul(h1 ^ (v >>> 0), 0x01000193) >>> 0;
+      h2 = Math.imul(h2 + (v >>> 0) + 0x9e3779b9, 0x85ebca6b) >>> 0;
+      h2 ^= h2 >>> 13;
+    };
+    mix(this.slots);
+    mix(this.entry);
+    mix(this.top);
+    mix(this.members);
+    for (let s = 0; s < this.slots; s++) {
+      mix(this.levels[s]);
+      if (this.levels[s] === HNSW_ABSENT) continue;
+      for (let l = 0; l <= this.levels[s]; l++) {
+        const list = this.linksOf(s, l);
+        mix(list.length);
+        for (const x of list) mix(x);
+      }
+    }
+    return `${h1.toString(16)}-${h2.toString(16)}`;
+  }
+}
+
 /**
  * In-memory embedding storage with brute-force cosine similarity search.
  *
@@ -1841,6 +3038,9 @@ export class EmbeddingStore {
   private _annNprobe: number | null = null;
   private _annMinSize: number = ANN_MIN_SIZE;
   private _annSeed = 0;
+  private _annHnswM = HNSW_DEFAULT_M;
+  private _annHnswEfConstruction = HNSW_DEFAULT_EF_CONSTRUCTION;
+  private _annEfSearch: number | null = null;
   private _annCounts = { approximate: 0, exact: 0, widened: 0, builds: 0 };
 
   /** Metadata of the most recent imported sidecar (empty before any). */
@@ -1852,8 +3052,8 @@ export class EmbeddingStore {
     this.onModelMismatch = options.onModelMismatch ?? 'warn';
 
     const ann = options.ann ?? null;
-    if (ann !== null && ann !== 'ivf') {
-      throw new EmbeddingError(`ann must be null or 'ivf', got ${JSON.stringify(ann)}`);
+    if (ann !== null && ann !== 'ivf' && ann !== 'hnsw') {
+      throw new EmbeddingError(`ann must be null, 'ivf' or 'hnsw', got ${JSON.stringify(ann)}`);
     }
     const whole = (label: string, value: number | null | undefined, floor: number): number | null => {
       if (value === undefined || value === null) return null;
@@ -1867,9 +3067,15 @@ export class EmbeddingStore {
     this._annNprobe = whole('annNprobe', options.annNprobe, 1);
     this._annMinSize = whole('annMinSize', options.annMinSize, 0) ?? ANN_MIN_SIZE;
     this._annSeed = Math.trunc(Number(options.annSeed ?? 0)) || 0;
+    const hnsw = options.annHnsw ?? {};
+    const m = whole('annHnsw.m', hnsw.m, 2) ?? HNSW_DEFAULT_M;
+    if (m > HNSW_MAX_M) throw new EmbeddingError(`annHnsw.m must be an integer between 2 and ${HNSW_MAX_M}, got ${m}`);
+    this._annHnswM = m;
+    this._annHnswEfConstruction = whole('annHnsw.efConstruction', hnsw.efConstruction, 1) ?? HNSW_DEFAULT_EF_CONSTRUCTION;
+    this._annEfSearch = whole('annHnsw.efSearch', hnsw.efSearch, 1);
   }
 
-  /** The approximate index in use (`'ivf'`), or null when search is exact. */
+  /** The approximate index in use (`'ivf'` or `'hnsw'`), or null when search is exact. */
   get ann(): AnnMode | null {
     return this._ann;
   }
@@ -1884,6 +3090,27 @@ export class EmbeddingStore {
       throw new EmbeddingError(`annNprobe must be an integer >= 1, got ${value}`);
     }
     this._annNprobe = value;
+  }
+
+  /**
+   * Candidates per HNSW query; null means automatic (by store size, see
+   * {@link HnswOptions}). Takes effect on the next search; the graph is not
+   * rebuilt. Ignored by the exact scan and by IVF.
+   */
+  get annEfSearch(): number | null {
+    return this._annEfSearch;
+  }
+
+  set annEfSearch(value: number | null) {
+    if (value !== null && (typeof value !== 'number' || !Number.isInteger(value) || value < 1)) {
+      throw new EmbeddingError(`annEfSearch must be an integer >= 1, got ${value}`);
+    }
+    this._annEfSearch = value;
+  }
+
+  /** Set {@link annEfSearch} (null = automatic); the same as assigning the property. */
+  setAnnEfSearch(efSearch: number | null): void {
+    this.annEfSearch = efSearch;
   }
 
   get encoder(): EmbeddingEncoder | null {
@@ -2239,17 +3466,20 @@ export class EmbeddingStore {
   remove(nodeRef: NodeRef): boolean {
     const table = this._table;
     if (table === null) return false;
-    return table.remove(this._nodeRefToKey(nodeRef));
+    const removed = table.remove(this._nodeRefToKey(nodeRef));
+    if (removed && table.hnsw !== null && table.live < Math.max(2, this._annMinSize)) table.hnsw = null;   // too small to index now
+    return removed;
   }
 
   /**
    * Find the most similar nodes by embedding.
    *
-   * Exact by default. With `ann: 'ivf'`, a bounded `topK` on a store of at
-   * least `annMinSize` vectors is answered from the approximate index (the
-   * scores are the same cosine values, but a true neighbour in an unprobed
-   * cell can be missing); `exact: true` forces the full scan, and has no effect
-   * on a store without `ann`. `topK: null` always scans everything.
+   * Exact by default. With `ann: 'ivf'` or `'hnsw'`, a bounded `topK` on a store
+   * of at least `annMinSize` vectors, with `topK` below the live count, is answered
+   * from the approximate index (IVF re-scores its hits exactly; HNSW's hits are
+   * the exact scan's own numbers; either way a true neighbour can be missing);
+   * `exact: true` forces the full scan, and has no effect on a store without
+   * `ann`. `topK: null` always scans everything.
    */
   similaritySearch(
     query: string | number[],
@@ -2258,12 +3488,39 @@ export class EmbeddingStore {
     threshold: number = 0.0,
     exact: boolean = false
   ): SimilarityResult[] {
-    const queryVector = this._resolveQuery(query);
+    return this._search(this._resolveQuery(query), topK, nodeType, threshold, exact, 0);
+  }
+
+  /**
+   * {@link similaritySearch} (never forced exact) with `efSearch` candidates for
+   * this call only: the HNSW knob, ignored by the exact scan and by IVF.
+   */
+  similaritySearchEf(
+    query: string | number[],
+    topK: number | null,
+    nodeType: string | undefined,
+    threshold: number,
+    efSearch: number
+  ): SimilarityResult[] {
+    if (typeof efSearch !== 'number' || !Number.isInteger(efSearch) || efSearch < 1) {
+      throw new EmbeddingError(`efSearch must be an integer >= 1, got ${efSearch}`);
+    }
+    return this._search(this._resolveQuery(query), topK, nodeType, threshold, false, efSearch);
+  }
+
+  private _search(
+    queryVector: number[],
+    topK: number | null,
+    nodeType: string | undefined,
+    threshold: number,
+    exact: boolean,
+    efOver: number
+  ): SimilarityResult[] {
     if (this._ann !== null) {
       if (exact || topK === null || topK <= 0) {
         this._annCounts.exact++;
       } else {
-        const answer = this._annSearch(queryVector, topK, nodeType, threshold);
+        const answer = this._annSearch(queryVector, topK, nodeType, threshold, efOver);
         if (answer !== null) return answer;
         this._annCounts.exact++;
       }
@@ -2395,6 +3652,88 @@ export class EmbeddingStore {
     return this._resolveQuery(query);
   }
 
+  // -- approximate (HNSW) search ------------------------------------------------
+
+  /** The ef a query uses: the per-call override, else the configured value, else the size-based default; never below k. */
+  private _hnswEf(over: number, k: number, live: number): number {
+    const ef = over > 0 ? over : this._annEfSearch ?? hnswAutoEf(live);
+    return Math.max(ef, k, 1);
+  }
+
+  /**
+   * The table holding the graph, with the graph built (or rebuilt once churn
+   * made it stale) as the policy says; null means "answer exactly": the mode is
+   * not HNSW, or the store holds fewer than `annMinSize` vectors (the graph is
+   * dropped then). Built lazily by the first search, never persisted; writes
+   * keep it current (see {@link VectorTable.put}).
+   */
+  private _hnswTable(): VectorTable | null {
+    if (this._ann !== 'hnsw' || this._dimension === null) return null;
+    const table = this._table;
+    if (table === null || table.live < Math.max(2, this._annMinSize)) {
+      if (table !== null) table.hnsw = null;
+      return null;
+    }
+    let graph = table.hnsw;
+    if (graph !== null && graph.stale) graph = table.hnsw = null;
+    if (graph === null) {
+      table.hnsw = HnswIndex.build(table, this._annHnswM, this._annHnswEfConstruction, this._annSeed);
+      this._annCounts.builds++;
+    }
+    return table;
+  }
+
+  /** A hit list from the graph's last result buffer (best first): the first `count` of them. */
+  private static _hnswHits(table: VectorTable, graph: HnswIndex, count: number): SimilarityResult[] {
+    const hits: SimilarityResult[] = new Array(count);
+    for (let i = 0; i < count; i++) {
+      const slot = graph.outI[i];
+      hits[i] = { nodeRef: table.refs[slot]!, score: graph.outS[i], text: table.texts[slot] };
+    }
+    return hits;
+  }
+
+  /**
+   * Top-k from the graph, or null to fall back to the exact scan. A filter
+   * (`nodeType`, `threshold`) leaves some answers short: ef is then widened 4x
+   * and the search retried, and the scan answers instead once ef would cover
+   * half the store or one search scores more nodes than the scan would cost
+   * (a filter so selective that scanning is cheaper). A hit's score is the
+   * exact scan's score for that node, bit for bit, and ties order by arrival.
+   */
+  private _hnswSearch(
+    queryVector: number[],
+    topK: number,
+    nodeType: string | undefined,
+    threshold: number,
+    efOver: number
+  ): SimilarityResult[] | null {
+    const table = this._hnswTable();
+    if (table === null) return null;
+    const graph = table.hnsw!;
+    const qnorm = EmbeddingStore._norm(queryVector);
+    if (!(qnorm > 0) || !Number.isFinite(qnorm)) return null;     // no direction to walk by: the scan answers
+    let code = -1;
+    if (nodeType) {
+      code = table.codeOf.get(nodeType) ?? -2;
+      if (code === -2) return [];                                   // no node of that type exists
+    }
+    const live = table.live;
+    if (!Number.isInteger(topK) || topK >= live) return null;       // everything is wanted: the scan is the answer
+    const baseEf = this._hnswEf(efOver, topK, live);
+    for (let scale = 1; ; scale *= 4) {
+      const ef = baseEf * scale;
+      if (scale === 1 ? ef >= live : ef * 2 >= live) return null;
+      const found = graph.search(table, queryVector, qnorm, code, threshold, ef, Math.max(Math.floor(live / 8), ef * 16));
+      if (graph.budgetHit) return null;
+      if (found >= topK) {
+        this._annCounts.approximate++;
+        if (scale > 1) this._annCounts.widened++;
+        return EmbeddingStore._hnswHits(table, graph, topK);
+      }
+    }
+  }
+
   // -- approximate (IVF) search -------------------------------------------------
 
   /** Cells for a store of `n` vectors: about 4 * sqrt(n), within [16, 65536]. */
@@ -2487,8 +3826,10 @@ export class EmbeddingStore {
     queryVector: number[],
     topK: number,
     nodeType: string | undefined,
-    threshold: number
+    threshold: number,
+    efOver: number = 0
   ): SimilarityResult[] | null {
+    if (this._ann === 'hnsw') return this._hnswSearch(queryVector, topK, nodeType, threshold, efOver);
     const scan = this._annIndex();
     if (scan === null) return null;
     const ivf = scan.ivf!;
@@ -2519,6 +3860,7 @@ export class EmbeddingStore {
    * `threshold` once exact, and order them best first.
    */
   annPolish(results: SimilarityResult[], queryVector: number[], threshold: number): SimilarityResult[] {
+    if (this._ann === 'hnsw') return results;          // the graph scored every hit exactly (same rows, same arithmetic) and ordered them
     const out: SimilarityResult[] = [];
     const table = this._table;
     if (table === null) return out;
@@ -2546,7 +3888,26 @@ export class EmbeddingStore {
     threshold: number,
     scale: number | null
   ): { ranked: Iterable<SimilarityResult>; approximate: boolean } {
-    if (scale !== null && this._ann !== null) {
+    if (scale !== null && this._ann === 'hnsw') {
+      const table = this._hnswTable();
+      const graph = table === null ? null : table.hnsw;
+      const qnorm = EmbeddingStore._norm(queryVector);
+      if (table !== null && graph !== null && qnorm > 0 && Number.isFinite(qnorm)) {
+        let code = -1;
+        if (nodeType) code = table.codeOf.get(nodeType) ?? -2;
+        if (code === -2) return { ranked: [], approximate: false };
+        const live = table.live;
+        const ef = this._hnswEf(0, 1, live) * scale;
+        if (!(scale === 1 ? ef >= live : ef * 2 >= live)) {
+          const found = graph.search(table, queryVector, qnorm, code, threshold, ef, Math.max(Math.floor(live / 8), ef * 16));
+          if (!graph.budgetHit) {
+            this._annCounts.approximate++;
+            if (scale > 1) this._annCounts.widened++;
+            return { ranked: EmbeddingStore._hnswHits(table, graph, found), approximate: true };
+          }
+        }
+      }
+    } else if (scale !== null && this._ann !== null) {
       const scan = this._annIndex();
       const ivf = scan === null ? null : scan.ivf;
       const lists = ivf === null ? null : this._annLists(ivf, scale);
@@ -2584,7 +3945,12 @@ export class EmbeddingStore {
    */
   buildAnnIndex(force: boolean = false): AnnStats {
     if (this._ann === null) {
-      throw new EmbeddingError("this store has no approximate index; create it with ann: 'ivf'");
+      throw new EmbeddingError("this store has no approximate index; create it with ann: 'ivf' or 'hnsw'");
+    }
+    if (this._ann === 'hnsw') {
+      if (force && this._table !== null) this._table.hnsw = null;
+      this._hnswTable();
+      return this.annStats();
     }
     if (force && this._table !== null) this._table.ivf = null;
     const scan = this._annIndex();
@@ -2595,6 +3961,31 @@ export class EmbeddingStore {
   /** What the approximate index looks like right now. Never builds anything. */
   annStats(): AnnStats {
     const scan = this._table;
+    if (this._ann === 'hnsw') {
+      const graph = scan === null ? null : scan.hnsw;
+      return {
+        enabled: true,
+        mode: 'hnsw',
+        active: graph !== null,
+        nlist: null,
+        nprobe: null,
+        trainedN: graph === null ? null : graph.members,
+        pending: 0,
+        churn: graph === null ? 0 : graph.churn,
+        buildSeconds: graph === null ? null : graph.buildSeconds,
+        indexBytes: graph === null ? 0 : graph.bytes(),
+        cacheBytes: 0,
+        vectorBytes: scan === null ? 0 : scan.bytes(),
+        minSize: this._annMinSize,
+        searches: { ...this._annCounts },
+        efSearch: this._annEfSearch ?? hnswAutoEf(scan === null ? 0 : scan.live),
+        maxLevel: graph === null ? null : graph.top,
+        graphNodes: graph === null ? 0 : graph.members,
+        graphDead: graph === null || scan === null ? 0 : graph.dead(scan),
+        inserts: graph === null ? 0 : graph.inserts,
+        insertSeconds: graph === null ? 0 : graph.insertSeconds,
+      };
+    }
     const ivf = scan === null ? null : scan.ivf;
     return {
       enabled: this._ann !== null,
@@ -2688,6 +4079,7 @@ export class EmbeddingStore {
       return ordered.length % 2 ? ordered[mid] : 0.5 * (ordered[mid - 1] + ordered[mid]);
     };
     const ivf = this._table === null ? null : this._table.ivf;
+    const hnsw = this._ann === 'hnsw';
     return {
       recall: recalls.length ? recalls.reduce((a, b) => a + b, 0) / recalls.length : 1,
       minRecall: recalls.length ? Math.min(...recalls) : 1,
@@ -2698,6 +4090,7 @@ export class EmbeddingStore {
       approximate: used,
       annMs: median(annTimes),
       exactMs: median(exactTimes),
+      ...(hnsw ? { efSearch: this._hnswEf(0, k, this._table === null ? 0 : this._table.live) } : {}),
     };
   }
 
@@ -3163,6 +4556,7 @@ export class SemanticGraph extends ISONGraph {
       annNprobe: options.annNprobe,
       annMinSize: options.annMinSize,
       annSeed: options.annSeed,
+      annHnsw: options.annHnsw,
     });
     this._autoEmbed = options.autoEmbed ?? true;
     this._embedFields = options.embedFields || ['name', 'description', 'content', 'text'];

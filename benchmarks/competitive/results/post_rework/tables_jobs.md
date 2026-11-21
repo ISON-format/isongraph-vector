@@ -1,0 +1,52 @@
+### Jobs: machine load before each job (all other processes), wall time, failures
+
+| file | CPU load before % | contaminated | wall s |
+|---|---|---|---|
+| cpp_avx2__text384__100000__core.json | 11.8 | False | 114 |
+| cpp_avx2__text384__100000__hnsw.json | 18.8 | False | 46.7 |
+| cpp_default__text384__1000000__core.json | 10.8 | False | 422 |
+| cpp_default__text384__1000000__hnsw.json | 18.5 | False | 272 |
+| cpp_default__text384__100000__core+saveload.json | 24.2 | False | 186 |
+| cpp_default__text384__100000__core+saveload__r2.json | 13.2 | False | 186 |
+| cpp_default__text384__100000__hnsw.json | 20.2 | False | 55.9 |
+| cpp_default__text384__100000__hnsw__r2.json | 12.4 | False | 55.3 |
+| csharp__text384__1000000__core.json | 12.8 | False | 377 |
+| csharp__text384__1000000__hnsw.json | 12.5 | False | 341 |
+| csharp__text384__100000__core+saveload.json | 19.2 | False | 128 |
+| csharp__text384__100000__core+saveload__r2.json | 14.5 | False | 128 |
+| csharp__text384__100000__hnsw.json | 13.0 | False | 71.1 |
+| csharp__text384__100000__hnsw__r2.json | 18.0 | False | 75.7 |
+| faiss_flat__text384__1000000__core+saveload.json | 14.7 | False | 63.9 |
+| faiss_flat__text384__100000__core+saveload.json | 11.7 | False | 32.5 |
+| faiss_flat__text384__100000__core+saveload__r2.json | 11.8 | False | 31.2 |
+| faiss_hnsw__text384__1000000__core+saveload.json | 15.4 | False | 275 |
+| faiss_hnsw__text384__100000__core+saveload.json | 14.5 | False | 90.2 |
+| faiss_hnsw__text384__100000__core+saveload__r2.json | 11.5 | False | 94.4 |
+| faiss_ivfflat__text384__1000000__core+saveload.json | 13.4 | False | 345 |
+| faiss_ivfflat__text384__100000__core+saveload.json | 12.9 | False | 77.1 |
+| faiss_ivfflat__text384__100000__core+saveload__r2.json | 12.0 | False | 79.1 |
+| hnswlib__text384__1000000__core+saveload.json | 13.0 | False | 283 |
+| hnswlib__text384__100000__core+saveload.json | 13.3 | False | 68.6 |
+| hnswlib__text384__100000__core+saveload__r2.json | 12.6 | False | 73.5 |
+| isong_py__text384__1000000__core.json | 11.9 | False | 209 |
+| isong_py__text384__100000__core+saveload.json | 11.9 | False | 121 |
+| isong_py_ivf__text384__1000000__core.json | 13.2 | False | 212 |
+| isong_py_ivf__text384__100000__core+saveload.json | 11.4 | False | 173 |
+| js__text384__1000000__core.json | 14.1 | False | 1002 |
+| js__text384__100000__core.json | 11.5 | False | 185 |
+| js__text384__100000__hnsw.json | 14.2 | False | 321 |
+| js__text384__100000__saveload.json | 11.8 | False | 5.59 |
+| numpy_bf__text384__1000000__core.json | 14.1 | False | 123 |
+| numpy_bf__text384__100000__core+saveload.json | 14.8 | False | 33.8 |
+| numpy_bf__text384__100000__core+saveload__r2.json | 13.6 | False | 36.0 |
+| rust_default__text384__1000000__core+int8+saveload.json | 11.1 | False | 329 |
+| rust_default__text384__1000000__hnsw.json | 9.35 | False | 234 |
+| rust_default__text384__100000__core+int8+saveload.json | 16.4 | False | 134 |
+| rust_default__text384__100000__core+int8+saveload__r2.json | 11.8 | False | 135 |
+| rust_default__text384__100000__hnsw.json | 13.9 | False | 47.2 |
+| rust_default__text384__100000__hnsw__r2.json | 11.1 | False | 48.0 |
+| rust_native__text384__100000__core+int8.json | 12.1 | False | 130 |
+| rust_native__text384__100000__hnsw.json | 13.3 | False | 47.2 |
+| ts__text384__100000__core.json | 18.2 | False | 184 |
+| ts__text384__100000__hnsw.json | 12.9 | False | 324 |
+| ts__text384__100000__saveload.json | 13.3 | False | 5.53 |

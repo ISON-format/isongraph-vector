@@ -15,11 +15,14 @@ What is deliberately not done yet, in rough priority order. Items marked
    and batch search, one copy of the vectors, no post-write stall, opt-in HNSW
    (level with faiss HNSW / hnswlib single-thread), int8 scan, binary snapshot.
    One copy of the vectors, batch search and the binary snapshot are now in
-   every port; HNSW is in Rust, C++ and C# (int8 is still Rust-only). Still
-   open: HNSW for Python, TypeScript and JavaScript; a SIMD scorer for C++/C#
-   HNSW (build is 1.6-3x slower than Rust's, MSVC the slowest); find why C++
-   HNSW is only 1.2x IVF on hard synthetic data; persist the ANN index; faster HNSW single-call inserts (1.4k/s at 1M); exact scan is at
-   parity with faiss Flat, not ahead.
+   every port; HNSW is in Rust, C++, C#, TypeScript and JavaScript (not Python:
+   1.7x IVF, rejected; int8 is still Rust-only). Still open: a SIMD scorer for
+   C# HNSW (1.6x slower to build than Rust) and a NEON one for C++ (needs ARM
+   hardware to verify); HNSW at 1M for TS/JS (build extrapolates to 30+ min);
+   persist the ANN index; faster HNSW single-call inserts (1.4k/s at 1M); exact scan is at
+   parity with faiss Flat, not ahead (but batch is 3x). Found by the post-rework re-run
+   and open: IVF builds 2-3x slower than before in every native port, Python ingest
+   superlinear at 1M, JS/TS JSON sidecar fails at 100k x 384.
 5. **Fix the slow ports.** The C++, C# and JS exact scans are scalar and still
    slower than numpy; JavaScript k-means takes about 8 minutes at 1M.
 6. **Per-record encoder version.** Today a version-only change warns on

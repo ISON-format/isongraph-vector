@@ -1,0 +1,17 @@
+ts: ds=text384 n=100000 d=384 queries=2000
+  hnsw: ingest 0.14s
+  hnsw build 250.01s graphNodes=100000 maxLevel=4 indexBytes=14270752
+  hnsw ef=10 recall=0.6177 qps1t=5126
+  hnsw ef=16 recall=0.7103 qps1t=3814
+  hnsw ef=24 recall=0.7846 qps1t=2860
+  hnsw ef=32 recall=0.8358 qps1t=2420
+  hnsw ef=48 recall=0.8852 qps1t=1768
+  hnsw ef=64 recall=0.9170 qps1t=1368
+  hnsw ef=96 recall=0.9480 qps1t=992
+  hnsw ef=128 recall=0.9646 qps1t=787
+  hnsw ef=192 recall=0.9808 qps1t=555
+  hnsw ef=256 recall=0.9869 qps1t=441
+  hnsw ef=400 recall=0.9933 qps1t=304
+  hnsw ef=640 recall=0.9973 qps1t=205
+  hnsw default ef=96 recall=0.9480 qps1t=986
+wrote results/post_rework/raw\ts__text384__100000__hnsw.json

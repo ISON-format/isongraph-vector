@@ -629,6 +629,19 @@ final sort and the exact scan treat +-0 as equal and break ties by slot; the
 C++ and C# ports use the exact-scan rule everywhere; the difference needs a
 score of exactly +-0.0.
 
+TypeScript/JavaScript (`ann: 'hnsw'`, single-threaded) matched Rust's ids in 6
+of 6 sets; a pure-Python port also matched 6 of 6 but is not shipped (1.6-1.7x
+IVF). Two findings from those ports: (d) a tombstoned row's floats must stay in
+the table until compaction, because routing through tombstones scores them (a
+Python table that zeroed deleted rows broke the match, 4 of 6 until fixed);
+(e) the TS table pops trailing tombstones and reuses the slot, which Rust and
+C# never do, so after deleting the newest row slot numbers (hence tie order and
+level draws) can differ from Rust's; the graph keeps such nodes as dead ghosts
+until the slot is reused or compaction. C++'s HNSW scores rows with a
+lane-per-row SSE2 kernel and cached norms: same ascending sums per row, so the
+same bits as the scalar scorer; the graph visits exactly Rust's number of rows
+at equal `ef` (1,850 per query at ef 96, 100k real text).
+
 ### 12.10 Portable vs language-specific
 
 *Portable (copy exactly)*: the level draw (integer, seeded), the (score, slot)

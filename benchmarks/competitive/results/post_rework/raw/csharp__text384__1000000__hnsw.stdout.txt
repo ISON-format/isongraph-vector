@@ -1,0 +1,17 @@
+csharp: ds=text384 n=1000000 d=384 queries=2000 cpus=32
+  hnsw: ingest 0.82s
+  hnsw build 259.19s graphNodes=1000000 maxLevel=5 indexBytes=145447744
+  hnsw ef=10 recall=0.5573 qps1t=6561 batch=38442
+  hnsw ef=16 recall=0.6501 qps1t=5540 batch=29290
+  hnsw ef=24 recall=0.7292 qps1t=4887 batch=23328
+  hnsw ef=32 recall=0.7762 qps1t=4525 batch=19012
+  hnsw ef=48 recall=0.8357 qps1t=3696 batch=13511
+  hnsw ef=64 recall=0.8713 qps1t=2121 batch=10336
+  hnsw ef=96 recall=0.9093 qps1t=1515 batch=7575
+  hnsw ef=128 recall=0.9306 qps1t=1199 batch=5853
+  hnsw ef=192 recall=0.9565 qps1t=849 batch=4298
+  hnsw ef=256 recall=0.9684 qps1t=647 batch=3229
+  hnsw ef=400 recall=0.9827 qps1t=435 batch=2250
+  hnsw ef=640 recall=0.9895 qps1t=284 batch=1559
+  hnsw default ef=192 recall=0.9565 qps1t=836
+wrote results/post_rework/raw\csharp__text384__1000000__hnsw.json

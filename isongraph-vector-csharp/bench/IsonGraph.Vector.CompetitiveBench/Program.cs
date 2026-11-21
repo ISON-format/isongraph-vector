@@ -91,8 +91,10 @@ J Point(EmbeddingStore s, int[][] truth, bool exact, string? ty)
     var oldMask = proc.ProcessorAffinity;
     int pinCpu = int.Parse(Environment.GetEnvironmentVariable("BENCH_PIN_CPU") ?? "8");
     try { proc.PriorityClass = ProcessPriorityClass.High; proc.ProcessorAffinity = (IntPtr)(1L << pinCpu); } catch { }
+    int oldScan = s.ScanThreads;
+    s.ScanThreads = 1;
     try { return PointPinned(s, truth, exact, ty); }
-    finally { try { proc.ProcessorAffinity = oldMask; } catch { } }
+    finally { s.ScanThreads = oldScan; try { proc.ProcessorAffinity = oldMask; } catch { } }
 }
 J PointPinned(EmbeddingStore s, int[][] truth, bool exact, string? ty)
 {
@@ -127,6 +129,22 @@ J PointPinned(EmbeddingStore s, int[][] truth, bool exact, string? ty)
         ["nq"] = m, ["recall"] = rec, ["qps_1t"] = Pct(runs, 0.5), ["qps_1t_min"] = runs.Min(), ["qps_1t_max"] = runs.Max(), ["qps_1t_runs"] = runs,
         ["median_ms"] = Pct(lats, 0.5) * 1000, ["p95_ms"] = Pct(lats, 0.95) * 1000, ["p99_ms"] = Pct(lats, 0.99) * 1000, ["mean_ms"] = lats.Average() * 1000,
     };
+}
+J BatchPoint(EmbeddingStore s, int[][] truth, bool exact)
+{
+    // all logical CPUs: warm up once, then 3 timed runs of the whole query set (ScanThreads left automatic)
+    double Run(out IReadOnlyList<IReadOnlyList<SimilarityResult>> r)
+    {
+        double t = Now();
+        r = s.SimilaritySearchBatch(queries, K, null, 0f, exact, 0);
+        return queries.Length / (Now() - t);
+    }
+    Run(out _);
+    var qps = new List<double>();
+    IReadOnlyList<IReadOnlyList<SimilarityResult>> last = null!;
+    for (int i = 0; i < 3; i++) { qps.Add(Run(out last)); }
+    var found = last.Select(row => row.Select(x => int.Parse(x.NodeRef.Id.ToString()!)).ToArray()).ToList();
+    return new J { ["nq"] = queries.Length, ["threads"] = cpus, ["qps"] = Pct(qps, 0.5), ["qps_runs"] = qps, ["recall"] = Recall(found, truth.Take(found.Count).ToArray()) };
 }
 int NlistFor(int x) => (int)Math.Clamp(Math.Round(4 * Math.Sqrt(x)), 16, 65536);
 List<int> Knobs()
@@ -174,6 +192,7 @@ if (exps.Contains("core") || exps.Contains("mutation") || exps.Contains("saveloa
     var p1 = Point(store, truth, true, null); p1["knob"] = null;
     Console.WriteLine($"  exact recall={p1["recall"]} qps={p1["qps_1t"]:F1}");
     ex["sweep"] = new List<J> { p1 };
+    ex["batch_allthreads"] = BatchPoint(store, truth, true);
     ex["mem_after_sweep"] = Mem();
     runsOut.Add(ex);
 
@@ -198,6 +217,7 @@ if (exps.Contains("core") || exps.Contains("mutation") || exps.Contains("saveloa
     {
         st.AnnNprobe = kn;
         var p = Point(st, truth, false, null); p["knob"] = kn;
+        p["batch_allthreads"] = BatchPoint(st, truth, false);
         Console.WriteLine($"  ivf nprobe={kn} recall={p["recall"]:F4} qps1t={p["qps_1t"]:F0}");
         if (refKnob < 0 && (double)p["recall"]! >= 0.95) { refKnob = kn; refRecall = (double)p["recall"]!; }
         pts.Add(p);
@@ -278,6 +298,63 @@ if (exps.Contains("core") || exps.Contains("mutation") || exps.Contains("saveloa
         iv["saveload"] = sl;
     }
     runsOut.Add(iv);
+}
+
+if (exps.Contains("hnsw"))
+{
+    // HNSW (AnnMode.Hnsw): its own store, so the memory figure holds only the vectors and the graph
+    var hs = new EmbeddingStore(ann: AnnMode.Hnsw, annMinSize: 0, annSeed: 0, annHnsw: new HnswOptions(16, 200, null));
+    double ingestS = Ingest(hs, null);
+    var memIng = Mem();
+    Console.WriteLine($"  hnsw: ingest {ingestS:F2}s");
+    var truth = Gt("");
+    double t0 = Now();
+    var stats = hs.BuildAnnIndex();
+    double idxS = Now() - t0;
+    var memBuild = Mem();
+    Console.WriteLine($"  hnsw build {idxS:F2}s graphNodes={stats.GraphNodes} maxLevel={stats.MaxLevel} indexBytes={stats.IndexBytes}");
+    var hn = Header(label + "_hnsw");
+    hn["knob_name"] = "ef_search";
+    hn["build"] = new J { ["ingest_s"] = ingestS, ["index_s"] = idxS, ["total_s"] = ingestS + idxS, ["first_query_ms"] = 0.0, ["ready_s"] = ingestS + idxS };
+    hn["mem_baseline"] = memBase; hn["mem_after_ingest"] = memIng; hn["mem_after_build"] = memBuild;
+    hn["index_stats"] = new J { ["graph_nodes"] = stats.GraphNodes, ["max_level"] = stats.MaxLevel, ["index_bytes"] = stats.IndexBytes, ["build_seconds"] = stats.BuildSeconds, ["default_ef_search"] = stats.EfSearch };
+    var pts = new List<J>();
+    int refKnob = -1; double refRecall = 0;
+    var recs = new List<double>();
+    foreach (int ef in new[] { 10, 16, 24, 32, 48, 64, 96, 128, 192, 256, 400, 640 })
+    {
+        hs.AnnEfSearch = ef;
+        var p = Point(hs, truth, false, null); p["knob"] = ef;
+        p["batch_allthreads"] = BatchPoint(hs, truth, false);
+        double rec = (double)p["recall"]!;
+        Console.WriteLine($"  hnsw ef={ef} recall={rec:F4} qps1t={p["qps_1t"]:F0} batch={((J)p["batch_allthreads"]!)["qps"]:F0}");
+        if (refKnob < 0 && rec >= 0.95) { refKnob = ef; refRecall = rec; }
+        pts.Add(p);
+        recs.Add(rec);
+        if (recs.Count > 2 && rec >= 0.9995 && recs[^2] >= 0.9995) break;
+    }
+    if (refKnob < 0) { refKnob = 640; refRecall = (double)pts[^1]["recall"]!; }
+    hn["sweep"] = pts; hn["ref_knob"] = refKnob; hn["ref_recall_pre"] = refRecall; hn["mem_after_sweep"] = Mem();
+    // the automatic ef (what a user who just enables HNSW gets)
+    hs.AnnEfSearch = null;
+    var pd = Point(hs, truth, false, null); pd["knob"] = stats.EfSearch; pd["batch_allthreads"] = BatchPoint(hs, truth, false);
+    hn["default_ef_point"] = pd;
+    Console.WriteLine($"  hnsw default ef={stats.EfSearch} recall={pd["recall"]:F4} qps1t={pd["qps_1t"]:F0}");
+    // concurrent clients (each one query at a time on the shared store)
+    hs.AnnEfSearch = refKnob;
+    hs.ScanThreads = 1;
+    var conc = new List<J>();
+    foreach (int clients in new[] { 8, Math.Min(16, cpus) })
+    {
+        int total = Math.Min(nq, 1000);
+        double tc = Now();
+        var ths = Enumerable.Range(0, clients).Select(w => new Thread(() => { for (int i = w; i < total; i += clients) Search(hs, queries[i], false, null); })).ToList();
+        ths.ForEach(x => x.Start()); ths.ForEach(x => x.Join());
+        conc.Add(new J { ["clients"] = clients, ["qps"] = total / (Now() - tc) });
+    }
+    hs.ScanThreads = 0;
+    hn["concurrent_clients"] = conc;
+    runsOut.Add(hn);
 }
 
 if (exps.Contains("filter"))

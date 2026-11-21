@@ -80,7 +80,7 @@ describe('approximate index: store', () => {
   });
 
   it('validates its arguments', () => {
-    expect(() => new EmbeddingStore(undefined, { ann: 'hnsw' })).toThrow(EmbeddingError);
+    expect(() => new EmbeddingStore(undefined, { ann: 'nope' })).toThrow(EmbeddingError);
     expect(() => new EmbeddingStore(undefined, { annNprobe: 0 })).toThrow(/annNprobe/);
     expect(() => new EmbeddingStore(undefined, { ann: 'ivf', annNlist: 0 })).toThrow(/annNlist/);
     expect(() => new EmbeddingStore(undefined, { ann: 'ivf', annMinSize: -1 })).toThrow(/annMinSize/);

@@ -1,0 +1,12 @@
+  faiss_hnsw text384 100000 knob=10 recall=0.6361 qps1t=12238 med=0.076ms batch=85156
+  faiss_hnsw text384 100000 knob=16 recall=0.7315 qps1t=9504 med=0.096ms batch=56645
+  faiss_hnsw text384 100000 knob=24 recall=0.8014 qps1t=7450 med=0.126ms batch=47227
+  faiss_hnsw text384 100000 knob=32 recall=0.8492 qps1t=6447 med=0.149ms batch=39469
+  faiss_hnsw text384 100000 knob=48 recall=0.9004 qps1t=4663 med=0.207ms batch=27552
+  faiss_hnsw text384 100000 knob=64 recall=0.9279 qps1t=3736 med=0.264ms batch=21444
+  faiss_hnsw text384 100000 knob=96 recall=0.9569 qps1t=2404 med=0.384ms batch=15901
+  faiss_hnsw text384 100000 knob=128 recall=0.9714 qps1t=1955 med=0.518ms batch=11370
+  faiss_hnsw text384 100000 knob=192 recall=0.9842 qps1t=1346 med=0.728ms batch=8027
+  faiss_hnsw text384 100000 knob=256 recall=0.9909 qps1t=1027 med=0.982ms batch=6009
+  faiss_hnsw text384 100000 knob=400 recall=0.9959 qps1t=631 med=1.602ms batch=3943
+  faiss_hnsw text384 100000 knob=640 recall=0.9982 qps1t=385 med=2.652ms batch=2561

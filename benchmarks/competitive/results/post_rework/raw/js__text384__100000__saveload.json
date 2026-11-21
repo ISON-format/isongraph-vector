@@ -1,0 +1,30 @@
+{
+ "status": "ok",
+ "label": "js",
+ "runs": [
+  {
+   "system": "js_exact",
+   "ds": "text384",
+   "n": 100000,
+   "d": 384,
+   "k": 10,
+   "queries": 2000,
+   "all_threads": 32,
+   "version": "isongraph-vector-js (repo HEAD, Node v24.18.0)",
+   "build": {
+    "ingest_s": 0.13508639996871352
+   },
+   "saveload": {
+    "json_error": "Invalid string length",
+    "snap_save_s": 0.3824799000285566,
+    "snap_mb": 148.7626895904541,
+    "snap_load_s": 0.4244431999977678,
+    "snap_first_query_ms": 39.76859990507364
+   }
+  }
+ ],
+ "load_before_pct": 11.793749999999987,
+ "load_contaminated": false,
+ "wall_s": 5.58601188659668,
+ "job_exp": "saveload"
+}
