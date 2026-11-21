@@ -1,5 +1,17 @@
 # Competitive benchmark: ISONGraph Vector against the established vector-search libraries
 
+> **Update, 2026-11-21: superseded by `README_post_rework.md`.** Every ratio
+> on this page predates the rework. A full re-run against the current branch,
+> on one machine in one session (faiss, hnswlib, numpy and all six ports at
+> text384 100k and 1M), found: Rust HNSW is 1.28x faiss HNSW and 1.33x hnswlib
+> single-thread at recall 0.95 (100k; 1.20x / 1.39x at 1M), batch throughput is
+> level (1.05x faiss); C++ HNSW 1.11x / 1.15x; C# HNSW 0.76x / 0.79x; JS/TS HNSW
+> 0.36x with a 4-minute build; Rust exact batch search is 3.1x faiss Flat; Rust
+> and C++ HNSW use within 8% of faiss's memory (C# 1.4-1.85x, JS/TS 2.5x). The
+> IVF indexes are still 0.1-0.3x of the HNSW libraries. The old "faiss Flat
+> batch is ~35x ours" and "Rust exact beats numpy / faiss" lines are both
+> obsolete. hnswlib still builds faster than any ISONGraph port at 100k.
+
 > **Update, 2026-11-16.** Everything below was measured before the Rust engine
 > rework. For Rust, the "no batch or concurrent search" loss, the 2-4x memory
 > loss and the slow first query after writes are addressed; see

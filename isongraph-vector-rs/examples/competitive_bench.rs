@@ -14,7 +14,9 @@
 //! measures recall again; `saveload` times the JSON sidecar; `filter` restricts to a node type
 //! holding a random 10% / 1% of the vectors.
 
-use isongraph_vector_rs::{AnnConfig, EmbeddingStore, NodeId, SimilarityResult};
+use isongraph_vector_rs::{
+    AnnConfig, EmbeddingStore, HnswConfig, NodeId, ScanPrecision, SimilarityResult, SnapshotIdentity,
+};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::fs::File;
@@ -296,6 +298,10 @@ fn knobs(n: usize) -> Vec<usize> {
     v
 }
 
+fn hnsw_knobs() -> Vec<usize> {
+    vec![10, 16, 24, 32, 48, 64, 96, 128, 192, 256, 400, 640]
+}
+
 fn ingest(s: &mut EmbeddingStore, c: &Ctx, n: usize, grp: Option<&[u8]>) -> f64 {
     let mut secs = 0.0;
     let step = 20000;
@@ -430,6 +436,38 @@ fn main() {
         exact["mem_after_sweep"] = mem();
         runs.push(exact);
 
+        // ---- exact, int8 first pass + f32 rerank (default rerank factor) ----
+        if exps.iter().any(|e| e == "int8") {
+            let mem_f32 = mem();
+            let t = Instant::now();
+            store.set_scan_precision(ScanPrecision::int8()).unwrap();
+            let quant_s = t.elapsed().as_secs_f64();
+            let mem_i8 = mem();
+            let mut e8 = json!({
+                "system": format!("{label}_exact_int8"), "ds": ds, "n": n, "d": d, "k": c.k, "queries": nq, "all_threads": cpus,
+                "version": "isongraph-vector-rs (repo HEAD, cargo release)",
+                "build": {"ingest_s": ingest_s, "index_s": quant_s, "total_s": ingest_s + quant_s, "first_query_ms": first_ms, "ready_s": ingest_s + quant_s + first_ms / 1000.0},
+                "mem_baseline": mem_base, "mem_after_ingest": mem_after_ingest, "mem_after_build": mem_i8, "mem_after_first_query": mem_i8,
+                "mem_f32_scan_only": mem_f32, "quant_bytes_mb": store.quant_bytes() as f64 / 1048576.0,
+            });
+            store.set_scan_threads(1);
+            let mut q1 = pinned(|| point(&store, &c, &truth, Path::Exact, None, budget));
+            q1["knob"] = Value::Null;
+            store.set_scan_threads(0);
+            let qa = point(&store, &c, &truth, Path::Exact, None, budget);
+            println!(
+                "  exact int8 1T recall={} qps={:.1} auto qps={:.1}",
+                q1["recall"], q1["qps_1t"].as_f64().unwrap(), qa["qps_1t"].as_f64().unwrap()
+            );
+            e8["sweep"] = json!([q1]);
+            e8["loop_allthreads"] = json!({"nq": qa["nq"], "threads": "auto", "qps": qa["qps_1t"], "median_ms": qa["median_ms"], "p95_ms": qa["p95_ms"], "p99_ms": qa["p99_ms"], "mean_ms": qa["mean_ms"], "qps_runs": qa["qps_1t_runs"]});
+            e8["batch_allthreads"] = batch_point(&store, &c, &truth, Path::Exact);
+            println!("  exact int8 batch qps={:.1}", e8["batch_allthreads"]["qps"].as_f64().unwrap());
+            e8["mem_after_sweep"] = mem();
+            runs.push(e8);
+            store.set_scan_precision(ScanPrecision::F32).unwrap();
+        }
+
         // ---- ivf ----
         store.set_scan_threads(0);
         store
@@ -561,6 +599,21 @@ fn main() {
                     sl["save_s"] = json!(t.elapsed().as_secs_f64());
                     sl["disk_mb"] =
                         json!(std::fs::metadata(&path).unwrap().len() as f64 / 1048576.0);
+                    // the binary snapshot of the same store (spec section 11.2)
+                    let snap = format!("{dir}/../../work/rust_{ds}_{n}.snap");
+                    let t = Instant::now();
+                    match store.save_snapshot(&snap, &SnapshotIdentity::default()) {
+                        Ok(_) => {
+                            sl["snap_save_s"] = json!(t.elapsed().as_secs_f64());
+                            sl["snap_mb"] = json!(std::fs::metadata(&snap).unwrap().len() as f64 / 1048576.0);
+                            let mut s3 = EmbeddingStore::new(None);
+                            let t = Instant::now();
+                            s3.load_snapshot(&snap).unwrap();
+                            sl["snap_load_s"] = json!(t.elapsed().as_secs_f64());
+                            let _ = std::fs::remove_file(&snap);
+                        }
+                        Err(e) => sl["snap_error"] = json!(format!("{e:?}")),
+                    }
                     drop(store);
                     let mut s2 = EmbeddingStore::new(None);
                     let t = Instant::now();
@@ -588,6 +641,98 @@ fn main() {
             ivf["saveload"] = sl;
         }
         runs.push(ivf);
+    }
+
+    // ---- HNSW (AnnConfig::hnsw): its own store, so the memory figure holds only the vectors and the graph ----
+    if exps.iter().any(|e| e == "hnsw") {
+        let mut store = EmbeddingStore::new(None);
+        let ingest_s = ingest(&mut store, &c, n, None);
+        let mem_after_ingest = mem();
+        println!("  hnsw: ingest {:.2}s", ingest_s);
+        let truth = c.gt("");
+        store.set_scan_threads(0);
+        store
+            .set_ann(Some(AnnConfig {
+                min_size: 0,
+                hnsw: HnswConfig { m: 16, ef_construction: 200, ef_search: None },
+                ..AnnConfig::hnsw()
+            }))
+            .unwrap();
+        let t = Instant::now();
+        let stats = store.build_ann_index(false).unwrap();
+        let idx_s = t.elapsed().as_secs_f64();
+        let mem_after_build = mem();
+        println!("  hnsw build {:.2}s graph_nodes={} max_level={:?} index_bytes={}", idx_s, stats.graph_nodes, stats.max_level, stats.index_bytes);
+        let mut hn = json!({
+            "system": format!("{label}_hnsw"), "ds": ds, "n": n, "d": d, "k": c.k, "queries": nq, "all_threads": cpus,
+            "version": "isongraph-vector-rs (repo HEAD, cargo release), AnnConfig::hnsw M=16 efConstruction=200", "knob_name": "ef_search",
+            "build": {"ingest_s": ingest_s, "index_s": idx_s, "total_s": ingest_s + idx_s, "first_query_ms": 0.0, "ready_s": ingest_s + idx_s},
+            "mem_baseline": mem_base, "mem_after_ingest": mem_after_ingest, "mem_after_build": mem_after_build,
+            "index_stats": {"graph_nodes": stats.graph_nodes, "max_level": stats.max_level, "index_bytes": stats.index_bytes, "build_seconds": stats.build_seconds, "default_ef_search": stats.ef_search},
+        });
+        let mut pts: Vec<Value> = Vec::new();
+        let mut ref_knob: Option<usize> = None;
+        let mut ref_recall = Value::Null;
+        for kn in hnsw_knobs() {
+            store.set_ann_ef_search(Some(kn)).unwrap();
+            store.set_scan_threads(1);
+            let mut p = pinned(|| point(&store, &c, &truth, Path::Ann, None, budget));
+            store.set_scan_threads(0);
+            p["knob"] = json!(kn);
+            p["batch_allthreads"] = batch_point(&store, &c, &truth, Path::Ann);
+            println!(
+                "  hnsw ef={kn} recall={:.4} qps1t={:.0} median={:.3}ms batch_qps={:.0}",
+                p["recall"].as_f64().unwrap(), p["qps_1t"].as_f64().unwrap(), p["median_ms"].as_f64().unwrap(), p["batch_allthreads"]["qps"].as_f64().unwrap()
+            );
+            let rec = p["recall"].as_f64().unwrap();
+            if ref_knob.is_none() && rec >= 0.95 {
+                ref_knob = Some(kn);
+                ref_recall = p["recall"].clone();
+            }
+            pts.push(p);
+            if rec >= 0.9995 && pts.len() > 2 && pts[pts.len() - 2]["recall"].as_f64().unwrap() >= 0.9995 {
+                break;
+            }
+        }
+        if ref_knob.is_none() {
+            ref_knob = hnsw_knobs().last().cloned();
+        }
+        hn["sweep"] = json!(pts);
+        hn["ref_knob"] = json!(ref_knob);
+        hn["ref_recall_pre"] = ref_recall;
+        hn["mem_after_sweep"] = mem();
+        // the library's automatic ef_search (no knob given): what a user who just sets ann=hnsw gets
+        store.set_ann_ef_search(None).unwrap();
+        store.set_scan_threads(1);
+        let mut pd = pinned(|| point(&store, &c, &truth, Path::Ann, None, budget));
+        pd["knob"] = json!(stats.ef_search);
+        store.set_scan_threads(0);
+        pd["batch_allthreads"] = batch_point(&store, &c, &truth, Path::Ann);
+        println!("  hnsw default ef={:?} recall={:.4} qps1t={:.0}", stats.ef_search, pd["recall"].as_f64().unwrap(), pd["qps_1t"].as_f64().unwrap());
+        hn["default_ef_point"] = pd;
+        // concurrent clients on the shared store (each one query at a time; the store is thread-safe for reads)
+        if let Some(rk) = ref_knob {
+            store.set_ann_ef_search(Some(rk)).unwrap();
+            store.set_scan_threads(1);
+            let mut conc = Vec::new();
+            for clients in [8usize, 16.min(cpus)] {
+                let qs = &c.queries[..c.queries.len().min(1000)];
+                let t = Instant::now();
+                std::thread::scope(|sc| {
+                    for w in 0..clients {
+                        let st = &store;
+                        sc.spawn(move || {
+                            for q in qs.iter().skip(w).step_by(clients) {
+                                st.similarity_search_vector(q, 10, None, 0.0).unwrap();
+                            }
+                        });
+                    }
+                });
+                conc.push(json!({"clients": clients, "qps": qs.len() as f64 / t.elapsed().as_secs_f64()}));
+            }
+            hn["concurrent_clients"] = json!(conc);
+        }
+        runs.push(hn);
     }
 
     if exps.iter().any(|e| e == "filter") {

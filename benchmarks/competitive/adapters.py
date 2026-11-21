@@ -245,6 +245,22 @@ class IsonPy(Base):
         self._new()
         self.s.load_embeddings(path)
 
+    def save_alt(self, path):
+        """binary snapshot (the Stage D opt-in persistence)"""
+        self.s.save_snapshot(path)
+
+    def load_alt(self, path):
+        self.s.close()
+        self._new()
+        self.s.load_snapshot(path, int_ids=lambda ty, ident: True)
+
+    def searchN(self, Q, k):
+        # numpy batch search (one matrix-matrix product per group of queries); only the exact scan has a batch path
+        if self.ann:
+            return None
+        res = self.s.similarity_search_batch([q for q in Q], top_k=k)
+        return np.array([[r.node_ref[1] for r in row] for row in res], dtype=np.int64)
+
     def close(self):
         self.s.close()
 

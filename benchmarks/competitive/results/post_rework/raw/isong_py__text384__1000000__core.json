@@ -1,0 +1,91 @@
+{
+ "system": "isong_py",
+ "ds": "text384",
+ "n": 1000000,
+ "d": 384,
+ "k": 10,
+ "queries": 2000,
+ "all_threads": 32,
+ "exps": [
+  "core"
+ ],
+ "started": "2026-11-20 23:25:24",
+ "mem_baseline": {
+  "rss_mb": 37.40234375,
+  "peak_mb": 37.40234375
+ },
+ "version": "isongraph-vector (python, repo HEAD)",
+ "build": {
+  "ingest_s": 59.920837799902074,
+  "index_s": 4.100031219422817e-06,
+  "total_s": 59.92084189993329,
+  "first_query_ms": 231.19910003151745,
+  "ready_s": 60.15204099996481
+ },
+ "mem_after_build": {
+  "rss_mb": 1925.734375,
+  "peak_mb": 3359.76171875
+ },
+ "mem_after_first_query": {
+  "rss_mb": 1925.99609375,
+  "peak_mb": 3359.76171875
+ },
+ "sweep": [
+  {
+   "nq": 34,
+   "recall_queries": 34,
+   "recall": 1.0,
+   "qps_1t_runs": [
+    11.183900394314145,
+    11.073877911900754,
+    10.622775192351988
+   ],
+   "qps_1t": 11.073877911900754,
+   "qps_1t_min": 10.622775192351988,
+   "qps_1t_max": 11.183900394314145,
+   "median_ms": 91.4667000179179,
+   "p95_ms": 100.74632994364946,
+   "p99_ms": 106.37469796929506,
+   "mean_ms": 91.28473529035189,
+   "knob": null,
+   "batch": {
+    "recall": 1.0,
+    "qps_batch_runs": [
+     46.871359706543814,
+     51.130949101197956,
+     49.11879385703292
+    ],
+    "qps_batch": 49.11879385703292,
+    "qps_batch_min": 46.871359706543814,
+    "qps_batch_max": 51.130949101197956,
+    "threads": 32
+   }
+  }
+ ],
+ "knob_name": null,
+ "loop_allthreads": {
+  "nq": 61,
+  "threads": 32,
+  "qps": 20.930372920432713,
+  "median_ms": 47.93679993599653,
+  "p95_ms": 54.70871006837115,
+  "p99_ms": 60.828527985140695,
+  "mean_ms": 48.64199890925605
+ },
+ "mem_after_sweep": {
+  "rss_mb": 1944.03125,
+  "peak_mb": 3359.76171875
+ },
+ "ref_knob": null,
+ "ref_recall_pre": 1.0,
+ "mem_end": {
+  "rss_mb": 1941.09765625,
+  "peak_mb": 3359.76171875
+ },
+ "status": "ok",
+ "finished": "2026-11-20 23:28:52",
+ "load_before_pct": 11.92812499999999,
+ "load_contaminated": false,
+ "wall_s": 208.65670323371887,
+ "job_exp": "core"
+}

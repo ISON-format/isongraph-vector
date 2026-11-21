@@ -1,0 +1,1 @@
+  isong_py text384 100000 knob=None recall=0.9999 qps1t=106 med=9.349ms batch=623

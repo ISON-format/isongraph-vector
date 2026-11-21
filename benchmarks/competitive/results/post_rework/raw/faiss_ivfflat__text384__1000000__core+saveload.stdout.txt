@@ -1,0 +1,10 @@
+  faiss_ivfflat text384 1000000 knob=1 recall=0.2711 qps1t=3836 med=0.269ms batch=22825
+  faiss_ivfflat text384 1000000 knob=2 recall=0.3827 qps1t=3334 med=0.300ms batch=17598
+  faiss_ivfflat text384 1000000 knob=4 recall=0.4944 qps1t=2722 med=0.368ms batch=12810
+  faiss_ivfflat text384 1000000 knob=8 recall=0.6087 qps1t=1911 med=0.515ms batch=8267
+  faiss_ivfflat text384 1000000 knob=16 recall=0.7099 qps1t=1303 med=0.763ms batch=5366
+  faiss_ivfflat text384 1000000 knob=32 recall=0.7952 qps1t=813 med=1.218ms batch=3036
+  faiss_ivfflat text384 1000000 knob=64 recall=0.8629 qps1t=471 med=2.117ms batch=1605
+  faiss_ivfflat text384 1000000 knob=128 recall=0.9183 qps1t=251 med=3.904ms batch=835
+  faiss_ivfflat text384 1000000 knob=256 recall=0.9561 qps1t=139 med=7.059ms batch=404
+  faiss_ivfflat text384 1000000 knob=4000 recall=1.0000 qps1t=10 med=103.298ms batch=30

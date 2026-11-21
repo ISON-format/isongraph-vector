@@ -1,5 +1,17 @@
 # Competitive benchmark: ISONGraph Vector against the established vector-search libraries
 
+> **Update, 2026-11-21: superseded by `README_post_rework.md`.** Every ratio
+> on this page predates the rework. A full re-run against the current branch,
+> on one machine in one session (faiss, hnswlib, numpy and all six ports at
+> text384 100k and 1M), found: Rust HNSW is 1.28x faiss HNSW and 1.33x hnswlib
+> single-thread at recall 0.95 (100k; 1.20x / 1.39x at 1M), batch throughput is
+> level (1.05x faiss); C++ HNSW 1.11x / 1.15x; C# HNSW 0.76x / 0.79x; JS/TS HNSW
+> 0.36x with a 4-minute build; Rust exact batch search is 3.1x faiss Flat; Rust
+> and C++ HNSW use within 8% of faiss's memory (C# 1.4-1.85x, JS/TS 2.5x). The
+> IVF indexes are still 0.1-0.3x of the HNSW libraries. The old "faiss Flat
+> batch is ~35x ours" and "Rust exact beats numpy / faiss" lines are both
+> obsolete. hnswlib still builds faster than any ISONGraph port at 100k.
+
 **One-paragraph answer.** On this machine, with identical vectors and an exact float64 ground truth, ISONGraph Vector is **not** the fastest vector search and the evidence does **not** support calling it the "best vector store". Its approximate index is a plain IVF-flat. At equal recall@10 its IVF is 1.4-2.3x slower than faiss IVFFlat at the same nlist and **1.9x (GloVe 100k) to 4.3x (text 100k) and 14-15x (text 1M) slower than the HNSW libraries** (hnswlib, faiss HNSW) in single-thread QPS; it has no batch or concurrent-query path, so its all-core throughput is 10-50x below faiss/hnswlib; and its only persistence is a JSON file (15-120x slower to save and load than faiss/hnswlib index files, 3-5x larger on disk). What it does well: the Rust exact scan is the fastest single-thread exact scan measured (6-33% ahead of numpy and faiss `IndexFlatIP` at 100k and 1M on text and GloVe, equal within noise at 10k); index build is 8-25x faster than HNSW builds at 100k-1M; the IVF index is maintained incrementally through insert/update/delete (faiss HNSW cannot update or delete; hnswlib/usearch can); and a node-type filter on a 1% subset is among the fastest filtered searches measured (see the filter table). Losses are listed as plainly as wins below.
 
 Everything here was measured on one laptop (i9-14900HX, 24 cores / 32 threads, 47.7 GB, Windows 11), see `results/environment.json`. Nothing in the libraries was changed. All numbers are in `results/raw/*.json`; the tables are generated from those files by `report.py`.

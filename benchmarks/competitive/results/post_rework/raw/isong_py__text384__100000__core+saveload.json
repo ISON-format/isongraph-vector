@@ -1,0 +1,107 @@
+{
+ "system": "isong_py",
+ "ds": "text384",
+ "n": 100000,
+ "d": 384,
+ "k": 10,
+ "queries": 2000,
+ "all_threads": 32,
+ "exps": [
+  "core",
+  "saveload"
+ ],
+ "started": "2026-11-20 22:22:42",
+ "mem_baseline": {
+  "rss_mb": 37.35546875,
+  "peak_mb": 37.35546875
+ },
+ "version": "isongraph-vector (python, repo HEAD)",
+ "build": {
+  "ingest_s": 2.0457879001041874,
+  "index_s": 2.500019036233425e-06,
+  "total_s": 2.0457904001232237,
+  "first_query_ms": 8.789399988017976,
+  "ready_s": 2.0545798001112416,
+  "total_s_runs": [
+   2.0457904001232237,
+   6.0143657001899555,
+   5.822596099926159
+  ]
+ },
+ "mem_after_build": {
+  "rss_mb": 236.78125,
+  "peak_mb": 633.03125
+ },
+ "mem_after_first_query": {
+  "rss_mb": 236.3515625,
+  "peak_mb": 633.03125
+ },
+ "sweep": [
+  {
+   "nq": 383,
+   "recall_queries": 1000,
+   "recall": 0.9999,
+   "qps_1t_runs": [
+    104.67517883885007,
+    105.8525019280944,
+    111.02134068357759
+   ],
+   "qps_1t": 105.8525019280944,
+   "qps_1t_min": 104.67517883885007,
+   "qps_1t_max": 111.02134068357759,
+   "median_ms": 9.349499945528805,
+   "p95_ms": 10.65088000614196,
+   "p99_ms": 11.352403941564262,
+   "mean_ms": 9.33591610070373,
+   "knob": null,
+   "batch": {
+    "recall": 0.99995,
+    "qps_batch_runs": [
+     623.0691670590671,
+     643.1395293409946,
+     573.8701758752097
+    ],
+    "qps_batch": 623.0691670590671,
+    "qps_batch_min": 573.8701758752097,
+    "qps_batch_max": 643.1395293409946,
+    "threads": 32
+   }
+  }
+ ],
+ "knob_name": null,
+ "loop_allthreads": {
+  "nq": 514,
+  "threads": 32,
+  "qps": 184.71616085751077,
+  "median_ms": 5.264399980660528,
+  "p95_ms": 6.537074956577269,
+  "p99_ms": 7.4932259926572415,
+  "mean_ms": 5.375537483263809
+ },
+ "mem_after_sweep": {
+  "rss_mb": 250.1953125,
+  "peak_mb": 633.03125
+ },
+ "ref_knob": null,
+ "ref_recall_pre": 0.9999,
+ "saveload": {
+  "save_s": 41.14071259996854,
+  "disk_mb": 807.4873752593994,
+  "snap_save_s": 1.607141499989666,
+  "snap_mb": 148.7626895904541,
+  "load_s": 27.557694499962963,
+  "first_query_after_load_ms": 23.441500030457973,
+  "time_to_ready_s": 27.58113599999342,
+  "snap_load_s": 1.01677650003694
+ },
+ "mem_end": {
+  "rss_mb": 244.3359375,
+  "peak_mb": 3355.609375
+ },
+ "status": "ok",
+ "finished": "2026-11-20 22:24:43",
+ "load_before_pct": 11.893749999999988,
+ "load_contaminated": false,
+ "wall_s": 121.02155113220215,
+ "job_exp": "core,saveload"
+}

@@ -1,0 +1,1 @@
+  faiss_flat text384 1000000 knob=None recall=1.0000 qps1t=11 med=94.094ms batch=199
