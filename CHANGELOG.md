@@ -256,6 +256,19 @@ JavaScript, Rust and C++.
   more), insert about 1.7 ms, whole store 1.23x (JS) / 1.30x (TS) raw. Only
   Node 24 was run; Node 20/22 and browsers are unverified. **Breaking:**
   `AnnMode` is now `'ivf' | 'hnsw'`; `ann: 'hnsw'` used to throw.
+- **Competitive benchmark re-run** (`benchmarks/competitive/README_post_rework.md`,
+  raw JSON in `results/post_rework/raw/`): faiss, hnswlib, numpy and every port on
+  the same machine, text-384 at 100k and 1M. QPS at recall 0.95, one thread,
+  100k: Rust HNSW 3,416, C++ 2,969 (4,004 with `/arch:AVX2`), C# 2,026, JS/TS
+  about 967, against faiss HNSW 2,671 and hnswlib 2,575; at 1M Rust 1,446, C++
+  1,308, C# 926 against 1,207 and 1,040. Rust exact batch is 3.1x faiss Flat
+  (5,454 vs 1,775 QPS) and 7.6x numpy. Not run: mutation, filters, GloVe, SIFT,
+  usearch/chromadb/lancedb. The run also recorded things the library still
+  does not do well: IVF index builds measured 2-3x slower than in the
+  pre-rework run in every native port (Rust 0.48 s to 1.42 s at 100k, not
+  machine drift; cause not yet found), Python ingest at 1M is 3.1x slower than
+  before (59.9 s vs 19.6 s), and the TypeScript/JavaScript JSON sidecar cannot be
+  written at 100k x 384 (`Invalid string length`; the snapshot works).
 - **Python: HNSW evaluated and not offered.** A pure-Python port of the same
   index (faithful: top-k ids match Rust in 6 of 6 sets) was only 1.6-1.7x faster
   than the Python IVF at equal recall on real text 100k (4-8x in the compiled
@@ -342,11 +355,18 @@ JavaScript, Rust and C++.
   measured at 100k and 1M (`benchmarks/competitive/`); the index is not
   persisted and is rebuilt after load. JavaScript builds are slow (about 8
   minutes at 1M vectors).
-- **Not a vector-database replacement.** Against faiss, hnswlib and usearch
-  the ports are 2-4x slower per query at 100k and about 14x slower at 1M text
-  vectors at equal recall; only Rust, C# and C++ have concurrent search and Python has batch search (TypeScript and JavaScript are single-threaded); the ANN index is
-  never persisted and the binary snapshot is opt-in (JSON is the portable default); and memory is 1.12-1.25x raw at 1M in the four ports measured, against 1.6-1.9 GB for faiss / hnswlib at 1M x 384 (re-run `benchmarks/competitive/` before quoting the
-  ratios: they predate the rework). Graph-aware retrieval
+- **Not a vector-database replacement.** Re-measured after the rework
+  (`benchmarks/competitive/README_post_rework.md`, real text-384, one machine,
+  one session): with HNSW, Rust is 1.2-1.3x faiss HNSW and 1.3-1.4x hnswlib per
+  thread at recall 0.95 (100k and 1M), C++ 1.1x, C# 0.76-0.77x, JS/TS 0.36x
+  (and a 4-minute build at 100k); the IVF indexes are 0.1-0.3x of the HNSW
+  libraries. hnswlib still builds faster than every port at 100k, the ANN index
+  is never persisted (faiss and hnswlib reload theirs in under a second, ours is
+  rebuilt), the binary snapshot is opt-in (JSON is the portable default), only
+  Rust, C# and C++ have concurrent search, Python has batch search (TypeScript
+  and JavaScript are single-threaded). Memory: Rust and C++ HNSW within 8% of
+  faiss / hnswlib at 1M x 384 (1.65-1.8 GB), C# 1.4-1.85x, JS/TS 2.5x. Other
+  stores in the old table (usearch, chromadb, lancedb, ...) were not re-run. Graph-aware retrieval
   beating plain vector search on multi-hop questions is the supported claim,
   and it depends on the graph carrying real structure
   (`benchmarks/multihop/README.md`).

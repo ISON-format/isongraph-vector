@@ -20,7 +20,9 @@ What is deliberately not done yet, in rough priority order. Items marked
    C# HNSW (1.6x slower to build than Rust) and a NEON one for C++ (needs ARM
    hardware to verify); HNSW at 1M for TS/JS (build extrapolates to 30+ min);
    persist the ANN index; faster HNSW single-call inserts (1.4k/s at 1M); exact scan is at
-   parity with faiss Flat, not ahead.
+   parity with faiss Flat, not ahead (but batch is 3x). Found by the post-rework re-run
+   and open: IVF builds 2-3x slower than before in every native port, Python ingest
+   superlinear at 1M, JS/TS JSON sidecar fails at 100k x 384.
 5. **Fix the slow ports.** The C++, C# and JS exact scans are scalar and still
    slower than numpy; JavaScript k-means takes about 8 minutes at 1M.
 6. **Per-record encoder version.** Today a version-only change warns on
