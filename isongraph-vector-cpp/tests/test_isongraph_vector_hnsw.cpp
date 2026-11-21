@@ -332,6 +332,99 @@ TEST(hnsw_four_row_scorer_equals_the_canonical_scorer_bit_for_bit) {
     }
 }
 
+/** `slots` scored through the graph's scorer against what cosineRows says for each, bit for bit. */
+static void expectScorerMatchesCanonical(const detail::HnswRows& rows, const Vec& q, const std::vector<uint32_t>& slots) {
+    std::vector<float> got(slots.size());
+    detail::hnswScore(rows, q.data(), detail::hnswRowNorm(q.data(), q.size()), slots.data(), slots.size(), got.data());
+    for (size_t i = 0; i < slots.size(); ++i) {
+        float want = detail::cosineRows(q.data(), rows.row(slots[i]), rows.dim);
+        if (std::isnan(want)) want = -std::numeric_limits<float>::infinity();   // the scorer ranks NaN last
+        ASSERT_EQ(floatBits(got[i]), floatBits(want));
+    }
+}
+
+TEST(hnsw_graph_scorer_equals_the_canonical_scorer_bit_for_bit) {
+    // Every batch size (1 row, a partial group, whole groups, a repeated slot), every row
+    // width around the SIMD step, and the rows that make scores awkward: zero, -0.0,
+    // tiny, huge, non-finite.
+    std::mt19937_64 rng(11);
+    std::normal_distribution<float> normal;
+    for (size_t dim : {1u, 2u, 3u, 4u, 5u, 7u, 8u, 9u, 15u, 16u, 17u, 31u, 33u, 100u, 384u}) {
+        const size_t count = 40;
+        std::vector<Vec> data(count, Vec(dim));
+        for (size_t r = 0; r < count; ++r) {
+            for (auto& x : data[r]) x = normal(rng) * (r % 5 == 0 ? 1e-3f : (r % 7 == 0 ? 1e3f : 1.0f));
+        }
+        std::fill(data[3].begin(), data[3].end(), 0.0f);
+        data[4][0] = -0.0f;
+        data[9][dim - 1] = std::numeric_limits<float>::quiet_NaN();
+        data[10][0] = std::numeric_limits<float>::infinity();
+        RawTable table(data, dim);
+        std::vector<float> norms(count);
+        for (size_t r = 0; r < count; ++r) norms[r] = detail::hnswRowNorm(table.matrix.row(r), dim);
+        detail::HnswRows rows = table.rows();
+        rows.norms = norms.data();
+        for (int trial = 0; trial < 6; ++trial) {
+            Vec q(dim);
+            for (auto& x : q) x = normal(rng);
+            if (trial == 4) std::fill(q.begin(), q.end(), 0.0f);
+            for (size_t n = 1; n <= 20; ++n) {
+                std::vector<uint32_t> slots(n);
+                for (auto& s : slots) s = static_cast<uint32_t>(rng() % count);
+                expectScorerMatchesCanonical(rows, q, slots);
+            }
+        }
+    }
+}
+
+TEST(hnsw_cached_norms_follow_updates_and_compaction) {
+    // The graph keeps each row's norm; the scores it navigates by must stay exactly what
+    // cosineRows gives for the row as it is NOW (an overwritten or moved row, in
+    // particular, must not keep its old norm).
+    Clustered gen(8, 24, 77);
+    auto data = gen.many(3000);
+    RawTable table(data, 24);
+    detail::HnswIndex graph = table.build(0);
+    auto checkHits = [&](const detail::HnswIndex& g, const detail::HnswRows& rows) {
+        for (const auto& q : gen.many(20)) {
+            detail::HnswFound found;
+            g.search(rows, q.data(), detail::IvfIndex::kAnyCode, -std::numeric_limits<float>::infinity(), 64,
+                     std::numeric_limits<size_t>::max(), found);
+            ASSERT_FALSE(found.hits.empty());
+            for (const auto& hit : found.hits) {
+                ASSERT_EQ(floatBits(hit.score), floatBits(detail::cosineRows(q.data(), rows.row(hit.slot), 24)));
+            }
+        }
+    };
+    checkHits(graph, table.rows());
+
+    // overwrite 200 rows with different vectors and link them again
+    const auto moved = gen.many(200);
+    for (uint32_t i = 0; i < 200; ++i) {
+        const uint32_t slot = i * 7;
+        table.matrix.set(slot, moved[i].data());
+        graph.notePut(table.rows(), slot);
+    }
+    checkHits(graph, table.rows());
+
+    // tombstone every fourth row, squeeze the table as the store does, renumber the graph
+    std::vector<uint32_t> remap(3000, detail::kHnswNone);
+    size_t kept = 0;
+    for (uint32_t i = 0; i < 3000; ++i) {
+        if (i % 4 == 1 && i != graph.entry()) table.alive[i] = 0;
+        if (table.alive[i]) remap[i] = static_cast<uint32_t>(kept++);
+    }
+    for (uint32_t i = 0; i < 3000; ++i) {
+        if (remap[i] != detail::kHnswNone && remap[i] != i) table.matrix.moveRow(i, remap[i]);
+    }
+    table.matrix.truncate(kept);
+    table.alive.assign(kept, 1);
+    table.codes.assign(kept, 0);
+    graph.compact(remap, kept);
+    ASSERT_EQ(graph.check(table.rows(), kept), std::string());
+    checkHits(graph, table.rows());
+}
+
 TEST(hnsw_recall_on_clustered_and_random_data) {
     // clustered: the shape of real embeddings
     {

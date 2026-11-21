@@ -9,9 +9,11 @@
  *
  * Like IvfIndex it knows nothing about node references or the store. It holds
  * slot numbers and links ONLY: every score is computed from the store's one
- * ChunkedMatrix with detail::cosineRows / detail::cosineRows4 (the same
- * ascending single-precision sums as the exact scan), so a hit's score is
- * bit-identical to the exact scan's, and ties order by slot as everywhere else.
+ * ChunkedMatrix by hnswScore, which returns exactly the float
+ * detail::cosineRows would (the same ascending single-precision sums as the
+ * exact scan: only the schedule differs, several rows per SIMD pass and the
+ * row norms cached instead of re-summed), so a hit's score is bit-identical to
+ * the exact scan's, and ties order by slot as everywhere else.
  *
  * Layout per table slot (DESIGN.md 12.2):
  *   levels_[slot]   u8, 255 = not in the graph
@@ -19,6 +21,8 @@
  *                   node, in chunks of kChunkRows nodes so growth never copies
  *   upperAt_[slot]  u32 offset into upper_, which holds, for a node of level L,
  *                   L consecutive blocks of m+1 u32 for layers 1..L
+ *   norms_[slot]    the row's Euclidean norm, summed exactly as cosineRows sums it
+ *                   (so a cached norm and a recomputed one are the same float)
  *   entry_, top_    the entry slot and its level
  *
  * Determinism: a build inserts in slot order in batches of size/16 (1 at the
@@ -96,12 +100,20 @@ struct HnswRows {
     const uint8_t* alive = nullptr;
     const uint32_t* codes = nullptr;
     size_t dim = 0;
+    /** Per-slot row norms; the index fills this in itself (callers leave it null). */
+    const float* norms = nullptr;
 
     const float* row(uint32_t slot) const { return matrix->row(slot); }
 };
 
-/** Euclidean norm of a row (the finiteness test of DESIGN.md 12.4). */
-inline float hnswRowNorm(const float* v, size_t n) {
+/**
+ * Euclidean norm of a row (the finiteness test of DESIGN.md 12.4, and the
+ * cached norm of the scorers below). The same strict single-precision
+ * ascending sum as the norm inside cosineRows, so the two are the same float;
+ * out of line for the same reason cosineRows is (see there).
+ */
+ISONGRAPH_VECTOR_NOINLINE inline float hnswRowNorm(const float* v, size_t n) {
+    ISONGRAPH_VECTOR_STRICT_FP
     float s = 0.0f;
     for (size_t i = 0; i < n; ++i) s += v[i] * v[i];
     return std::sqrt(s);
@@ -109,27 +121,138 @@ inline float hnswRowNorm(const float* v, size_t n) {
 
 inline bool hnswHitWorse(const IvfHit& a, const IvfHit& b) { return hitBefore(b, a); }
 
+// The lane kernel below needs SSE2 (every x86-64 compiler enables it) and the
+// <emmintrin.h> that isongraph_vector_ivf.hpp already included for it.
+#if defined(ISONGRAPH_VECTOR_SIMD_AVX2) || defined(ISONGRAPH_VECTOR_SIMD_SSE2)
+#define ISONGRAPH_VECTOR_HNSW_LANES 1
+#endif
+
+/** cos = dot / (|q| * |r|), or 0 when either norm is 0: the closing step of cosineRows. */
+inline float hnswCosine(float dot, float qNorm, float rowNorm) {
+    return (qNorm == 0.0f || rowNorm == 0.0f) ? 0.0f : dot / (qNorm * rowNorm);
+}
+
+#if defined(ISONGRAPH_VECTOR_HNSW_LANES)
+
 /**
- * Cosine of the query with each of slots[0..n), through the canonical scorers
- * (four rows per pass, then one). A NaN score (a row that cannot be compared)
- * ranks last as -infinity.
+ * The dot products of q with 4 * G rows, one row per SIMD lane. Every lane runs
+ * the very sequence cosineRows runs for its row - acc = acc + q[i] * r[i], i
+ * ascending, a separate multiply and add, no fused multiply-add - so each
+ * lane's sum is bit for bit cosineRows's dot; the lanes just advance together.
+ * (The alternative, several elements of one row per lane, would change the
+ * order of the sum; this does not.) The rows are loaded four elements at a
+ * time and transposed in registers, so the matrix keeps its row-major layout.
+ * Out of line and contraction-free for the reason cosineRows is.
  */
-inline void hnswScore(const HnswRows& rows, const float* q, const uint32_t* slots, size_t n,
-                      float* out) {
+template <int G>
+ISONGRAPH_VECTOR_NOINLINE inline void hnswDotsLanes(const float* q, const float* const* rows, size_t n,
+                                                    float* dots /* [4 * G] */) {
+    ISONGRAPH_VECTOR_STRICT_FP
+    __m128 acc[G];
+    for (int g = 0; g < G; ++g) acc[g] = _mm_setzero_ps();
     size_t i = 0;
     for (; i + 4 <= n; i += 4) {
-        cosineRows4(q, rows.row(slots[i]), rows.row(slots[i + 1]), rows.row(slots[i + 2]),
-                    rows.row(slots[i + 3]), rows.dim, out + i);
+        const __m128 b0 = _mm_set1_ps(q[i]);
+        const __m128 b1 = _mm_set1_ps(q[i + 1]);
+        const __m128 b2 = _mm_set1_ps(q[i + 2]);
+        const __m128 b3 = _mm_set1_ps(q[i + 3]);
+        for (int g = 0; g < G; ++g) {
+            const __m128 a = _mm_loadu_ps(rows[4 * g] + i);
+            const __m128 b = _mm_loadu_ps(rows[4 * g + 1] + i);
+            const __m128 c = _mm_loadu_ps(rows[4 * g + 2] + i);
+            const __m128 d = _mm_loadu_ps(rows[4 * g + 3] + i);
+            const __m128 t0 = _mm_unpacklo_ps(a, b);
+            const __m128 t1 = _mm_unpacklo_ps(c, d);
+            const __m128 t2 = _mm_unpackhi_ps(a, b);
+            const __m128 t3 = _mm_unpackhi_ps(c, d);
+            __m128 s = acc[g];
+            s = _mm_add_ps(s, _mm_mul_ps(b0, _mm_movelh_ps(t0, t1)));   // element i of the four rows
+            s = _mm_add_ps(s, _mm_mul_ps(b1, _mm_movehl_ps(t1, t0)));   // i + 1
+            s = _mm_add_ps(s, _mm_mul_ps(b2, _mm_movelh_ps(t2, t3)));   // i + 2
+            s = _mm_add_ps(s, _mm_mul_ps(b3, _mm_movehl_ps(t3, t2)));   // i + 3
+            acc[g] = s;
+        }
     }
-    for (; i < n; ++i) out[i] = cosineRows(q, rows.row(slots[i]), rows.dim);
+    for (; i < n; ++i) {
+        const __m128 b = _mm_set1_ps(q[i]);
+        for (int g = 0; g < G; ++g) {
+            const __m128 c = _mm_setr_ps(rows[4 * g][i], rows[4 * g + 1][i], rows[4 * g + 2][i], rows[4 * g + 3][i]);
+            acc[g] = _mm_add_ps(acc[g], _mm_mul_ps(b, c));
+        }
+    }
+    for (int g = 0; g < G; ++g) _mm_storeu_ps(dots + 4 * g, acc[g]);
+}
+
+#else
+
+/** The dot products of q with four rows: the scalar form of the above (cosineRows4 without the norm sums). */
+ISONGRAPH_VECTOR_NOINLINE inline void hnswDots4(const float* q, const float* r0, const float* r1,
+                                                const float* r2, const float* r3, size_t n, float* dots) {
+    ISONGRAPH_VECTOR_STRICT_FP
+    float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+        d0 += q[i] * r0[i];
+        d1 += q[i] * r1[i];
+        d2 += q[i] * r2[i];
+        d3 += q[i] * r3[i];
+    }
+    dots[0] = d0;
+    dots[1] = d1;
+    dots[2] = d2;
+    dots[3] = d3;
+}
+
+ISONGRAPH_VECTOR_NOINLINE inline float hnswDot1(const float* q, const float* r, size_t n) {
+    ISONGRAPH_VECTOR_STRICT_FP
+    float d = 0.0f;
+    for (size_t i = 0; i < n; ++i) d += q[i] * r[i];
+    return d;
+}
+
+#endif
+
+/**
+ * Cosine of the query (norm qNorm) with each of slots[0..n), equal bit for bit
+ * to cosineRows(q, row, dim) for every one: the dot is the same ascending
+ * single-precision sum (see hnswDotsLanes) and the two norms are the floats
+ * cosineRows would sum (qNorm from hnswRowNorm, the row's from the index's
+ * cache of the same sum), so only the work differs, not the answer. A NaN
+ * score (a row that cannot be compared) ranks last as -infinity.
+ */
+inline void hnswScore(const HnswRows& rows, const float* q, float qNorm, const uint32_t* slots, size_t n,
+                      float* out) {
+    size_t i = 0;
+#if defined(ISONGRAPH_VECTOR_HNSW_LANES)
+    while (i < n) {
+        // Eight rows per pass (two lane groups) while there are that many left, else
+        // four; a short last pass repeats its final row in the spare lanes.
+        const size_t left = n - i;
+        const size_t take = std::min<size_t>(left, left > 4 ? 8 : 4);
+        const float* ptr[8];
+        float dots[8];
+        const size_t lanes = take > 4 ? 8 : 4;
+        for (size_t j = 0; j < lanes; ++j) ptr[j] = rows.row(slots[i + std::min(j, take - 1)]);
+        if (lanes == 8) hnswDotsLanes<2>(q, ptr, rows.dim, dots); else hnswDotsLanes<1>(q, ptr, rows.dim, dots);
+        for (size_t j = 0; j < take; ++j) out[i + j] = hnswCosine(dots[j], qNorm, rows.norms[slots[i + j]]);
+        i += take;
+    }
+#else
+    for (; i + 4 <= n; i += 4) {
+        float dots[4];
+        hnswDots4(q, rows.row(slots[i]), rows.row(slots[i + 1]), rows.row(slots[i + 2]), rows.row(slots[i + 3]),
+                  rows.dim, dots);
+        for (size_t j = 0; j < 4; ++j) out[i + j] = hnswCosine(dots[j], qNorm, rows.norms[slots[i + j]]);
+    }
+    for (; i < n; ++i) out[i] = hnswCosine(hnswDot1(q, rows.row(slots[i]), rows.dim), qNorm, rows.norms[slots[i]]);
+#endif
     for (i = 0; i < n; ++i) {
         if (std::isnan(out[i])) out[i] = -std::numeric_limits<float>::infinity();
     }
 }
 
-inline IvfHit hnswScoreOne(const HnswRows& rows, const float* q, uint32_t slot) {
+inline IvfHit hnswScoreOne(const HnswRows& rows, const float* q, float qNorm, uint32_t slot) {
     float s;
-    hnswScore(rows, q, &slot, 1, &s);
+    hnswScore(rows, q, qNorm, &slot, 1, &s);
     return IvfHit{s, slot};
 }
 
@@ -248,7 +371,7 @@ public:
     /** Bytes held by the graph. It holds no copy of any vector. */
     size_t bytes() const {
         size_t total = levels_.capacity() + upperAt_.capacity() * sizeof(uint32_t) +
-                       upper_.capacity() * sizeof(uint32_t);
+                       upper_.capacity() * sizeof(uint32_t) + norms_.capacity() * sizeof(float);
         for (const auto& chunk : l0_) total += chunk.capacity() * sizeof(uint32_t);
         return total;
     }
@@ -258,13 +381,17 @@ public:
                            uint64_t seed, size_t threads) {
         const auto started = std::chrono::steady_clock::now();
         HnswIndex h(m, efConstruction, seed);
+        h.levels_.reserve(slotCount);
+        h.upperAt_.reserve(slotCount);
+        h.norms_.reserve(slotCount);
         if (slotCount > 0) h.ensureSlot(slotCount - 1);
         std::vector<uint32_t> order;
         order.reserve(slotCount);
         for (size_t s = 0; s < slotCount; ++s) {
-            if (rows.alive[s] && std::isfinite(hnswRowNorm(rows.row(static_cast<uint32_t>(s)), rows.dim))) {
-                order.push_back(static_cast<uint32_t>(s));
-            }
+            if (!rows.alive[s]) continue;
+            const float norm = hnswRowNorm(rows.row(static_cast<uint32_t>(s)), rows.dim);
+            h.norms_[s] = norm;
+            if (std::isfinite(norm)) order.push_back(static_cast<uint32_t>(s));
         }
         size_t at = 0;
         std::vector<Job> jobs;
@@ -287,7 +414,9 @@ public:
     void notePut(const HnswRows& rows, uint32_t slot) {
         const auto started = std::chrono::steady_clock::now();
         ensureSlot(slot);
-        if (!std::isfinite(hnswRowNorm(rows.row(slot), rows.dim))) {
+        const float norm = hnswRowNorm(rows.row(slot), rows.dim);
+        norms_[slot] = norm;
+        if (!std::isfinite(norm)) {
             if (inGraph(slot)) ++churn;
             return;
         }
@@ -330,6 +459,7 @@ public:
             // surviving node is either a live graph member or absent.
             if (level == kHnswAbsent) continue;
             fresh.addNode(nw, level);
+            fresh.norms_[nw] = norms_[old];
             for (size_t l = 0; l <= level; ++l) {
                 const size_t cap = capacity(l);
                 out.clear();
@@ -371,19 +501,21 @@ public:
      * descent through the upper layers, then a best-first search of layer 0.
      * Gives up (budgetHit) after scoring more than `budget` nodes.
      */
-    void search(const HnswRows& rows, const float* q, uint32_t code, float threshold, size_t ef,
+    void search(const HnswRows& given, const float* q, uint32_t code, float threshold, size_t ef,
                 size_t budget, HnswFound& found) const {
         found.hits.clear();
         found.budgetHit = false;
         if (entry_ == kHnswNone) return;
+        const HnswRows rows = withNorms(given);
+        const float qNorm = hnswRowNorm(q, rows.dim);
         HnswVisitedScope scope(levels_.size());
-        IvfHit cur = hnswScoreOne(rows, q, entry_);
-        for (size_t level = top_; level >= 1; --level) cur = greedy(rows, q, cur, level);
+        IvfHit cur = hnswScoreOne(rows, q, qNorm, entry_);
+        for (size_t level = top_; level >= 1; --level) cur = greedy(rows, q, qNorm, cur, level);
         HnswAdmit admit;
         admit.code = code;
         admit.threshold = threshold;
         const std::vector<IvfHit> eps(1, cur);
-        searchLayer(rows, q, eps, ef, 0, admit, budget, scope.get(), found);
+        searchLayer(rows, q, qNorm, eps, ef, 0, admit, budget, scope.get(), found);
     }
 
     /**
@@ -518,17 +650,25 @@ private:
     std::vector<std::vector<uint32_t>> l0_;     ///< kChunkRows nodes per chunk, m0 + 1 words each
     std::vector<uint32_t> upperAt_;
     std::vector<uint32_t> upper_;
+    std::vector<float> norms_;                  ///< per slot; NaN until the row is written (see the layout above)
     uint32_t entry_ = kHnswNone;
     uint8_t top_ = 0;
     size_t members_ = 0;
 
     size_t capacity(size_t level) const { return level == 0 ? m0_ : m_; }
 
+    /** `rows` with this graph's cached norms attached (callers hand in a view without them). */
+    HnswRows withNorms(HnswRows rows) const {
+        rows.norms = norms_.data();
+        return rows;
+    }
+
     /** Cover slot `s` (new slots start absent, with empty link blocks). */
     void ensureSlot(size_t s) {
         while (levels_.size() <= s) {
             levels_.push_back(kHnswAbsent);
             upperAt_.push_back(kHnswNone);
+            norms_.push_back(std::numeric_limits<float>::quiet_NaN());
         }
         while (l0_.size() <= s / kChunkRows) l0_.emplace_back(kChunkRows * (m0_ + 1), 0u);
     }
@@ -576,13 +716,13 @@ private:
     // -- search -----------------------------------------------------------------
 
     /** Walk to the best node reachable by single steps on `level`. */
-    IvfHit greedy(const HnswRows& rows, const float* q, IvfHit cur, size_t level) const {
+    IvfHit greedy(const HnswRows& rows, const float* q, float qNorm, IvfHit cur, size_t level) const {
         float scores[kHnswMaxCap];
         for (;;) {
             const Links links = list(cur.slot, level);
             if (links.count == 0) return cur;
             for (uint32_t i = 0; i < links.count; ++i) hnswPrefetch(rows.row(links.items[i]), rows.dim);
-            hnswScore(rows, q, links.items, links.count, scores);
+            hnswScore(rows, q, qNorm, links.items, links.count, scores);
             IvfHit best = cur;
             for (uint32_t i = 0; i < links.count; ++i) {
                 const IvfHit c{scores[i], links.items[i]};
@@ -599,7 +739,7 @@ private:
      * kept. Stops when the best unexpanded node is worse than the worst kept one
      * (once `ef` are kept), or after `budget` nodes were scored.
      */
-    void searchLayer(const HnswRows& rows, const float* q, const std::vector<IvfHit>& eps, size_t ef,
+    void searchLayer(const HnswRows& rows, const float* q, float qNorm, const std::vector<IvfHit>& eps, size_t ef,
                      size_t level, const HnswAdmit& admit, size_t budget, HnswVisited& visited,
                      HnswFound& found) const {
         visited.clear();
@@ -641,7 +781,7 @@ private:
                 }
             }
             if (nFresh == 0) continue;
-            hnswScore(rows, q, fresh, nFresh, scores);
+            hnswScore(rows, q, qNorm, fresh, nFresh, scores);
             scored += nFresh;
             for (size_t i = 0; i < nFresh; ++i) {
                 const IvfHit node{scores[i], fresh[i]};
@@ -680,7 +820,7 @@ private:
         float scores[kHnswMaxCap];
         for (const IvfHit& c : cands) {
             if (chosen.size() >= cap) break;
-            hnswScore(rows, rows.row(c.slot), chosen.data(), chosen.size(), scores);
+            hnswScore(rows, rows.row(c.slot), rows.norms[c.slot], chosen.data(), chosen.size(), scores);
             bool rejected = false;
             for (size_t i = 0; i < chosen.size(); ++i) {
                 if (scores[i] > c.score) { rejected = true; break; }
@@ -699,14 +839,15 @@ private:
         const uint32_t x = job.slot;
         const size_t level = job.level;
         const float* q = rows.row(x);
+        const float qNorm = rows.norms[x];
         HnswAdmit admit;
         admit.exclude = x;
         const size_t top = top_;
         Plan lists(level + 1);
         std::vector<IvfHit> eps;
         if (entry_ != kHnswNone) {
-            IvfHit cur = hnswScoreOne(rows, q, entry_);
-            for (size_t l = top; l > level; --l) cur = greedy(rows, q, cur, l);
+            IvfHit cur = hnswScoreOne(rows, q, qNorm, entry_);
+            for (size_t l = top; l > level; --l) cur = greedy(rows, q, qNorm, cur, l);
             eps.push_back(cur);
         }
         std::vector<uint32_t> members;
@@ -715,7 +856,7 @@ private:
         for (size_t li = level + 1; li-- > 0;) {
             std::vector<IvfHit> cands;
             if (li <= top && !eps.empty()) {
-                searchLayer(rows, q, eps, efC_, li, admit, std::numeric_limits<size_t>::max(), visited, found);
+                searchLayer(rows, q, qNorm, eps, efC_, li, admit, std::numeric_limits<size_t>::max(), visited, found);
                 cands = found.hits;
                 if (!cands.empty()) eps = cands;
             }
@@ -725,7 +866,7 @@ private:
             }
             if (!members.empty()) {
                 memberScores.assign(members.size(), 0.0f);
-                hnswScore(rows, q, members.data(), members.size(), memberScores.data());
+                hnswScore(rows, q, qNorm, members.data(), members.size(), memberScores.data());
                 for (size_t i = 0; i < members.size(); ++i) cands.push_back(IvfHit{memberScores[i], members[i]});
                 std::sort(cands.begin(), cands.end(), hitBefore);
             }
@@ -753,7 +894,7 @@ private:
                   all.end());
         if (all.size() <= cap) return true;
         std::vector<float> scores(all.size());
-        hnswScore(rows, rows.row(t), all.data(), all.size(), scores.data());
+        hnswScore(rows, rows.row(t), rows.norms[t], all.data(), all.size(), scores.data());
         std::vector<IvfHit> cands;
         cands.reserve(all.size());
         for (size_t i = 0; i < all.size(); ++i) cands.push_back(IvfHit{scores[i], all[i]});
@@ -773,7 +914,8 @@ private:
      * parallel, read-only), then apply the plans in job order. The result does
      * not depend on `threads`.
      */
-    void link(const HnswRows& rows, const std::vector<Job>& jobs, size_t threads) {
+    void link(const HnswRows& given, const std::vector<Job>& jobs, size_t threads) {
+        const HnswRows rows = withNorms(given);
         const size_t slots = levels_.size();
         std::vector<std::pair<uint32_t, uint8_t>> intra;
         for (const Job& j : jobs) {
