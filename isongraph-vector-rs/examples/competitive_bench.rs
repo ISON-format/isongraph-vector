@@ -15,7 +15,8 @@
 //! holding a random 10% / 1% of the vectors.
 
 use isongraph_vector_rs::{
-    AnnConfig, EmbeddingStore, HnswConfig, NodeId, ScanPrecision, SimilarityResult, SnapshotIdentity,
+    AnnConfig, EmbeddingStore, HnswConfig, NodeId, ScanPrecision, SimilarityResult,
+    SnapshotIdentity,
 };
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -457,12 +458,17 @@ fn main() {
             let qa = point(&store, &c, &truth, Path::Exact, None, budget);
             println!(
                 "  exact int8 1T recall={} qps={:.1} auto qps={:.1}",
-                q1["recall"], q1["qps_1t"].as_f64().unwrap(), qa["qps_1t"].as_f64().unwrap()
+                q1["recall"],
+                q1["qps_1t"].as_f64().unwrap(),
+                qa["qps_1t"].as_f64().unwrap()
             );
             e8["sweep"] = json!([q1]);
             e8["loop_allthreads"] = json!({"nq": qa["nq"], "threads": "auto", "qps": qa["qps_1t"], "median_ms": qa["median_ms"], "p95_ms": qa["p95_ms"], "p99_ms": qa["p99_ms"], "mean_ms": qa["mean_ms"], "qps_runs": qa["qps_1t_runs"]});
             e8["batch_allthreads"] = batch_point(&store, &c, &truth, Path::Exact);
-            println!("  exact int8 batch qps={:.1}", e8["batch_allthreads"]["qps"].as_f64().unwrap());
+            println!(
+                "  exact int8 batch qps={:.1}",
+                e8["batch_allthreads"]["qps"].as_f64().unwrap()
+            );
             e8["mem_after_sweep"] = mem();
             runs.push(e8);
             store.set_scan_precision(ScanPrecision::F32).unwrap();
@@ -605,7 +611,8 @@ fn main() {
                     match store.save_snapshot(&snap, &SnapshotIdentity::default()) {
                         Ok(_) => {
                             sl["snap_save_s"] = json!(t.elapsed().as_secs_f64());
-                            sl["snap_mb"] = json!(std::fs::metadata(&snap).unwrap().len() as f64 / 1048576.0);
+                            sl["snap_mb"] =
+                                json!(std::fs::metadata(&snap).unwrap().len() as f64 / 1048576.0);
                             let mut s3 = EmbeddingStore::new(None);
                             let t = Instant::now();
                             s3.load_snapshot(&snap).unwrap();
@@ -654,7 +661,11 @@ fn main() {
         store
             .set_ann(Some(AnnConfig {
                 min_size: 0,
-                hnsw: HnswConfig { m: 16, ef_construction: 200, ef_search: None },
+                hnsw: HnswConfig {
+                    m: 16,
+                    ef_construction: 200,
+                    ef_search: None,
+                },
                 ..AnnConfig::hnsw()
             }))
             .unwrap();
@@ -662,7 +673,10 @@ fn main() {
         let stats = store.build_ann_index(false).unwrap();
         let idx_s = t.elapsed().as_secs_f64();
         let mem_after_build = mem();
-        println!("  hnsw build {:.2}s graph_nodes={} max_level={:?} index_bytes={}", idx_s, stats.graph_nodes, stats.max_level, stats.index_bytes);
+        println!(
+            "  hnsw build {:.2}s graph_nodes={} max_level={:?} index_bytes={}",
+            idx_s, stats.graph_nodes, stats.max_level, stats.index_bytes
+        );
         let mut hn = json!({
             "system": format!("{label}_hnsw"), "ds": ds, "n": n, "d": d, "k": c.k, "queries": nq, "all_threads": cpus,
             "version": "isongraph-vector-rs (repo HEAD, cargo release), AnnConfig::hnsw M=16 efConstruction=200", "knob_name": "ef_search",
@@ -682,7 +696,10 @@ fn main() {
             p["batch_allthreads"] = batch_point(&store, &c, &truth, Path::Ann);
             println!(
                 "  hnsw ef={kn} recall={:.4} qps1t={:.0} median={:.3}ms batch_qps={:.0}",
-                p["recall"].as_f64().unwrap(), p["qps_1t"].as_f64().unwrap(), p["median_ms"].as_f64().unwrap(), p["batch_allthreads"]["qps"].as_f64().unwrap()
+                p["recall"].as_f64().unwrap(),
+                p["qps_1t"].as_f64().unwrap(),
+                p["median_ms"].as_f64().unwrap(),
+                p["batch_allthreads"]["qps"].as_f64().unwrap()
             );
             let rec = p["recall"].as_f64().unwrap();
             if ref_knob.is_none() && rec >= 0.95 {
@@ -690,7 +707,10 @@ fn main() {
                 ref_recall = p["recall"].clone();
             }
             pts.push(p);
-            if rec >= 0.9995 && pts.len() > 2 && pts[pts.len() - 2]["recall"].as_f64().unwrap() >= 0.9995 {
+            if rec >= 0.9995
+                && pts.len() > 2
+                && pts[pts.len() - 2]["recall"].as_f64().unwrap() >= 0.9995
+            {
                 break;
             }
         }
@@ -708,7 +728,12 @@ fn main() {
         pd["knob"] = json!(stats.ef_search);
         store.set_scan_threads(0);
         pd["batch_allthreads"] = batch_point(&store, &c, &truth, Path::Ann);
-        println!("  hnsw default ef={:?} recall={:.4} qps1t={:.0}", stats.ef_search, pd["recall"].as_f64().unwrap(), pd["qps_1t"].as_f64().unwrap());
+        println!(
+            "  hnsw default ef={:?} recall={:.4} qps1t={:.0}",
+            stats.ef_search,
+            pd["recall"].as_f64().unwrap(),
+            pd["qps_1t"].as_f64().unwrap()
+        );
         hn["default_ef_point"] = pd;
         // concurrent clients on the shared store (each one query at a time; the store is thread-safe for reads)
         if let Some(rk) = ref_knob {
@@ -728,7 +753,9 @@ fn main() {
                         });
                     }
                 });
-                conc.push(json!({"clients": clients, "qps": qs.len() as f64 / t.elapsed().as_secs_f64()}));
+                conc.push(
+                    json!({"clients": clients, "qps": qs.len() as f64 / t.elapsed().as_secs_f64()}),
+                );
             }
             hn["concurrent_clients"] = json!(conc);
         }
